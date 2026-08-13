@@ -11,6 +11,7 @@ import logging
 import threading
 import shutil
 import smtplib
+import contextlib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from io import BytesIO
@@ -314,6 +315,12 @@ def get_connection() -> sqlite3.Connection:
     # "database is locked" errors under concurrent use.
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
+    # FIX: default busy_timeout is 0 — a second writer hits "database is
+    # locked" immediately instead of waiting. 5s lets a writer that's
+    # blocked behind another session's BEGIN IMMEDIATE (see _write_lock
+    # below) simply wait its turn, which is what we want now that closing
+    # stock is computed under an explicit write lock.
+    conn.execute("PRAGMA busy_timeout=5000;")
     return conn
 
 conn = get_connection()
@@ -344,6 +351,27 @@ class _ThreadLocalCursor:
         return getattr(self._get(), name)
 
 cur = _ThreadLocalCursor(conn)
+
+# FIX: closes the "read previous closing balance, then insert the new one"
+# race (reconciliation review, Section 3). WAL mode lets reads and writes
+# proceed concurrently, but it does NOT make a read-then-write *sequence*
+# atomic — two sessions can both read the same previous closing stock
+# before either has written, so one session's addition silently overwrites
+# the other's instead of stacking on top of it. BEGIN IMMEDIATE acquires
+# SQLite's write lock up front, before the read inside the block runs, so
+# a second session's BEGIN IMMEDIATE simply waits (via PRAGMA busy_timeout,
+# set above) until the first one commits and its read no longer sees stale
+# data. Use this around any "read latest ledger row, compute new balance,
+# insert" sequence — currently: FG stock movements and RM stock entries.
+@contextlib.contextmanager
+def _write_lock():
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 # ================= AUTH =================
@@ -386,8 +414,90 @@ CREATE TABLE IF NOT EXISTS login_attempts (
     attempts     INTEGER DEFAULT 0,
     locked_until TEXT
 );
+CREATE TABLE IF NOT EXISTS login_log (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    username  TEXT NOT NULL,
+    factory   TEXT,
+    role      TEXT,
+    timestamp TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS module_usage (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    username  TEXT NOT NULL,
+    module    TEXT NOT NULL,
+    timestamp TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS feedback (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    username  TEXT NOT NULL,
+    factory   TEXT,
+    message   TEXT NOT NULL,
+    status    TEXT NOT NULL DEFAULT 'pending',
+    timestamp TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS app_errors (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    level     TEXT NOT NULL,
+    username  TEXT,
+    message   TEXT NOT NULL
+);
 """)
 conn.commit()
+
+# ================= PILOT DASHBOARD: instrumentation =================
+# NEW: lightweight usage tracking that feeds the admin-only "Pilot Dashboard"
+# module further down. Every insert here is wrapped so a tracking failure
+# can never take down the actual feature the user is trying to use.
+
+class _SQLiteLogHandler(logging.Handler):
+    """Mirrors every WARNING+ log record into app_errors so the Pilot
+    Dashboard can show 'errors reported' without anyone having to go dig
+    through fcsc_app.log on disk."""
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            _uname = "system"
+            try:
+                _uname = st.session_state.get("username", "system") or "system"
+            except Exception:
+                pass
+            cur.execute(
+                "INSERT INTO app_errors (timestamp, level, username, message) VALUES (?,?,?,?)",
+                (datetime.datetime.now().isoformat(timespec="seconds"),
+                 record.levelname, _uname, self.format(record))
+            )
+            conn.commit()
+        except Exception:
+            pass  # logging must never raise
+
+logger.addHandler(_SQLiteLogHandler())
+
+def log_login(username: str, factory: str | None, role: str) -> None:
+    try:
+        cur.execute(
+            "INSERT INTO login_log (username, factory, role, timestamp) VALUES (?,?,?,?)",
+            (username, factory, role, datetime.datetime.now().isoformat(timespec="seconds"))
+        )
+        conn.commit()
+    except Exception as e:
+        logger.warning("login_log write failed: %s", e)
+
+def log_module_view(username: str, module: str) -> None:
+    try:
+        cur.execute(
+            "INSERT INTO module_usage (username, module, timestamp) VALUES (?,?,?)",
+            (username, module, datetime.datetime.now().isoformat(timespec="seconds"))
+        )
+        conn.commit()
+    except Exception as e:
+        logger.warning("module_usage write failed: %s", e)
+
+def submit_feedback(username: str, factory: str | None, message: str) -> None:
+    cur.execute(
+        "INSERT INTO feedback (username, factory, message, status, timestamp) VALUES (?,?,?,'pending',?)",
+        (username, factory, message.strip(), datetime.datetime.now().isoformat(timespec="seconds"))
+    )
+    conn.commit()
 
 # ── Seed default accounts on first run only ───────────────────────────────────
 # FIX: Plaintext defaults no longer live permanently in source. They're used
@@ -454,12 +564,12 @@ def _reset_attempts(username: str) -> None:
     conn.commit()
 
 # Modules blocked for factory supervisors
-SUPERVISOR_BLOCKED = {"Dashboard", "P&L", "Analysis", "Audit Trail"}
+SUPERVISOR_BLOCKED = {"Dashboard", "P&L", "Analysis", "Audit Trail", "Pilot Dashboard"}
 ADMIN_MODULES      = ["Dashboard", "Daily Log", "Production", "Formulation", "Sand", "Stock",
-                       "Procurement", "Quality", "Sales", "Dispatch", "Cost", "P&L", "Analysis",
-                       "Reports", "Customers", "Audit Trail"]
+                       "Procurement", "Quality", "Sales", "Dispatch", "Reconciliation", "Cost", "P&L", "Analysis",
+                       "Reports", "Customers", "Audit Trail", "Pilot Dashboard"]
 SUPERVISOR_MODULES = ["My Factory", "Daily Log", "Production", "Formulation", "Sand", "Stock",
-                       "Procurement", "Quality", "Sales", "Dispatch", "Cost", "Reports"]
+                       "Procurement", "Quality", "Sales", "Dispatch", "Reconciliation", "Cost", "Reports"]
 
 # NEW: Company logo for the login page — loaded from disk and cached as a
 # base64 data URI so it can be embedded straight into the styled HTML card
@@ -1192,7 +1302,7 @@ def run_global_search(q: str, is_admin: bool, user_factory: str | None,
             f"SELECT DISTINCT product, factory FROM production WHERE product LIKE ?{clause} LIMIT ?",
             (like, *params, limit_per_cat)
         ).fetchall():
-            results.append({"category": "Product", "icon": "⚙️", "label": product,
+            results.append({"category": "Product", "icon": "⚙️", "label": fg_label(product),
                             "detail": f"Produced @ {fac}", "module": "Production"})
     except sqlite3.Error:
         pass
@@ -1486,6 +1596,7 @@ def show_login_page() -> None:
                     st.session_state.role         = user["role"]
                     st.session_state.user_factory = user["factory"]
                     st.session_state.display_name = user["display"]
+                    log_login(uname, user["factory"], user["role"])
                     st.rerun()
                 else:
                     attempts, locked_until = _register_failed_attempt(uname)
@@ -1684,6 +1795,32 @@ CREATE TABLE IF NOT EXISTS material_codes (
 """)
 conn.commit()
 
+# -- NEW: Official Material Master (single source of truth) ---------------
+# Replaces the old free-text MATERIALS list as the authoritative record for
+# every raw material, packaging item, label/sticker, and process/intermediate
+# item. Sourced from the plant team's Codification_for_System.xlsx and never
+# auto-generated or renamed -- see SEED_MATERIALS_MASTER below. A handful of
+# items are seeded with procurement_code=NULL and status='Pending Code
+# Confirmation' because the source sheet had an unresolved code collision;
+# these still work everywhere in the ERP, just flagged, until the plant QC
+# head confirms the correct code (do not guess it here).
+cur.executescript("""
+CREATE TABLE IF NOT EXISTS materials_master (
+    id                INTEGER PRIMARY KEY,
+    lab_code          TEXT,
+    name              TEXT NOT NULL,
+    procurement_code  TEXT,
+    category          TEXT DEFAULT 'Raw Material',
+    status            TEXT DEFAULT 'Confirmed',
+    created_at        TEXT
+);
+CREATE TABLE IF NOT EXISTS material_aliases (
+    legacy_name    TEXT PRIMARY KEY,
+    canonical_name TEXT NOT NULL
+);
+""")
+conn.commit()
+
 # ── NEW: Quality Control / Batch Traceability workflow ────────────────────────
 # Mirrors the RM Receipt → Incoming QC → Production → Process QC → FG QC →
 # Packing QC → Dispatch QC pipeline. Each stage is its own table (not one huge
@@ -1848,6 +1985,109 @@ CREATE TABLE IF NOT EXISTS user_prefs (
     default_days_back  INTEGER,
     default_module     TEXT,
     updated_at         TEXT
+);
+""")
+conn.commit()
+
+# -- NEW: Finished Goods stock ledger + central reconciliation log ------------
+# fg_stock is a ledger, not an overwritten balance: every Production save and
+# every Dispatch save inserts its own row (production_in or dispatch_out), and
+# closing_stock is computed at insert time from the previous row for that
+# factory+product, same pattern as the existing `stock` (RM) table. Never
+# written to directly from the UI outside record_fg_stock_movement().
+#
+# inventory_reconciliation is an append-only log of every QC<->Stock and
+# Dispatch<->Quality check that's been run — nothing here ever corrects a
+# source record, it only ever records what was found. See reconcile_* helpers
+# below (after to_mt/from_mt are defined).
+cur.executescript("""
+CREATE TABLE IF NOT EXISTS fg_stock (
+    id             INTEGER PRIMARY KEY,
+    date           TEXT, factory TEXT, product TEXT,
+    fg_code        TEXT DEFAULT '',
+    production_in  REAL DEFAULT 0,
+    dispatch_out   REAL DEFAULT 0,
+    adjustment     REAL DEFAULT 0,
+    closing_stock  REAL DEFAULT 0,
+    source_module  TEXT DEFAULT '',
+    source_ref_id  INTEGER,
+    created_at     TEXT
+);
+CREATE TABLE IF NOT EXISTS inventory_reconciliation (
+    id              INTEGER PRIMARY KEY,
+    check_type      TEXT,
+    factory         TEXT,
+    item_code       TEXT,
+    period_start    TEXT, period_end TEXT,
+    qty_source_a    REAL, qty_source_b REAL,
+    difference      REAL,
+    severity        TEXT,
+    detail          TEXT,
+    checked_at      TEXT
+);
+""")
+conn.commit()
+
+# -- ADDITIVE MIGRATION (2nd-pass integrity review) ---------------------------
+# Never touches existing columns/rows — only adds what's missing, so every
+# existing table, record and downstream query keeps working unchanged.
+#
+#  1) fg_stock.movement_type — distinguishes a normal Production/Dispatch
+#     entry from a Reversal/Correction row written when an edit or delete
+#     needs to keep the ledger truthful (see reverse_fg_stock_for_source()).
+#  2) production_batches.quantity / quantity_unit — the QC/batch-traceability
+#     side never captured an actual output quantity, which is why the old
+#     Dispatch<->Quality check could only compare a batch COUNT (a proxy, not
+#     a real quantity check — Section 11 fix). New batches can record it;
+#     historical batches stay NULL and are handled as an explicitly labelled
+#     fallback, never silently treated as zero or "matched".
+#  3) fg_product_unit — canonical FG stock-keeping unit per product (Section
+#     6). Production is logged in weight (MT/KG); Dispatch is logged as a
+#     packed-unit count ("Qty" = bags/pieces, already the de-facto FG stock
+#     unit used historically). Without a per-product pack weight, those two
+#     can't be combined in one ledger — this table is the single place that
+#     conversion factor lives, editable by an admin.
+def _safe_add_column(table: str, coldef: str) -> None:
+    try:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {coldef}")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists — additive migration is idempotent
+
+_safe_add_column("fg_stock", "movement_type TEXT DEFAULT 'Entry'")
+_safe_add_column("production_batches", "quantity REAL")
+_safe_add_column("production_batches", "quantity_unit TEXT DEFAULT ''")
+
+cur.executescript("""
+CREATE TABLE IF NOT EXISTS fg_product_unit (
+    product         TEXT PRIMARY KEY,
+    stock_unit      TEXT DEFAULT 'Bags',
+    pack_weight_kg  REAL,
+    updated_by      TEXT,
+    updated_at      TEXT
+);
+""")
+conn.commit()
+
+# -- NEW: Official Finished Goods Master (single source of truth) ---------
+# Mirrors materials_master/material_aliases below but for finished products.
+# Sourced from the plant team's finished_good_codification.xlsx
+# (2026-08-13) and never auto-generated or renamed here -- see
+# SEED_FINISHED_GOODS_MASTER. A handful of items are seeded with code=NULL
+# and status='Pending Code Confirmation' because the source sheet had no
+# code yet; these still work everywhere in the ERP, just flagged, until the
+# plant team confirms the code.
+cur.executescript("""
+CREATE TABLE IF NOT EXISTS finished_goods_master (
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    code        TEXT,
+    status      TEXT DEFAULT 'Confirmed',
+    created_at  TEXT
+);
+CREATE TABLE IF NOT EXISTS fg_aliases (
+    legacy_name    TEXT PRIMARY KEY,
+    canonical_name TEXT NOT NULL
 );
 """)
 conn.commit()
@@ -2242,9 +2482,882 @@ _SEED_MATERIAL_CODES = [
     ("ZINC DUST", "C2700/14"),
     ("ZINC PHOSPHATE", "C2700/27"),
 ]
+# ── Official Material Master — imported from Codification_for_System.xlsx
+# (provided by the plant team, 2026-08-07). Format: (lab_code, name, procurement_code, category, status)
+# procurement_code is None and status is 'Pending Code Confirmation' for the handful of items
+# where the source sheet had a code collision the plant QC head still needs to resolve —
+# see Codification_for_System_REVIEWED.xlsx for the flagged rows. Do not guess these codes.
+SEED_MATERIALS_MASTER = [
+    ("C0330/02", "ALUMINIUM HYDROXIDE GEL DRIED", "R1001", "Raw Material", "Confirmed"),
+    ("C0345/01", "ALUMINIUM SULPHATE IRON FREE GRADE", "R1002", "Raw Material", "Confirmed"),
+    ("C0765/02", "CALCIUM CHLORIDE SOLID(FUSED)", "R1003", "Raw Material", "Confirmed"),
+    ("C0780/01", "CALCIUM FORMATE POWDER", "R1004", "Raw Material", "Confirmed"),
+    ("C0795/01", "CALCIUM HYDROXIDE (HYDRATED LIME)", "R1005", "Raw Material", "Confirmed"),
+    ("C3435/01", "SODIUM CARBONATE", "R1006", "Raw Material", "Confirmed"),
+    ("C3540/01", "SODIUM NITRATE", "R1007", "Raw Material", "Confirmed"),
+    ("C3630/01", "SODIUM THIOCYANATE", "R1008", "Raw Material", "Confirmed"),
+    ("C1065/01", "CITRIC ACID MONOHYDRATE POWDER", "R1201", "Raw Material", "Confirmed"),
+    ("C1665/01", "FORMIC ACID (85%)", "R1202", "Raw Material", "Confirmed"),
+    ("C2490/01", "NONYL PHENOL ETHOXYLATE", "R1203", "Raw Material", "Confirmed"),
+    ("C3825/01", "SULPHAMIC ACID", "R1204", "Raw Material", "Confirmed"),
+    ("C0676/01", "BYK 9076", "R1401", "Raw Material", "Confirmed"),
+    ("C0676/02", "Uniwet 3048", "R1405", "Raw Material", "Confirmed"),
+    ("C3135/01", "POTASSIUM DICHROMATE", "R1402", "Raw Material", "Confirmed"),
+    ("C2585/01", "SILANE BASED ADHESION PROMOTER(BYK 4511)", "R1403", "Raw Material", "Confirmed"),
+    ("C2585/02", "SILANE BASED ADHESION PROMOTER(RESIL GTMS)", "R1404", "Raw Material", "Confirmed"),
+    ("C3510/01", "SODIUM LAURYL ETHER SULPHATE", "R1601", "Raw Material", "Confirmed"),
+    ("C1755/01", "GLYCERINE", "R1801", "Raw Material", "Confirmed"),
+    ("C2010/01", "ISOPROPYL ALCOHOL", "R1802", "Raw Material", "Confirmed"),
+    ("C3480/01", "SODIUM HYDROXIDE SOLUTION", "R2201", "Raw Material", "Confirmed"),
+    ("C2280/01", "METHYLDIETHANOLAMINE (MDEA)", "R2401", "Raw Material", "Confirmed"),
+    ("C4005/01", "TRIETHANOLAMINE (TEA) - 99%", "R2402", "Raw Material", "Confirmed"),
+    ("C1315/01", "DIETHANOLAMINE(DEA)", "R2403", "Raw Material", "Confirmed"),
+    ("C1260/01", "DIBUTYLTIN DILAURATE", "R2601", "Raw Material", "Confirmed"),
+    ("C0930/01", "CARBOXYMETHYL CELLULOSE LV", "R2801", "Raw Material", "Confirmed"),
+    ("C1935/01", "HYDROXYETHYL CELLULOSE", "R2802", "Raw Material", "Confirmed"),
+    ("C2205/01", "METHYL HYDROXY ETHYL CELLULOSE (40000PF)", "R2803", "Raw Material", "Confirmed"),
+    ("C2205/02", "METHYL HYDROXY ETHYL CELLULOSE (60000)", "R2804", "Raw Material", "Confirmed"),
+    ("C2445/01", "NATURAL CELLULOSE FIBRES(TECHNOCEL C500)", "R2805", "Raw Material", "Confirmed"),
+    ("C2445/02", "NATURAL CELLULOSE FIBRES(ARBOCEL PWC 500 )", "R2806", "Raw Material", "Confirmed"),
+    ("C0990/03", "CEMENT - WHITE", "R3001", "Raw Material", "Confirmed"),
+    ("C0990/05", "CEMENT (OPC) 53 GRADE", "R3002", "Raw Material", "Confirmed"),
+    ("C0990/07", "CEMENT PPC(AMBUJA/NUVOCO)", "R3003", "Raw Material", "Confirmed"),
+    ("C0990/10", "CEMENT PPC(DALMIA)", "R3004", "Raw Material", "Confirmed"),
+    ("C0990/11", "CEMENT PPC(AMBUJA/NUVOCO) Siliguri", "R3005", "Raw Material", "Confirmed"),
+    ("C0485/01", "ANTISETTLING AGENT (RHEOPLUS)", "R3201", "Raw Material", "Confirmed"),
+    ("C1610/01", "FINESET 35", "R3202", "Raw Material", "Confirmed"),
+    ("C0665/01", "BUTYL CELLOSOLVE", "R3401", "Raw Material", "Confirmed"),
+    ("C0030/01", "2,2,4-TRIMETHYL-1,3-PENTANEDIOL MONO (2-METHYL PROPANATE)(TEXANOL)", "R3402", "Raw Material", "Confirmed"),
+    ("C0480/01", "ANTIFOAM", "R3602", "Raw Material", "Confirmed"),
+    ("C0677/01", "BYK 054", "R3603", "Raw Material", "Confirmed"),
+    ("C1185/01", "DEFOAMER FOR PC (DYN 575/DISPLAIRE 707)", "R3604", "Raw Material", "Confirmed"),
+    ("C1190/01", "DEFOAMER FOR EMULSION (SAPCO NDW)", "R3605", "Raw Material", "Confirmed"),
+    ("C2780/01", "POLYESTER FIBER 6MM(RECRON)", "R4401", "Raw Material", "Confirmed"),
+    ("C2780/02", "POLYESTER FIBER 12MM(RECRON)", "R4402", "Raw Material", "Confirmed"),
+    ("C0525/02", "BARIUM SULPHATE (OFF COLOURED)", "R4601", "Raw Material", "Confirmed"),
+    ("C0750/08", "CALCIUM CARBONATE- 300 MESH", "R4602", "Raw Material", "Confirmed"),
+    ("C0750/06", "CALCIUM CARBONATE (STEARATE COATED) (-45 MICRONS)", "R4603", "Raw Material", "Confirmed"),
+    ("C0900/02", "CALCIUM/MAGNESIUM CARBONATE- DOLOMITE 45 MICRONE", "R4604", "Raw Material", "Confirmed"),
+    ("C3210/01", "PRECIPITATED SILICA", "R4605", "Raw Material", "Confirmed"),
+    ("C3345/01", "SILICA FLOUR (<300 Mesh)", "R4606", "Raw Material", "Confirmed"),
+    ("C3345/03", "SILICA FLOUR 45micron (325 MESH)", "R4607", "Raw Material", "Confirmed"),
+    ("C3345/17", "SILICA FLOUR 37micron (400 MESH)", "R4608", "Raw Material", "Confirmed"),
+    ("C3885/01", "TALC- MAGNESIUM SILICATE", "R4609", "Raw Material", "Confirmed"),
+    ("C1666/01", "FRAGNANCE – LEMON DT", "R4801", "Raw Material", "Confirmed"),
+    ("C1880/01", "HARDENER FOR EPOXY(AMIDE BASED- LAPOX AH713)", "R5001", "Raw Material", "Confirmed"),
+    ("C1881/01", "HARDENER FOR EPOXY(PHENOLALKAMINE BASED- CARDOLITE NC558)", "R5002", "Raw Material", "Confirmed"),
+    ("C1881/02", "HARDENER FOR EPOXY(PHENOLALKAMINE BASED- CARDOLITE NC541)", "R5003", "Raw Material", "Confirmed"),
+    ("C1881/04", "HARDENER FOR EPOXY(PHENOLALKAMINE BASED- CARDOLITE NX 5454)", "R5004", "Raw Material", "Confirmed"),
+    ("C1882/01", "HARDENER FOR EPOXY(AMINE BASED- LAPOX AH 428)", "R5005", "Raw Material", "Confirmed"),
+    ("C1200/01", "DEMOULDING OIL (SERVO CONMOULD 12/HIND MOULD RELEASE OB)", "R5601", "Raw Material", "Confirmed"),
+    ("C2520/01", "OLEIC ACID (LUBOLIC GRADE)", "R1205", "Raw Material", "Confirmed"),
+    ("C2835/01", "POLYCARBOXYLIC ETHER (LIQUID) - DYN E 35 (55%)", "R6001", "Raw Material", "Confirmed"),
+    ("C2835/02", "POLYCARBOXYLIC ETHER (LIQUID) (DYN E 95 (50%)/HYDROSOFT WD 500)", "R6002", "Raw Material", "Confirmed"),
+    ("C2835/03", "POLYCARBOXYLIC ETHER (LIQUID) (PCT 135)", "R6003", "Raw Material", "Confirmed"),
+    ("C2835/06", "POLYCARBOXYLIC ETHER (LIQUID) - DYN R 85", "R6004", "Raw Material", "Confirmed"),
+    ("C2835/08", "POLYCARBOXYLIC ETHER POWDER", "R6005", "Raw Material", "Confirmed"),
+    ("C2595/01", "ORTHO PHOSPHORIC ACID (85%)", "R1206", "Raw Material", "Confirmed"),
+    ("C2700/04", "PIGMENT - INORGANIC - IRON OXIDE BLACK", "R6402", "Raw Material", "Confirmed"),
+    ("C2700/05", "PIGMENT - INORGANIC - IRON OXIDE BLACK PIGMENT", "R6403", "Raw Material", "Confirmed"),
+    ("C2700/07", "PIGMENT - INORGANIC - IRON OXIDE RED PIGMENT", "R6404", "Raw Material", "Confirmed"),
+    ("C2700/08", "PIGMENT - INORGANIC - IRON OXIDE YELLOW PIGMENT", "R6405", "Raw Material", "Confirmed"),
+    ("C2700/12", "PIGMENT - INORGANIC CHROMOCYANINE GREEN-1753", "R6406", "Raw Material", "Confirmed"),
+    ("C2700/26", "PIGMENT - RED OXIDE COLORANT PR101", "R6407", "Raw Material", "Confirmed"),
+    ("C2700/27", "PIGMENT - ZINC PHOSPHATE PIGMENT", "R6408", "Raw Material", "Confirmed"),
+    ("C2700/28", "PIGMENT-ULTRAMARINE BLUE", "R6409", "Raw Material", "Confirmed"),
+    ("C3960/01", "TITANIUM DIOXIDE (RUTILE) SULPHATE PROCESSED", "R6410", "Raw Material", "Confirmed"),
+    ("C2700/29", "PIGMENT-CEEFAST ALPHA BLUE 15:0 (U)", "R6411", "Raw Material", "Confirmed"),
+    ("C2700/30", "PIGMENT-CEEFAST BETA BLUE (U)", "R6412", "Raw Material", "Confirmed"),
+    ("C2700/31", "PIGMENT-CEEFAST GREEN 7 (U)", "R6413", "Raw Material", "Confirmed"),
+    ("C2700/32", "PIGMENT-CEEFAST GREEN  B 807", "R6414", "Raw Material", "Confirmed"),
+    ("C2700/33", "PIGMENT-CEEROX BROWN OXIDE", "R6415", "Raw Material", "Confirmed"),
+    ("C2700/34", "PIGMENT-CEEROX RED OXIDE 445", "R6416", "Raw Material", "Confirmed"),
+    ("C2700/35", "PIGMENT-CEEROX RED OXIDE 473", "R6417", "Raw Material", "Confirmed"),
+    ("C2700/36", "PIGMENT-CEEFAST RED 48:2", "R6401", "Raw Material", "Confirmed"),
+    ("C2700/37", "PIGMENT-CEEFAST VIOLET TONER 777", "R6418", "Raw Material", "Confirmed"),
+    ("C2700/38", "PIGMENT-CEEFAST MIDDLE CHROME( E)", "R6419", "Raw Material", "Confirmed"),
+    ("C0090/01", "ACRYLIC COPOLYMER EMULSION(BONDEX 5800)", "R6601", "Raw Material", "Confirmed"),
+    ("C0090/02", "ACRYLIC COPOLYMER EMULSION(KEMICRYL 2505)", "R6602", "Raw Material", "Confirmed"),
+    ("C3780/01", "STYRENE ACRYLIC COPOLYMER EMULSION(BONDEX J400)", "R6603", "Raw Material", "Confirmed"),
+    ("C3781/02", "STYRENE ACRYLIC COPOLYMER EMULSION(BONDEX J76C)", "R6604", "Raw Material", "Confirmed"),
+    ("C3782/01", "WATER-BASED DISPERSION OR EMULSION OF ACRYLIC AND STYRENE COPOLYMER WITH FINE PARTICLES(BONDEX 5295)", "R6605", "Raw Material", "Confirmed"),
+    ("C3795/01", "STYRENE BUTADIENE RUBBER LATEX (STYROFAN D623)", "R6606", "Raw Material", "Confirmed"),
+    ("C3795/02", "STYRENE BUTADIENE RUBBER LATEX (COLOURCHEM)", "R6609", "Raw Material", "Confirmed"),
+    ("C4139/01", "REDISPERSIBLE POWDER(VINNAPAS 5010N)", "R6607", "Raw Material", "Confirmed"),
+    ("C4140/01", "REDISPERSIBLE POWDER(VINNAPAS 5044)", "R6608", "Raw Material", "Confirmed"),
+    ("C0140/01", "ACRYLIC-POLYURATAHNE HYBRID POLYMER(CARBOSET CA1009I)", "R6801", "Raw Material", "Confirmed"),
+    ("C2885/01", "POLYETHYLENE GLYCOL 400", "R7001", "Raw Material", "Confirmed"),
+    ("C3525/02", "SODIUM LIGNOSULPHONATE POWDER (SAPPI – SOUTH AFRICA)", "R7002", "Raw Material", "Confirmed"),
+    ("C3570/01", "SNF(40%)-HIMADRI", "R7003", "Raw Material", "Confirmed"),
+    ("C3585/01", "SNF(POWDER)-HIMADRI", "R7004", "Raw Material", "Confirmed"),
+    ("C1985/01", "IPDI(BASONAT I)", "R7201", "Raw Material", "Confirmed"),
+    ("C2795/01", "POLYESTER BASED PU DISPERSION(PUTEC 3255)", "R7202", "Raw Material", "Confirmed"),
+    ("C3067/01", "POLYURATHANE COATING SOLVENT BASED(HIND HYDRO FLEX PU)", "R7203", "Raw Material", "Confirmed"),
+    ("C1650/01", "FORMALDEHYDE SOLUTION (METHANOL STABILISED)", "R7601", "Raw Material", "Confirmed"),
+    ("C3215/01", "PRESERVATIVE(MERGAL K-14)", "R7602", "Raw Material", "Confirmed"),
+    ("C0615/01", "BISPHENOL A EPOXY RESIN(LAPOX B11)", "R7801", "Raw Material", "Confirmed"),
+    ("C1500/02", "EPOXY REACTIVE DILUENTS (CARDOLITE NC 513)", "R7802", "Raw Material", "Confirmed"),
+    ("C2810/01", "POLYESTER RESIN CASULE(300 X 32)", "R7803", "Raw Material", "Confirmed"),
+    ("C2810/02", "POLYESTER RESIN CASULE(300 X 40)", "R7804", "Raw Material", "Confirmed"),
+    ("C0870/01", "CALCIUM SULPHATE - GYPSUM", "R8001", "Raw Material", "Confirmed"),
+    ("C2370/01", "MONO PROPYLENE GLYCOL", "R8002", "Raw Material", "Confirmed"),
+    ("C3465/01", "SODIUM GLUCONATE POWDER", "R8003", "Raw Material", "Confirmed"),
+    ("C3810/01", "SUGAR – SUCROSE", "R8004", "Raw Material", "Confirmed"),
+    ("C3460/01", "SODIUM SILICOFLUORIDE", "R8201", "Raw Material", "Confirmed"),
+    ("C3615/01", "SODIUM SULPHATE", "R8202", "Raw Material", "Confirmed"),
+    ("C3255/04", "QUARTZ SAND (75-300)", "R8402", "Raw Material", "Confirmed"),
+    ("C3345/07", "SILICA SAND (0.15-2mm)", "R8403", "Raw Material", "Confirmed"),
+    ("C3345/16", "SILICA SAND DRY(<600 Mic)", "R8404", "Raw Material", "Confirmed"),
+    ("C3065/01", "POLYSULPHIDE SEALANT POUR GRADE(HIND SEALANT PS)", "T3000", "Raw Material", "Confirmed"),
+    ("C3070/01", "POLYURATHANE SEALANT 1K(HIND SEALANT PU)", "T3002", "Raw Material", "Confirmed"),
+    ("C2775/01", "POLYDIMETHYL POLYSILOXANE(Aquaphobe WR2)", "R8801", "Raw Material", "Confirmed"),
+    ("C3170/01", "POTASSIUM METHYL SILICONATE(SILRES BS 16)", "R8802", "Raw Material", "Confirmed"),
+    ("C3600/01", "SODIUM SILICATE SOLUTION (wt. ratio 3.30)", "R9001", "Raw Material", "Confirmed"),
+    ("C3601/01", "POTASSIUM LITHIUM SILICATE", "R9002", "Raw Material", "Confirmed"),
+    ("C2075/01", "LIQUID HINDERED AMINE STABILIZER(POLYSORB 292)", "R9201", "Raw Material", "Confirmed"),
+    ("C2190/01", "METHYL ETHYL KETONE", "R9202", "Raw Material", "Confirmed"),
+    ("C2265/01", "METHYL ISOBUTYL KETONE", "R9203", "Raw Material", "Confirmed"),
+    ("C2745/01", "POLYACRYLAMIDE", "R6610", "Raw Material", "Confirmed"),
+    ("C4230/01", "XYLENE", "R9204", "Raw Material", "Confirmed"),
+    ("C0145/01", "ACRYLIC TYPE VMA - DYN A70", "R9801", "Raw Material", "Confirmed"),
+    ("C0145/02", "ACRYLIC VMA(BONDEX T60/INDOFIL ASE 60)", "R9802", "Raw Material", "Confirmed"),
+    ("C0145/03", "PECEVIS 100", "R9805", "Raw Material", "Confirmed"),
+    ("C1680/01", "FUMED SILICA/MICRO SILICA", "R9803", "Raw Material", "Confirmed"),
+    ("C1685/01", "HYDROPHILIC FUMES SILICA(AEROSIL 200)", "R9804", "Raw Material", "Confirmed"),
+    ("C3455/01", "SODIUM FLUORIDE", "R1009", "Raw Material", "Confirmed"),
+    ("C0361/02", "BITUMINUS COATING(ELASTOCRYL EMB)", "R7204", "Raw Material", "Confirmed"),
+    ("C3068/01", "POLYURATHANE GROUT SINGLE COMPONENT(HYDROGUARDIAN- DHP 2000)", "R7205", "Raw Material", "Confirmed"),
+    ("C3069/01", "POLYURATHANE GROUT DOUBLE COMPONENT(HYDROGUARDIAN-DHP 9000)", "R7206", "Raw Material", "Confirmed"),
+    ("C2310/01", "MICROSILICA (DENSIFIED) 92%", "R3006", "Raw Material", "Confirmed"),
+    ("C2310/02", "MICROSILICA (UNDENSIFIED) 92%", "R3007", "Raw Material", "Confirmed"),
+    ("C2310/03", "MICROSILICA (UNDENSIFIED) 85%", "R3008", "Raw Material", "Confirmed"),
+    ("C3195/01", "POWDER DEFOAMER(ADDITIVE 5154)", "R3601", "Raw Material", "Confirmed"),
+    ("C0855/01", "CALCIUM STEARATE POWDER", "R4610", "Raw Material", "Confirmed"),
+    ("C0615/02", "BISPHENOL A EPOXY RESIN(LAPOX B47)", "R7805", "Raw Material", "Confirmed"),
+    ("C3255/07", "QURTZ SAND (45 Micron/300 Mesh)", "R8405", "Raw Material", "Confirmed"),
+    ("C0990/09", "Calamdum", "R3009", "Raw Material", "Confirmed"),
+    ("C0315/01", "Aluminium Powder", "R5201", "Raw Material", "Confirmed"),
+    ("C1881/05", "CAMSPEED 3054", "R5006", "Raw Material", "Confirmed"),
+    ("C1881/06", "HARDENER FOR EPOXY(CAMCURE 2979)", "R5007", "Raw Material", "Confirmed"),
+    ("C1881/07", "HARDENER FOR EPOXY(PHENOLALKAMINE BASED- CARDOLITE LITE 2401)", "R5008", "Raw Material", "Confirmed"),
+    ("C2700/14", "ZINC METAL PIGMENT", "R5202", "Raw Material", "Confirmed"),
+    ("X40001", "50% SOLUTION OF BONDEX T-60", None, "Process/Intermediate", "Confirmed"),
+    ("X50001", "2% SOLUTION OF HEC", None, "Process/Intermediate", "Confirmed"),
+    ("X50002", "10% SOLUTION OF SHMP", None, "Process/Intermediate", "Confirmed"),
+    ("X60001", "1% SOLUTION OF AMMONIA", None, "Process/Intermediate", "Confirmed"),
+    ("X70001", "80% SOLUTION OF DEA", None, "Process/Intermediate", "Confirmed"),
+    ("X80001", "FLOOR WASTAGE POWDER MATERIAL", None, "Process/Intermediate", "Confirmed"),
+    ("X90001", "TIO2 PASTE", None, "Process/Intermediate", "Confirmed"),
+    ("X90002", "CRETE 1", None, "Process/Intermediate", "Confirmed"),
+    ("X90003", "CRETE 2", None, "Process/Intermediate", "Confirmed"),
+    ("C1005/01", "CHINA CLAY (KAOLIN)", "R4611", "Raw Material", "Confirmed"),
+    ("C3245/01", "PVA 2488", "R1406", "Raw Material", "Confirmed"),
+    ("C1881/08", "HARDENER FOR EPOXY(CAMCURE W287)", "R5009", "Raw Material", "Confirmed"),
+    ("C3345/01", "Silica Powder(300 mesh)", "R4612", "Raw Material", "Confirmed"),
+    ("C0250/01", "Baraytes Powder(400 mesh)", "R4613", "Raw Material", "Confirmed"),
+    ("C1745/01", "Globamine Green", "R1407", "Raw Material", "Confirmed"),
+    ("C3680/01", "Solvesso 100", "R9205", "Raw Material", "Confirmed"),
+    ("C0600/01", "Benzoyl Alcohol", "R9206", "Raw Material", "Confirmed"),
+    ("C1881/03", "Cardolite NX 5198", "R5010", "Raw Material", "Confirmed"),
+    ("C1505/01", "Resicare AIC", "R1408", "Raw Material", "Confirmed"),
+    ("C1190/02", "AFA 2KI", "R3606", "Raw Material", "Confirmed"),
+    ("C3345/09", "1 mm down sand", "R8406", "Raw Material", "Confirmed"),
+    ("C0885/01", "CSA Binder", "R3010", "Raw Material", "Confirmed"),
+    ("C1620/01", "FLY ASH", "R3011", "Raw Material", "Confirmed"),
+    ("C1620/02", "FLY ASH(Siliguri)", "R3012", "Raw Material", "Confirmed"),
+    ("C1470/01", "EMERY GRIT(0.15 MM -2.36 MM)", "R8407", "Raw Material", "Confirmed"),
+    ("C2385/01", "MTO", "R9207", "Raw Material", "Confirmed"),
+    ("C4170/01", "WATER", "R9208", "Raw Material", "Confirmed"),
+    ("C4200/01", "SAVCAT 40", "R4001", "Raw Material", "Confirmed"),
+    ("C0185/01", "ALKYD RESIN", "R7806", "Raw Material", "Confirmed"),
+    ("C3345/18", "<600 micron Siliguri", "R8408", "Raw Material", "Confirmed"),
+    ("C3345/20", "-2.36 Sand Siliguri", "R8409", "Raw Material", "Confirmed"),
+    ("C0750/09", "CALCIUM CARBONATE- PRECIPITATED (~1Mic)", "R4618", "Raw Material", "Confirmed"),
+    ("C2415/01", "N,N-DIMETHYLANILINE", "R2602", "Raw Material", "Confirmed"),
+    ("C1100/01", "COBALT OCTATE(6%)", "R2603", "Raw Material", "Confirmed"),
+    ("C1100/02", "COBALT OCTATE(3%)", "R2604", "Raw Material", "Confirmed"),
+    ("C0585/02", "BENZOYL PEROXIDE (75%)", "R2605", "Raw Material", "Confirmed"),
+    ("C2815/01", "POLYESTER RESIN GP GRADE", "R7807", "Raw Material", "Confirmed"),
+    ("C3510/02", "SODIUM LAURYL SULPHATE", "R1602", "Raw Material", "Confirmed"),
+    ("C3305/01", "SINGLE POLYMER FOR PUTTY", "R6611", "Raw Material", "Confirmed"),
+    ("C4035/01", "TRIETHYLENE TETRAMINE (T.E.T.)", "R5011", "Raw Material", "Confirmed"),
+    ("C1995/01", "ISOPHORONE DIAMINE HARDENER(45)", "R5012", "Raw Material", "Confirmed"),
+    ("C1995/02", "ISOPHORONE DIAMINE HARDENER(60)", "R5013", "Raw Material", "Confirmed"),
+    ("C3255/02", "QUARTZ SAND 300 MESH (0.75mm - 0.425mm)", "R8410", "Raw Material", "Confirmed"),
+    ("C2700/11", "PIGMENT - INORGANIC (MIDDLE CHROME -1322)", "R8420", "Raw Material", "Confirmed"),
+    ("C3275/01", "RESICARE AIC", "R1410", "Raw Material", "Confirmed"),
+    ("C3255/09", "QUARTZ SAND (-150 MICRON)(WHITE)", "R8411", "Raw Material", "Confirmed"),
+    ("C1965/01", "ISOCYANATE RESIN ALIPHATIC-HDI-DESMODUR N75", "R7810", "Raw Material", "Confirmed"),
+    ("C1980/01", "ISOCYANATE RESIN AROMATIC-MDI", "R7809", "Raw Material", "Confirmed"),
+    ("C2945/01", "POLYOL RESIN(CARDOLITE NX9005)", "R7808", "Raw Material", "Confirmed"),
+    ("C2360/01", "MOISTURE SCAVENGER AND STABILISER(ADDITIVE OF)", "R1409", "Raw Material", "Confirmed"),
+    ("C1120/01", "COCO DI ETHANOL AMIDE", "R1207", "Raw Material", "Confirmed"),
+    ("C0345/02", "ALUMINIUM SULPHATE IRON FREE GRADE(40%) SOLUTION", "R1012", "Raw Material", "Confirmed"),
+    ("C0146/01", "AGGREGATE 20MM SINGUR", "R4614", "Raw Material", "Confirmed"),
+    ("C0146/02", "AGGREGATE 20MM SILIGURI", "R4615", "Raw Material", "Confirmed"),
+    ("C0147/01", "AGGREGATE 10MM SINGUR", "R4616", "Raw Material", "Confirmed"),
+    ("C0147/01", "AGGREGATE 10MM SILIGURI", "R4617", "Raw Material", "Confirmed"),
+    ("C0840/02", "CALCIUM NITRATE POWDER", "R8203", "Raw Material", "Confirmed"),
+    ("C0485/02", "ANTISETTLING AGENT (ADDITIVE 5292)", "R3203", "Raw Material", "Confirmed"),
+    ("C1995/03", "CARDOLITE NT 5901", "R5014", "Raw Material", "Confirmed"),
+    ("C2700/39", "PIGMENT-CEEROX RED OXIDE 130", "R6420", "Raw Material", "Confirmed"),
+    ("C2701/01", "PEARL GOLD- EMS 351", "R6421", "Raw Material", "Confirmed"),
+    ("C2045/01", "JOINT FILLER BOARD", "R7400", "Raw Material", "Confirmed"),
+    ("C3890/01", "TAPE- JOINT TPE(T-1MM: W-150 MM: L-50MM)", "R7401", "Raw Material", "Confirmed"),
+    ("C1606/01", "FIBERMESH 45 GSM", "R4403", "Raw Material", "Confirmed"),
+    ("C3065/03", "PU BASED PRIMER(HIND PRIME PU-250 GM)", "R7207", "Raw Material", "Confirmed"),
+    ("C3068/02", "POLYURATHANE GROUT SINGLE COMPONENT(HIND HYDROFOAM PU SC)", "R7208", "Raw Material", "Confirmed"),
+    ("C0145/04", "KELCOCRETE DG(DIUTAN GUM)", "R9806", "Raw Material", "Confirmed"),
+    ("C2105/01", "LITHIUM NITRATE ANHYDROUS POWDER", "R8204", "Raw Material", "Confirmed"),
+    ("C2195/01", "METHYL ETHYL KETONE PEROXIDE", "R2607", "Raw Material", "Confirmed"),
+    ("C3066/01", "POLYSULPHIDE SEALANT GUN GRADE", "T3003", "Raw Material", "Confirmed"),
+    ("C3435/02", "SODIUM CARBONATE(LIGHT)", "R1010", "Raw Material", "Confirmed"),
+    ("C3645/02", "SODIUM THIOSULPHATE PENTAHYDRATE", "R1011", "Raw Material", "Confirmed"),
+    ("C3755/01", "STONE DUST", "R4619", "Raw Material", "Confirmed"),
+    ("C3855/01", "SULPHONATED MELAMINE FORMALDEHYDE CONDENSATE", "R7005", "Raw Material", "Confirmed"),
+    ("P1000", "NM PLASTIC BOTTLE 500 ML WITH INNER, WH", None, "Packaging", "Confirmed"),
+    ("P1100", "NM PLASTIC BOTTLE 1000 ML WITH INNER,WH", None, "Packaging", "Confirmed"),
+    ("P1200", "NM PLASTIC BOTTLE 5000 ML WITH INNER,WH", None, "Packaging", "Confirmed"),
+    ("P2000", "WM PLASTIC WHITE BOTTLE 100 ML WITH INNER, WOH", None, "Packaging", "Confirmed"),
+    ("P2100", "WM PLASTIC WHITE BOTTLE 200 ML WITH INNER, WOH", None, "Packaging", "Confirmed"),
+    ("P2200", "WM PLASTIC WHITE  BOTTLE 500 ML WITH INNER, WOH", None, "Packaging", "Confirmed"),
+    ("P2300", "WM PLASTIC WHITE BOTTLE 1000 ML WITH INNER, WOH", None, "Packaging", "Confirmed"),
+    ("P2400", "WM PLASTIC CLEAR BOTTLE 500 ML WITHOUT INNER", None, "Packaging", "Confirmed"),
+    ("P3000", "WM PLASTIC WHITE 250 ML CONTAINER WITH INNER", None, "Packaging", "Confirmed"),
+    ("P3100", "WM PLASTIC WHITE 500 ML CONTAINER WITH INNER", None, "Packaging", "Confirmed"),
+    ("P3200", "WM PLASTIC CLEAR 500 ML CONTAINER WITHOUT INNER", None, "Packaging", "Confirmed"),
+    ("P4000", "1LTR WHITE BUCKET WITHOUT HANDLE RED LID", None, "Packaging", "Confirmed"),
+    ("P4100", "2LTR WHITE BUCKET WITH HANDLE RED LID", None, "Packaging", "Confirmed"),
+    ("P4200", "5LTR WHITE BUCKET WITH HANDLE RED LID", None, "Packaging", "Confirmed"),
+    ("P4300", "10LTR WHITE BUCKET WITH HANDLE RED LID", None, "Packaging", "Confirmed"),
+    ("P4400", "20LTR WHITE BUCKET WITH HANDLE RED LID", None, "Packaging", "Confirmed"),
+    ("P4500", "25LTR WHITE BUCKET WITH HANDLE RED LID", None, "Packaging", "Confirmed"),
+    ("P5000", "210 LTR BLUE BARREL", None, "Packaging", "Confirmed"),
+    ("P5100", "210 LTR WHITE BARREL", None, "Packaging", "Confirmed"),
+    ("P5200", "235 LTR BLUE BARREL", None, "Packaging", "Confirmed"),
+    ("P5300", "235 LTR WHITE BARREL", None, "Packaging", "Confirmed"),
+    ("P5400", "50 LTR BLUE BARREL", None, "Packaging", "Confirmed"),
+    ("P5500", "100 LTR BLUE BARREL", None, "Packaging", "Confirmed"),
+    ("P5600", "1000 LTR IBC NEW", None, "Packaging", "Confirmed"),
+    ("P5610", "1000 LTR IBC OLD", None, "Packaging", "Confirmed"),
+    ("P6000", "HDPE COMMON BAG 30 KG WITH LINER", None, "Packaging", "Confirmed"),
+    ("P6050", "HDPE BAG FOR PLASTWELL 40 KG WITH LINER", None, "Packaging", "Confirmed"),
+    ("P6100", "HDPE BAG FOR BLOCKFIX 40 KG WITH LINER", None, "Packaging", "Confirmed"),
+    ("P6110", "HDPE BAG FOR WALLSAFE 40 KG WITH LINER", None, "Packaging", "Confirmed"),
+    ("P6150", "HDPE BAG FOR TILLEGLUE 1.0 20 KG WITH LINER", None, "Packaging", "Confirmed"),
+    ("P6200", "HDPE BAG FOR TILLEGLUE 2.0 20 KG WITH LINER", None, "Packaging", "Confirmed"),
+    ("P6250", "HDPE BAG FOR TILLEGLUE 3.0 20 KG WITH LINER", None, "Packaging", "Confirmed"),
+    ("P6300", "HDPE BAG FOR TILLEGLUE 4.0 20 KG WITH LINER", None, "Packaging", "Confirmed"),
+    ("P6350", "HDPE BAG FOR TILEGLUE 4.0 + 20 KG WITH LINER", None, "Packaging", "Confirmed"),
+    ("P6400", "LOCKTIE 8 INCH", None, "Packaging", "Confirmed"),
+    ("P6450", "LOCKTIE 10 INCH", None, "Packaging", "Confirmed"),
+    ("P6500", "LOCKTIE 12 INCH", None, "Packaging", "Confirmed"),
+    ("P6550", "POLYPACK CLEAR 2KG", None, "Packaging", "Confirmed"),
+    ("P6600", "POLYPACK CLEAR 5KG", None, "Packaging", "Confirmed"),
+    ("P6650", "POLYPACK WHITE 2KG", None, "Packaging", "Confirmed"),
+    ("P6700", "POLYPACK WHITE 5KG", None, "Packaging", "Confirmed"),
+    ("P6750", "POLYPACK CLEAR 30KG", None, "Packaging", "Confirmed"),
+    ("P6800", "POLYPACK CLEAR 15KG", None, "Packaging", "Confirmed"),
+    ("P7000", "20KG 5PLY COOMON CARTOON", None, "Packaging", "Confirmed"),
+    ("P7050", "7PLY CARTOON- CONCAP R PRINTED", None, "Packaging", "Confirmed"),
+    ("P7100", "EP BOND BA CARTOON-PRINTED(0.4+0.2KG WM X 12 UNIT)", None, "Packaging", "Confirmed"),
+    ("P7150", "EP BOND BA CARTOON-PRINTED(2+1KG X 2 UNIT)", None, "Packaging", "Confirmed"),
+    ("P7200", "CARTOON BOX(0.2KG X 24)-COMMON", None, "Packaging", "Confirmed"),
+    ("P7250", "CARTOON BOX(0.5KGX 18 NOS.)-COMMON", None, "Packaging", "Confirmed"),
+    ("P7300", "CARTOON BOX(1KGX 12 NOS.)-COMMON", None, "Packaging", "Confirmed"),
+    ("P7350", "CARTOON BOX(600ML X 20 UNIT)-PRINTED PUSEAL", None, "Packaging", "Confirmed"),
+    ("P7400", "CARTOON(0.5+0.5KG WM X 4) -EP COAT FGW PRINTED", None, "Packaging", "Confirmed"),
+    ("P7410", "CARTOON(0.5+0.5KG WM)", None, "Packaging", "Confirmed"),
+    ("P7450", "CARTOON(5KG X 4) -COMMON", None, "Packaging", "Confirmed"),
+    ("P7500", "CARTOON(1KG X 15) -SUPERGROUT CG PRINTED", None, "Packaging", "Confirmed"),
+    ("P7550", "CARTOON( 2+2 KG BUCKET x 2) -EP COAT FGW PRINTED", None, "Packaging", "Confirmed"),
+    ("P7600", "CARTOON( 1KG BUCKET X 10 ) -REPCON CRACK X PRINTED", None, "Packaging", "Confirmed"),
+    ("P7650", "CARTOON( 3KG BUCKET X 4 ) -REPCON CRACK X PRINTED", None, "Packaging", "Confirmed"),
+    ("P7700", "CARTOON( 2+2 KG BUCKET x 2) -EP GROUT LV PRINTED", None, "Packaging", "Confirmed"),
+    ("P7750", "CARTOON (0.25KG X 20)-PU SEAL PRIMER PRINTED", None, "Packaging", "Confirmed"),
+    ("P7800", "CARTOON (600 ML X 20)-PU SEAL PRINTED", None, "Packaging", "Confirmed"),
+    ("P7850", "ANCHOR PR CARTOON(1 KG)", None, "Packaging", "Confirmed"),
+    ("ST1000", "0.2 KG STICKER-AQUAPROOF IW", None, "Label/Sticker", "Confirmed"),
+    ("ST1050", "0.2 KG STICKER-ADMIX CG", None, "Label/Sticker", "Confirmed"),
+    ("ST1100", "0.2 KG STICKER-ANCHOR PR PART 1", None, "Label/Sticker", "Confirmed"),
+    ("ST2000", "0.5 KG STICKER-AQUAPROOF CRYSTALLINE", None, "Label/Sticker", "Confirmed"),
+    ("ST2050", "0.5 KG STICKER- CEMBOND SBR", None, "Label/Sticker", "Confirmed"),
+    ("ST2100", "0.5 KG STICKER-CEMCOAT AR", None, "Label/Sticker", "Confirmed"),
+    ("ST2150", "0.5 KG STICKER-RUSTCURE", None, "Label/Sticker", "Confirmed"),
+    ("ST2200", "0.5 KG STICKER-TILESMART AC", None, "Label/Sticker", "Confirmed"),
+    ("ST2250", "0.5 KG STICKER-EP COAT FGW COMP A", None, "Label/Sticker", "Confirmed"),
+    ("ST2260", "0.5 KG STICKER-EP COAT FGW COMP B", None, "Label/Sticker", "Confirmed"),
+    ("ST3000", "1.0 kg STICKER-AQUAPROOF IW", None, "Label/Sticker", "Confirmed"),
+    ("ST3050", "1.0 kg STICKER-CEMBOND SBR", None, "Label/Sticker", "Confirmed"),
+    ("ST3100", "1.0 kg STICKER-CEMCOAT AR", None, "Label/Sticker", "Confirmed"),
+    ("ST3110", "1kg COMMON STICKER FG", None, "Label/Sticker", "Confirmed"),
+    ("ST3150", "1.0 kg STICKER-ELASTOCEM COMP B", None, "Label/Sticker", "Confirmed"),
+    ("ST3200", "1.0 kg STICKER-ELASTOCEM FLEX COMP B", None, "Label/Sticker", "Confirmed"),
+    ("ST3250", "1.0 kg STICKER-ELASTOCEM SUPER FLEX COMP B", None, "Label/Sticker", "Confirmed"),
+    ("ST3300", "1.0 kg STICKER-ELASTOCAT", None, "Label/Sticker", "Confirmed"),
+    ("ST3350", "1.0 kg STICKER-ELASTOCAT SR", None, "Label/Sticker", "Confirmed"),
+    ("ST3400", "1.0 kg STICKER-RUSTCURE", None, "Label/Sticker", "Confirmed"),
+    ("ST3410", "1.0 kg STICKER-TILESSMART AC", None, "Label/Sticker", "Confirmed"),
+    ("ST3450", "1.0 kg STICKER-CEMCOAT PRIMER", None, "Label/Sticker", "Confirmed"),
+    ("ST3500", "1.0 kg STICKER-AQUAPROOF PRIMER PU W COMP A", None, "Label/Sticker", "Confirmed"),
+    ("ST3550", "1.0 kg STICKER-AQUAPROOF PRIMER PU W COMP B", None, "Label/Sticker", "Confirmed"),
+    ("ST3600", "1.0 kg STICKER-SILICOCOAT", None, "Label/Sticker", "Confirmed"),
+    ("ST3660", "1.0 kg STICKER-EP COAT ZINK", None, "Label/Sticker", "Confirmed"),
+    ("ST3700", "1.0 kg STICKER-REPCON CRACK-X", None, "Label/Sticker", "Confirmed"),
+    ("ST3750", "5.0 kg STICKER-AQUAPROOF IW", None, "Label/Sticker", "Confirmed"),
+    ("ST3800", "5.0 kg STICKER-CEMBOND SBR", None, "Label/Sticker", "Confirmed"),
+    ("ST3850", "5.0 kg STICKER-CEMCOAT AR", None, "Label/Sticker", "Confirmed"),
+    ("ST3900", "5.0 kg STICKER-ELASTOCEM COMP B", None, "Label/Sticker", "Confirmed"),
+    ("ST3950", "5.0 kg STICKER-ELASTOCEM FLEX COMP B", None, "Label/Sticker", "Confirmed"),
+    ("ST4000", "5.0 kg STICKER-ELASTOCEM SUPER FLEX COMP B", None, "Label/Sticker", "Confirmed"),
+    ("ST4050", "5.0 kg STICKER-ELASTOCAT", None, "Label/Sticker", "Confirmed"),
+    ("ST4100", "5.0 kg STICKER-ELASTOCAT SR", None, "Label/Sticker", "Confirmed"),
+    ("ST4150", "5.0 kg STICKER-RUSTCURE", None, "Label/Sticker", "Confirmed"),
+    ("ST4200", "5.0 kg STICKER-TILESSMART AC", None, "Label/Sticker", "Confirmed"),
+    ("ST4250", "5.0 kg STICKER-CEMCOAT PRIMER", None, "Label/Sticker", "Confirmed"),
+    ("ST4300", "5.0 kg STICKER-AQUAPROOF PRIMER PU W COMP A", None, "Label/Sticker", "Confirmed"),
+    ("ST4310", "5.0 kg STICKER-AQUAPROOF PRIMER PU W COMP B", None, "Label/Sticker", "Confirmed"),
+    ("ST4350", "5.0 kg STICKER-SILICOCOAT", None, "Label/Sticker", "Confirmed"),
+    ("ST4400", "5.0 kg STICKER-EP COAT ZINK", None, "Label/Sticker", "Confirmed"),
+    ("ST4450", "10 kg STICKER-AQUAPROOF IW", None, "Label/Sticker", "Confirmed"),
+    ("ST4500", "10 kg STICKER-CEMBOND SBR", None, "Label/Sticker", "Confirmed"),
+    ("ST4550", "10 kg STICKER-CEMCOAT AR", None, "Label/Sticker", "Confirmed"),
+    ("ST4600", "10 kg STICKER-AQUAPROOF PU W1", None, "Label/Sticker", "Confirmed"),
+    ("ST4650", "10 kg STICKER-ELASTOCAT", None, "Label/Sticker", "Confirmed"),
+    ("ST4700", "10 kg STICKER-ELASTOCAT SR", None, "Label/Sticker", "Confirmed"),
+    ("ST4750", "15 kg STICKER-ELASTOCEM FLEX", None, "Label/Sticker", "Confirmed"),
+    ("ST4800", "20 kg STICKER-AQUAPROOF IW", None, "Label/Sticker", "Confirmed"),
+    ("ST4850", "20 kg STICKER-CEMBOND SBR", None, "Label/Sticker", "Confirmed"),
+    ("ST4900", "20 kg STICKER-CEMCOAT AR", None, "Label/Sticker", "Confirmed"),
+    ("ST4950", "20 kg STICKER-AQUAPROOF PU W1", None, "Label/Sticker", "Confirmed"),
+    ("ST5000", "20 kg STICKER-ELASTOCAT", None, "Label/Sticker", "Confirmed"),
+    ("ST5050", "20 kg STICKER-ELASTOCAT SR", None, "Label/Sticker", "Confirmed"),
+    ("ST5100", "20 kg STICKER-CEMCOAT PRIMER", None, "Label/Sticker", "Confirmed"),
+    ("ST5150", "20 kg STICKER-SILICOCOAT", None, "Label/Sticker", "Confirmed"),
+    ("ST5200", "20 kg STICKER-ELASTOCEM", None, "Label/Sticker", "Confirmed"),
+    ("ST5250", "20 kg STICKER-ELASTOCEM SUPERFLEX", None, "Label/Sticker", "Confirmed"),
+    ("ST5300", "20 kg STICKER-AQUAPROOP PU S1", None, "Label/Sticker", "Confirmed"),
+    ("ST5350", "20 kg STICKER-CONSET CA", None, "Label/Sticker", "Confirmed"),
+    ("ST5400", "20 kg STICKER-HIPROCAST 20E", None, "Label/Sticker", "Confirmed"),
+    ("ST5450", "20 kg STICKER-HIPROCAST 30E", None, "Label/Sticker", "Confirmed"),
+    ("ST5500", "20 kg STICKER-HIPROCAST 50E", None, "Label/Sticker", "Confirmed"),
+    ("ST5550", "250 kg STICKER-ESTEEMA 501", None, "Label/Sticker", "Confirmed"),
+    ("ST5600", "250 kg STICKER-ESTEEMA 1001", None, "Label/Sticker", "Confirmed"),
+    ("ST5650", "250 kg STICKER-ESTEEMA 1501", None, "Label/Sticker", "Confirmed"),
+    ("ST5700", "250 kg STICKER-ESTEEMA 2001", None, "Label/Sticker", "Confirmed"),
+    ("ST5750", "250 kg STICKER-ESTEEMA PLUS 2501", None, "Label/Sticker", "Confirmed"),
+    ("ST5800", "250 kg STICKER-ESTEEMA PLUS 2751", None, "Label/Sticker", "Confirmed"),
+    ("ST5850", "250 kg STICKER-ESTEEMA PLUS 3001", None, "Label/Sticker", "Confirmed"),
+    ("ST5900", "250 kg STICKER-HIPROCAST 20E", None, "Label/Sticker", "Confirmed"),
+    ("ST5950", "250 kg STICKER-HIPROCAST 30E", None, "Label/Sticker", "Confirmed"),
+    ("ST6000", "250 kg STICKER-HIPROCAST 50E", None, "Label/Sticker", "Confirmed"),
+    ("ST6050", "200 LTR STICKER-SHUTTEROL RA", None, "Label/Sticker", "Confirmed"),
+    ("ST6100", "200 LTR STICKER-SHUTTEROL RAS", None, "Label/Sticker", "Confirmed"),
+    ("ST6150", "200 LTR STICKER-SHUTTEROL RAE", None, "Label/Sticker", "Confirmed"),
+    ("ST6200", "200 LTR STICKER-SHUTTEROL RA EXTRA", None, "Label/Sticker", "Confirmed"),
+    ("ST6250", "275 kg STICKER-SPRAYCON A", None, "Label/Sticker", "Confirmed"),
+    ("ST6300", "275 kg STICKER-SPRAYCON AF", None, "Label/Sticker", "Confirmed"),
+    ("ST6350", "275 kg STICKER-SPRAYCON AF(LV)", None, "Label/Sticker", "Confirmed"),
+    ("ST6400", "STICKER - ANCHOR PR PART 2", None, "Label/Sticker", "Confirmed"),
+]
+
+# ── Legacy free-text material names (used in historical ERP records) mapped
+# to their canonical name above, matched via shared internal lab code. This lets
+# old rm_batches/bom_lines/etc. rows keep displaying correctly without rewriting
+# historical data. Format: (legacy_name, canonical_name)
+SEED_MATERIAL_ALIASES = [
+    ("ADDAGE PCE 128 (POLY CARBOXYLATE ETHER) POWDER", "POLYCARBOXYLIC ETHER POWDER"),
+    ("ADDAGE PCE POWDER", "POLYCARBOXYLIC ETHER POWDER"),
+    ("ALPHOX-200 H", "NONYL PHENOL ETHOXYLATE"),
+    ("ALPOX 200", "NONYL PHENOL ETHOXYLATE"),
+    ("ALUMINIUM SULPHATE", "ALUMINIUM SULPHATE IRON FREE GRADE"),
+    ("ANTI FOAM POWDER", "ANTIFOAM"),
+    ("APCOTEX TSN 651", "STYRENE BUTADIENE RUBBER LATEX (STYROFAN D623)"),
+    ("AQUAPHOBE WR2", "POLYDIMETHYL POLYSILOXANE(Aquaphobe WR2)"),
+    ("BARYTES POWDER 2511", "BARIUM SULPHATE (OFF COLOURED)"),
+    ("BONDEX 5800", "ACRYLIC COPOLYMER EMULSION(BONDEX 5800)"),
+    ("BONDEX J-400", "STYRENE ACRYLIC COPOLYMER EMULSION(BONDEX J400)"),
+    ("BONDEX T 60", "ACRYLIC VMA(BONDEX T60/INDOFIL ASE 60)"),
+    ("BUTYL CELLSOLOV", "BUTYL CELLOSOLVE"),
+    ("BYK-9076", "BYK 9076"),
+    ("Bondex 5295", "WATER-BASED DISPERSION OR EMULSION OF ACRYLIC AND STYRENE COPOLYMER WITH FINE PARTICLES(BONDEX 5295)"),
+    ("C 400", "STYRENE ACRYLIC COPOLYMER EMULSION(BONDEX J400)"),
+    ("C 76", "STYRENE ACRYLIC COPOLYMER EMULSION(BONDEX J76C)"),
+    ("C-2835/03  PCT135", "POLYCARBOXYLIC ETHER (LIQUID) (PCT 135)"),
+    ("CALCIUM CARBONATE 1000", "CALCIUM CARBONATE- 300 MESH"),
+    ("CALCIUM CHLORIDE", "CALCIUM CHLORIDE SOLID(FUSED)"),
+    ("CALCIUM FORMATE", "CALCIUM FORMATE POWDER"),
+    ("CALCIUM STARATE", "CALCIUM STEARATE POWDER"),
+    ("CAMCURE 2979", "HARDENER FOR EPOXY(CAMCURE 2979)"),
+    ("CAMCURE W287", "HARDENER FOR EPOXY(CAMCURE W287)"),
+    ("CAMSPEED 3054", "CAMSPEED 3054"),
+    ("CEEFAST ALPHA BLUE 15.0 (U)", "PIGMENT-CEEFAST ALPHA BLUE 15:0 (U)"),
+    ("CEEFAST BETA BLUE (U)", "PIGMENT-CEEFAST BETA BLUE (U)"),
+    ("CEEFAST CHROMOCYANINE", "PIGMENT - INORGANIC CHROMOCYANINE GREEN-1753"),
+    ("CEEFAST CHROMOCYANINE GREEN", "PIGMENT - INORGANIC CHROMOCYANINE GREEN-1753"),
+    ("CEEFAST GREEN 7(U)", "PIGMENT-CEEFAST GREEN 7 (U)"),
+    ("CEEFAST RED 48.2", "PIGMENT-CEEFAST RED 48:2"),
+    ("CEEFAST VIOLET TONER 777", "PIGMENT-CEEFAST VIOLET TONER 777"),
+    ("CEEFST GREEN B 807", "PIGMENT-CEEFAST GREEN  B 807"),
+    ("CEEROX BLACK OXIDE", "PIGMENT - INORGANIC - IRON OXIDE BLACK"),
+    ("CEEROX BLACK OXIDE 330", "PIGMENT - INORGANIC - IRON OXIDE BLACK"),
+    ("CEEROX BROWN OXIDE", "PIGMENT-CEEROX BROWN OXIDE"),
+    ("CEEROX RED OXIDE 130", "PIGMENT - INORGANIC - IRON OXIDE RED PIGMENT"),
+    ("CEEROX RED OXIDE 445", "PIGMENT-CEEROX RED OXIDE 445"),
+    ("CEEROX RED OXIDE 473", "PIGMENT-CEEROX RED OXIDE 473"),
+    ("CHINA CLAY CP POWDER(KAOLIN CLAY)", "CHINA CLAY (KAOLIN)"),
+    ("CHINA CLAY CP POWDER(KAOLIN)", "CHINA CLAY (KAOLIN)"),
+    ("CITRIC ACID MONOHYDRATE", "CITRIC ACID MONOHYDRATE POWDER"),
+    ("CMC POWDER", "CARBOXYMETHYL CELLULOSE LV"),
+    ("DIETHANOLAMINE", "DIETHANOLAMINE(DEA)"),
+    ("DISPLAYER CF707", "DEFOAMER FOR PC (DYN 575/DISPLAIRE 707)"),
+    ("DOLOMITE", "CALCIUM/MAGNESIUM CARBONATE- DOLOMITE 45 MICRONE"),
+    ("DRIED ALUMINIUM HYDROXIDE GEL", "ALUMINIUM HYDROXIDE GEL DRIED"),
+    ("DYN A70", "ACRYLIC TYPE VMA - DYN A70"),
+    ("EASTMAN TEXANOL", "2,2,4-TRIMETHYL-1,3-PENTANEDIOL MONO (2-METHYL PROPANATE)(TEXANOL)"),
+    ("EMERI SAND", "EMERY GRIT(0.15 MM -2.36 MM)"),
+    ("EPOXY CURING AGENT LITE 2401", "HARDENER FOR EPOXY(PHENOLALKAMINE BASED- CARDOLITE LITE 2401)"),
+    ("EPOXY CURING AGENT NC 541", "HARDENER FOR EPOXY(PHENOLALKAMINE BASED- CARDOLITE NC541)"),
+    ("FINESET 35", "FINESET 35"),
+    ("FORMALDIHYDE", "FORMALDEHYDE SOLUTION (METHANOL STABILISED)"),
+    ("FORMIC ACID", "FORMIC ACID (85%)"),
+    ("GALAXY SLES", "SODIUM LAURYL ETHER SULPHATE"),
+    ("GINOPOL (SLS POWDER)", "SODIUM LAURYL SULPHATE"),
+    ("GLOBAMINE GREEN", "Globamine Green"),
+    ("GLYCERINE", "GLYCERINE"),
+    ("GYPSUM POWDER", "CALCIUM SULPHATE - GYPSUM"),
+    ("HIMFLOW CRETE HRWR 3J02 55%", "POLYCARBOXYLIC ETHER (LIQUID) - DYN E 35 (55%)"),
+    ("HIND HFR - WD 500", "POLYCARBOXYLIC ETHER (LIQUID) (DYN E 95 (50%)/HYDROSOFT WD 500)"),
+    ("HIND HFR - WD 500 C2835/07", "POLYCARBOXYLIC ETHER (LIQUID) (DYN E 95 (50%)/HYDROSOFT WD 500)"),
+    ("HIND MOULD RELEASE OB", "DEMOULDING OIL (SERVO CONMOULD 12/HIND MOULD RELEASE OB)"),
+    ("HYDRATED LIME", "CALCIUM HYDROXIDE (HYDRATED LIME)"),
+    ("HYDROSOFT SRF 50", "POLYCARBOXYLIC ETHER (LIQUID) - DYN R 85"),
+    ("INDOLIGA PSR50(K)", "POLYCARBOXYLIC ETHER (LIQUID) - DYN R 85"),
+    ("IPA", "ISOPROPYL ALCOHOL"),
+    ("KELCOCRETE DG-F", "KELCOCRETE DG(DIUTAN GUM)"),
+    ("LAPOX AH 428", "HARDENER FOR EPOXY(AMINE BASED- LAPOX AH 428)"),
+    ("LAPOX AH 713", "HARDENER FOR EPOXY(AMIDE BASED- LAPOX AH713)"),
+    ("LAPOX B-47", "BISPHENOL A EPOXY RESIN(LAPOX B47)"),
+    ("LAPOX B11", "BISPHENOL A EPOXY RESIN(LAPOX B11)"),
+    ("LIME STONE", "CALCIUM CARBONATE- 300 MESH"),
+    ("LUBOLICE", "OLEIC ACID (LUBOLIC GRADE)"),
+    ("MDEA", "METHYLDIETHANOLAMINE (MDEA)"),
+    ("MEK", "METHYL ETHYL KETONE"),
+    ("MERGAL K14", "PRESERVATIVE(MERGAL K-14)"),
+    ("METHYL ISOBUTYL KETONE", "METHYL ISOBUTYL KETONE"),
+    ("MICRO SILICA 85%", "MICROSILICA (UNDENSIFIED) 85%"),
+    ("MICRO SILICA 92%", "MICROSILICA (UNDENSIFIED) 92%"),
+    ("MUSCLUER OX ULTRA MARINE BLUE CI 2900", "PIGMENT-ULTRAMARINE BLUE"),
+    ("MUSCULAR OXIDE ULFRAMARINE BLUE PIGMENTS CI-2900", "PIGMENT-ULTRAMARINE BLUE"),
+    ("NC 513", "EPOXY REACTIVE DILUENTS (CARDOLITE NC 513)"),
+    ("NC 541", "HARDENER FOR EPOXY(PHENOLALKAMINE BASED- CARDOLITE NC541)"),
+    ("NC 558", "HARDENER FOR EPOXY(PHENOLALKAMINE BASED- CARDOLITE NC558)"),
+    ("NX 5454", "HARDENER FOR EPOXY(PHENOLALKAMINE BASED- CARDOLITE NX 5454)"),
+    ("OPC CEMENT", "CEMENT (OPC) 53 GRADE"),
+    ("ORTHO PHOSPHORIC ACID", "ORTHO PHOSPHORIC ACID (85%)"),
+    ("PCE 128 (POLY CARBOXYLATE ETHER)", "POLYCARBOXYLIC ETHER POWDER"),
+    ("PECEVIS 100 PS", "PECEVIS 100"),
+    ("PEG  400", "POLYETHYLENE GLYCOL 400"),
+    ("PHOSPHORIC ACID", "ORTHO PHOSPHORIC ACID (85%)"),
+    ("PIGMENTS GREEN B  807/811", "PIGMENT-CEEFAST GREEN  B 807"),
+    ("POLY ACRALAMIDE", "POLYACRYLAMIDE"),
+    ("POLY ACRYLAMIDE", "POLYACRYLAMIDE"),
+    ("POTASSIUM LITHIUM SILICATE KL25", "POTASSIUM LITHIUM SILICATE"),
+    ("PPC CEMENT", "CEMENT PPC(AMBUJA/NUVOCO)"),
+    ("PRECIPATED CALCIUM CARBONATE", "CALCIUM CARBONATE- PRECIPITATED (~1Mic)"),
+    ("PROPLYLENE GLYCOL", "MONO PROPYLENE GLYCOL"),
+    ("PUTEC 3255", "POLYESTER BASED PU DISPERSION(PUTEC 3255)"),
+    ("PVA 2488", "PVA 2488"),
+    ("QUARTZ POWDER(300 Mesh or 45 Micron)", "QURTZ SAND (45 Micron/300 Mesh)"),
+    ("QUARTZ SAND(-300 to 75)", "QUARTZ SAND (75-300)"),
+    ("R 85", "POLYCARBOXYLIC ETHER (LIQUID) - DYN R 85"),
+    ("RDP 1    5010", "REDISPERSIBLE POWDER(VINNAPAS 5010N)"),
+    ("RDP 2 5044", "REDISPERSIBLE POWDER(VINNAPAS 5044)"),
+    ("RESILANE GTMS", "SILANE BASED ADHESION PROMOTER(RESIL GTMS)"),
+    ("RHEO PLUS", "ANTISETTLING AGENT (RHEOPLUS)"),
+    ("SAND 2.36", "SILICA SAND (0.15-2mm)"),
+    ("SAND 600 MICRON", "SILICA SAND DRY(<600 Mic)"),
+    ("SAPCO NDW", "DEFOAMER FOR EMULSION (SAPCO NDW)"),
+    ("SBR LATEX", "STYRENE BUTADIENE RUBBER LATEX (COLOURCHEM)"),
+    ("SHUTTEROL RA", "DEMOULDING OIL (SERVO CONMOULD 12/HIND MOULD RELEASE OB)"),
+    ("SINGLE POLYMER", "SINGLE POLYMER FOR PUTTY"),
+    ("SLES 230 KG", "SODIUM LAURYL ETHER SULPHATE"),
+    ("SNF LIQUID", "SNF(40%)-HIMADRI"),
+    ("SNF POWDER", "SNF(POWDER)-HIMADRI"),
+    ("SNF POWDER (sodium nepthalene sulphonate)", "SNF(POWDER)-HIMADRI"),
+    ("SODA ASH(Light)", "SODIUM CARBONATE(LIGHT)"),
+    ("SODIUM CARBONATE(Light)", "SODIUM CARBONATE(LIGHT)"),
+    ("SODIUM GLUCONATE", "SODIUM GLUCONATE POWDER"),
+    ("SODIUM HYDROXIDE solution", "SODIUM HYDROXIDE SOLUTION"),
+    ("SODIUM LIGNO 01", "SODIUM LIGNOSULPHONATE POWDER (SAPPI – SOUTH AFRICA)"),
+    ("SODIUM NITRATE", "SODIUM NITRATE"),
+    ("SODIUM SHULPHATE", "SODIUM SULPHATE"),
+    ("SODIUM SILICATE", "SODIUM SILICATE SOLUTION (wt. ratio 3.30)"),
+    ("SODIUM SILICOFLUORIDE", "SODIUM SILICOFLUORIDE"),
+    ("SODIUM SULPHATE", "SODIUM SULPHATE"),
+    ("SODIUM THIOCYANATE", "SODIUM THIOCYANATE"),
+    ("SOLVENT C9", "Solvesso 100"),
+    ("SUGAR", "SUGAR – SUCROSE"),
+    ("SULPHAMIC ACID", "SULPHAMIC ACID"),
+    ("TALCUM POWDER KOHINOOR", "TALC- MAGNESIUM SILICATE"),
+    ("TEA 99%", "TRIETHANOLAMINE (TEA) - 99%"),
+    ("TECHNOCEL-500-I", "NATURAL CELLULOSE FIBRES(TECHNOCEL C500)"),
+    ("TIO2 ®", "TITANIUM DIOXIDE (RUTILE) SULPHATE PROCESSED"),
+    ("UNIWET 3048", "Uniwet 3048"),
+    ("WHITE CEMENT", "CEMENT - WHITE"),
+    ("XYLINE", "XYLENE"),
+    ("YELLOW OXIDE", "PIGMENT - INORGANIC - IRON OXIDE YELLOW PIGMENT"),
+    ("ZINC DUST", "ZINC METAL PIGMENT"),
+    ("ZINC PHOSPHATE", "PIGMENT - ZINC PHOSPHATE PIGMENT"),
+]
+
+# ── Official Finished Goods Master — imported from finished_good_codification.xlsx
+# (provided by the plant team, 2026-08-13). Format: (name, code, status).
+# code is None and status is 'Pending Code Confirmation' for the handful of
+# items the source sheet had not yet assigned a code to -- do not guess it here.
+SEED_FINISHED_GOODS_MASTER = [
+    ("AQUAPROOF CRYSTALLINE - 30KGS", "FPS_C050_30K", "Confirmed"),
+    ("AQUAPROOF C.T.X 2K", "FPS_D700", "Confirmed"),
+    ("AQUAPROOF IW 10 KGS", "FPS_C010_10K", "Confirmed"),
+    ("AQUAPROOF IW 1 KGS", "FPS_C010_1K", "Confirmed"),
+    ("AQUAPROOF IW - 200 GM", "FPS_C010_0.2K", "Confirmed"),
+    ("AQUAPROOF IW 20 KGS", "FPS_C010_20K", "Confirmed"),
+    ("AQUAPROOF IW 5 KGS", "FPS_C010_5K", "Confirmed"),
+    ("AQUAPROOF PU PRIMER - W - 10 KGS", "FPS_C1300_10K", "Confirmed"),
+    ("AQUAPROOF PU S1", "FPS_C1200-20K", "Confirmed"),
+    ("AQUAPROOF PU W1", "FPS_C400_5K", "Confirmed"),
+    ("AQUAPROOF PU W1 20 KGS", "FPS_C400_20K", "Confirmed"),
+    ("Bitukot 1K - 20 Kgs", "FPS_C800_20K", "Confirmed"),
+    ("Bitukot 1K - 5 Kgs", "FPS_C800_5K", "Confirmed"),
+    ("CEMBOND SBR 0.5 KGS", "FPS_C100_0.5K", "Confirmed"),
+    ("CEMBOND SBR 10 KGS", "FPS_C100_10K", "Confirmed"),
+    ("CEMBOND SBR 1 KGS", "FPS_C100_1K", "Confirmed"),
+    ("CEMBOND SBR 20 KGS", "FPS_C100_20", "Confirmed"),
+    ("CEMBOND SBR 5 KG", "FPS_C100_5K", "Confirmed"),
+    ("CEMCOAT AR -10 KGS", "FPS_C200_10K", "Confirmed"),
+    ("CEMCOAT AR - 1 KG", "FPS_C200_1K", "Confirmed"),
+    ("CEMCOAT AR -20 Kg", "FPS_C200_20K", "Confirmed"),
+    ("CEMCOAT AR - 5 KGS", "FPS_C200_5K", "Confirmed"),
+    ("CEMCOAT PRIMER - 5 KGS", "FPS_C150_5K", "Confirmed"),
+    ("CEMGROUT AD - 250 GM", "FPS_E250_0.25K", "Confirmed"),
+    ("CEMGROUT GP2 - 30 Kgs", "FPS_E150_30K", "Confirmed"),
+    ("CEMGROUT GP - 30 Kgs", "FPS_E050_30K", "Confirmed"),
+    ("CONSET R", "FPS_A090_250K", "Confirmed"),
+    ("CRETE VMA", "FPS_A650_200K", "Confirmed"),
+    ("CUREWELL ARB", "FPS_B300_230L", "Confirmed"),
+    ("ELASTOCEM - 20 kg", "FPS_C250_20K", "Confirmed"),
+    ("ELASTOCEM - 40 Kg", "FPS_C250_40K", "Confirmed"),
+    ("ELASTOCEM - 4 KGS", "FPS_C250_4K", "Confirmed"),
+    ("ELASTOCOAT - 10 Kgs", "FPS_C500_10K", "Confirmed"),
+    ("ELASTOCOAT - 20 Kgs", "FPS_C500_20K", "Confirmed"),
+    ("EP Bond BA", "FPS_D600_0.6K", "Confirmed"),
+    ("EP COAT FGW - 1 Kgs", "FPS_C1500_1K", "Confirmed"),
+    ("EP COAT FGW - 4 KGS", "FPS_C1500_4K", "Confirmed"),
+    ("ESTEEMA 1001", "FPS_A300_250K", "Confirmed"),
+    ("ESTEEMA 1501", "FPS_A350_250K", "Confirmed"),
+    ("ESTEEMA 2001", "FPS_A400_250K", "Confirmed"),
+    ("ESTEEMA PLUS 2501", "FPS_A500_250K", "Confirmed"),
+    ("ESTEEMA PLUS 2751", "FPS_A550_250K", "Confirmed"),
+    ("ESTEEMA PLUS 3001", "FPS_A600_250K", "Confirmed"),
+    ("HARDTOP M", "FPS_F200_30K", "Confirmed"),
+    ("HARDTOP NM", "FPS_F100", "Confirmed"),
+    ("HARDTOP NM- 30 Kg", "FPS_F100_30K", "Confirmed"),
+    ("HIPROCAST 20E", "FPS_A200_250K", "Confirmed"),
+    ("HIPROCAST 30E", "FPS_A230_250K", "Confirmed"),
+    ("HIPROCAST 50E", "FPS_A250_250K", "Confirmed"),
+    ("HIPROCAST 50HE", None, "Pending Code Confirmation"),
+    ("MICRETE- 30 KGS", "FPS_D100_30K", "Confirmed"),
+    ("PLAST AEA", "FPS_A170_200K", "Confirmed"),
+    ("POLYSEAL G 4 KGS", "FPS_G300_4K", "Confirmed"),
+    ("PUMP PRIMO", "FPS_B400_0.2K", "Confirmed"),
+    ("Pu Seal", "FPS_G100", "Confirmed"),
+    ("Pu Seal 2K", "FPS_G800_4K", "Confirmed"),
+    ("PU SEAL PRIMER", "FPS_G400_0.25K", "Confirmed"),
+    ("REPCON CRACK- X - 3 Kgs", "FPS_D500_3K", "Confirmed"),
+    ("REPCON EP UWP - 4 KGS", "FPS_D800_4K", "Confirmed"),
+    ("REPCON FC - 30 KGS", "FPS_D200_30K", "Confirmed"),
+    ("RUST CURE - 1 KG", "FPS_D1100_1K", "Confirmed"),
+    ("RUST CURE - 500 GM", "FPS_D1100_0.5K", "Confirmed"),
+    ("SHUTTEROL RA", "FPS_B550_230L", "Confirmed"),
+    ("SHUTTEROL RAE", "FPS_B600_230L", "Confirmed"),
+    ("SHUTTEROL RAE (EXTRA)", "FPS_B650_230L", "Confirmed"),
+    ("SHUTTEROL RAS", "FPS_B500_230L", "Confirmed"),
+    ("SILICOCOAT 1 KGS", "FPS_C950_1K", "Confirmed"),
+    ("SILICOCOAT 5 KGS", "FPS_C950_5K", "Confirmed"),
+    ("Spraycon AF", "FPS_A140_275K", "Confirmed"),
+    ("SPRAYCON AF (LV)", "FPS_A145_275K", "Confirmed"),
+    ("SPRAYCON AFP", "FPS_A800_20K", "Confirmed"),
+    ("SUPERGROUT CG - Alpine Blue - 1Kgs", "FPS_H800_1K013", "Confirmed"),
+    ("SUPERGROUT CG - Burgundy -1Kg", "FPS_H800_1K012", "Confirmed"),
+    ("SUPERGROUT CG - Chocolate - 1 Kgs", "FPS_H800_1K044", "Confirmed"),
+    ("SUPERGROUT CG - Native Grey - 1 Kgs", "FPS_H800_1K027", "Confirmed"),
+    ("SUPERGROUT CG - Smoke Grey - 1 Kgs", "FPS_H800_1K031", "Confirmed"),
+    ("SUPERGROUT CG - Terracotta - 1 Kgs", "FPS_H800_1K021", "Confirmed"),
+    ("SUPERGROUT EG - FP- Quarry Red-3.8Kg & Resin Kit-1.2Kg", "FPS_H900_5K022", "Confirmed"),
+    ("TOPHARD LS", "FPS_F400_250K", "Confirmed"),
+    ("TOPHARD SS", "FPS_F300_250K", "Confirmed"),
+    ("UW PLAST", "FPS_A180_230K", "Confirmed"),
+    ("ADMIX CG 200ML", "FPS_H1000_0.2L", "Confirmed"),
+    ("Anchor PR - 1kg", "FPS_E1150_1K", "Confirmed"),
+    ("AQUAPROOF CRYSTALLINE - 5KGS", "FPS_C050_5K", "Confirmed"),
+    ("AQUAPROOF PU PRIMER - W - 20 KGS", "FPS_C1300_20K", "Confirmed"),
+    ("BECK BOND EP 17", "FPS_F700", "Confirmed"),
+    ("BECK BOND SLF 36", "FPS_F500", "Confirmed"),
+    ("BITUCOAT PRIMER W - 20 Kgs", "FPS_C1100_20K", "Confirmed"),
+    ("BLOCKFIX - 40Kgs", "FPS_H1100_40K", "Confirmed"),
+    ("CEMCOAT AR - 500 ML", "FPS_C200_0.5K", "Confirmed"),
+    ("CEMCOAT PRIMER - 1 KGS", "FPS_C150_1K", "Confirmed"),
+    ("CEMCOAT PRIMER - 20 KGS", "FPS_C150_20K", "Confirmed"),
+    ("CEMGROUT GP1 - 30 Kgs", "FPS_E050_30K", "Confirmed"),
+    ("CONSET CA PLUS", "FPS_A900_250K", "Confirmed"),
+    ("CONSET SL", "FPS_A950_275K", "Confirmed"),
+    ("DRYMIXCRETE - 50 KGS", "FPS_H1500", "Confirmed"),
+    ("EFFLOCOAT 1K - 20 KGS", "FPS_C900_20K", "Confirmed"),
+    ("EFFLOCOAT 1K - 5 KGS", "FPS_C900_1K", "Confirmed"),
+    ("ELASTOCEM FLEX - 15 KGS", "FPS_C300_15K", "Confirmed"),
+    ("ELASTOCEM FLEX - 3 KGS", "FPS_C300_3K", "Confirmed"),
+    ("ELASTOCEM FLEX - 60 KGS", "FPS_C300_60K", "Confirmed"),
+    ("ELASTOCOAT - 1 Kgs", "FPS_C500_1K", "Confirmed"),
+    ("ELASTOCOAT - 5 Kgs", "FPS_C500_5K", "Confirmed"),
+    ("ELASTOCOAT-GREEN- 20 Kgs", "FPS_C500_20KGR", "Confirmed"),
+    ("ELASTOCOAT-RED- 20 Kgs", "FPS_C500_20KRD", "Confirmed"),
+    ("ELASTOCOAT SR - 10 KGS", "FPS_C600_10K", "Confirmed"),
+    ("ELASTOCOAT SR - 1 KGS", "FPS_C600_1K", "Confirmed"),
+    ("ELASTOCOAT SR - 20 KGS", "FPS_C600_20K", "Confirmed"),
+    ("ELASTOCOAT SR - 5 KGS", "FPS_C600_5K", "Confirmed"),
+    ("ELASTOCOAT-WHITE- 20 Kgs", "FPS_C500_20KWH", "Confirmed"),
+    ("ELASTOCOAT XL 20 KGS", "FPS_C550_20K", "Confirmed"),
+    ("EP BOND BA - 3 KG", "FPS_D600_3K", "Confirmed"),
+    ("EP BOND BA - 600 GRAM", "FPS_D600_0.6K", "Confirmed"),
+    ("EP COAT FG - 4 KGS", "FPS_C1450_4K", "Confirmed"),
+    ("EP COAT FGW - 20 KGS", "FPS_C1500_20K", "Confirmed"),
+    ("EP COAT ZINC 1 KG", "FPS_D1200_1K", "Confirmed"),
+    ("EP GROUT LV - 15 KGS", "FPS_E550_15K", "Confirmed"),
+    ("EP GROUT LV - 3 KGS", "FPS_E550_3K", "Confirmed"),
+    ("EP GROUT UW - 3 KGS", "FPS_E650_3K", "Confirmed"),
+    ("EP GROUT UW - 4 KGS", "FPS_E650", "Confirmed"),
+    ("FCSC MICROSILICA", "FPS_A750_20K", "Confirmed"),
+    ("FIRSTSHINE - COPPER GLITTER - 100 GM", None, "Pending Code Confirmation"),
+    ("FIRSTSHINE - SILVER GLITTER - 100 GM", None, "Pending Code Confirmation"),
+    ("FLOOR HARDTOP NM- 25 Kg", "FPS_F100_30K", "Confirmed"),
+    ("HARDTOP M - 30 KGS", "FPS_F200_30K", "Confirmed"),
+    ("MEASURE CAP", None, "Pending Code Confirmation"),
+    ("MICRETE- 5 KGS", "FPS_D100_5K", "Confirmed"),
+    ("PLAST WELL -40 KGS", "FPS_H1400_40K", "Confirmed"),
+    ("Plugcon - 1 Kgs", None, "Pending Code Confirmation"),
+    ("Plugcon - 5 Kgs", None, "Pending Code Confirmation"),
+    ("Polymer Bondex 400", None, "Pending Code Confirmation"),
+    ("POLYSEAL G 6.5 KGS", "FPS_G300_6.5K", "Confirmed"),
+    ("POLYSEAL P - 6.5 KGS", "FPS_G200_6.5K", "Confirmed"),
+    ("Premix", None, "Pending Code Confirmation"),
+    ("PU GROUT 1K", "FPS_E750_10K", "Confirmed"),
+    ("PU GROUT 2 K", "FPS_E850_10K", "Confirmed"),
+    ("Pu Seal 2K - 4kg", "FPS_G800_4K", "Confirmed"),
+    ("Recron Fiber", None, "Pending Code Confirmation"),
+    ("REPCON CRACK- X -1kg", "FPS_D500_1K", "Confirmed"),
+    ("REPCON EP COAL TAR - 20 KGS", "FPS_D700_20K", "Confirmed"),
+    ("REPCON EP TM - 6KG", "FPS_D900_6K", "Confirmed"),
+    ("REPCON EP UWP - 1 KG", "FPS_D800_1K", "Confirmed"),
+    ("REPCON FC - 5 KGS", "FPS_D200_5K", "Confirmed"),
+    ("REPCON MICRETE- 30 KGS", "FPS_D100_30K", "Confirmed"),
+    ("REPCON RUSTCURE", "FPS_D1100", "Confirmed"),
+    ("REPCON TI - 25 KGS", "FPS_D300_25K", "Confirmed"),
+    ("RUST CURE - 20 KG", "FPS_D1100_20K", "Confirmed"),
+    ("RUST CURE - 5 KG", "FPS_D1100_5K", "Confirmed"),
+    ("RXSOL", None, "Pending Code Confirmation"),
+    ("SEAL TAPE ADHESIVE - 3 KGS", "FPS_G700_3K", "Confirmed"),
+    ("SEAL TAPE TPE", "FPS_G500", "Confirmed"),
+    ("SILICOCOAT 10 KGS", "FPS_C950_10K", "Confirmed"),
+    ("SILICOCOAT 20 KGS", "FPS_C950_20K", "Confirmed"),
+    ("SPECTRA FLOGUARD EH", "FPS_F800", "Confirmed"),
+    ("SUPERGROUT CG -  Almond-1Kg", "FPS_H800_1K003", "Confirmed"),
+    ("SUPERGROUT CG - Antique White - 1 Kgs", "FPS_H800_1K005", "Confirmed"),
+    ("SUPERGROUT CG - AQUA BLUE -1Kg", "FPS_H800_1K017", "Confirmed"),
+    ("SUPERGROUT CG - AUBURN-1KG", "FPS_H800_1K030", "Confirmed"),
+    ("SUPERGROUT CG - Bloom-1Kg", "FPS_H800_1K029", "Confirmed"),
+    ("SUPERGROUT CG - Blue -1Kg", "FPS_H800_1K054", "Confirmed"),
+    ("SUPERGROUT CG - Bright White-1Kg", "FPS_H800_1K001", "Confirmed"),
+    ("SUPERGROUT CG - BUFF -1Kg", "FPS_H800_1K007", "Confirmed"),
+    ("SUPERGROUT CG - Canyon Red-1Kg", "FPS_H800_1K016", "Confirmed"),
+    ("SUPERGROUT CG - Chocolate Brown - 1 Kgs", "FPS_H800_1K055", "Confirmed"),
+    ("SUPERGROUT CG - CITRUS LIME - 1KG", "FPS_H800_1K040", "Confirmed"),
+    ("SUPERGROUT CG -Cofee Brown-1kg", "FPS_H800_1K050", "Confirmed"),
+    ("SUPERGROUT CG - Dusty Rose - 1 Kgs", "FPS_H800_1K006", "Confirmed"),
+    ("SUPERGROUT CG - Gleaming Gold-1Kg", "FPS_H800_1K034", "Confirmed"),
+    ("SUPERGROUT CG - Gold-1Kg", "FPS_H800_1K049", "Confirmed"),
+    ("SUPERGROUT CG - Green-1Kg", "FPS_H800_1K056", "Confirmed"),
+    ("SUPERGROUT CG - Grey -1Kg", "FPS_H800_1K053", "Confirmed"),
+    ("SUPERGROUT CG - Ivory-1Kg", "FPS_H800_1K004", "Confirmed"),
+    ("SUPERGROUT CG LINCOLN GREEN - 1 KG", "FPS_H800_1K035", "Confirmed"),
+    ("SUPERGROUT CG - Lite Brown- 1kg", "FPS_H800_1K051", "Confirmed"),
+    ("SUPERGROUT CG - Manyan Red-1Kg", "FPS_H800_1K018", "Confirmed"),
+    ("SUPERGROUT CG - Marble Beigh-1Kg", "FPS_H800_1K011", "Confirmed"),
+    ("SUPERGROUT CG - Mayan Red -1Kg", "FPS_H800_1K018", "Confirmed"),
+    ("SUPERGROUT CG - Midnight Black-1Kg", "FPS_H800_1K010", "Confirmed"),
+    ("SUPERGROUT CG - Off White-1Kg", "FPS_H800_1K002", "Confirmed"),
+    ("SUPERGROUT CG - PEACH - 1Kg", "FPS_H800_1K043", "Confirmed"),
+    ("SUPERGROUT CG - Raven-1Kg", "FPS_H800_1K015", "Confirmed"),
+    ("SUPERGROUT CG - SANDY GOLD -1KG", "FPS_H800_1K057", "Confirmed"),
+    ("SUPERGROUT CG - SAPHIRE-1KG", "FPS_H800_1K019", "Confirmed"),
+    ("SUPERGROUT CG - Scamper-1Kg", "FPS_H800_1K036", "Confirmed"),
+    ("SUPERGROUT CG - SEMILLON -1Kg", "FPS_H800_1K023", "Confirmed"),
+    ("SUPERGROUT CG - Silk-1Kg", "FPS_H800_1K004", "Confirmed"),
+    ("SUPERGROUT CG - Silver Shadow-1Kg", "FPS_H800_1K058", "Confirmed"),
+    ("SUPERGROUT CG - SKY BLUE-1 KG", "FPS_H800_1K009", "Confirmed"),
+    ("SUPERGROUT CG - SLATE GREY -1Kg", "FPS_H800_1K014", "Confirmed"),
+    ("SUPERGROUT CG - Terracota-1Kg", "FPS_H800_1K021", "Confirmed"),
+    ("SUPERGROUT CG - Terracota-1Kgs", "FPS_H800", "Confirmed"),
+    ("SUPERGROUT CG - Trakotta - 1 Kg", "FPS_H800", "Confirmed"),
+    ("SUPERGROUT CG - Umbra Slate-1Kg", "FPS_H800_1K026", "Confirmed"),
+    ("SUPERGROUT CG - Vine-1Kg", "FPS_H800_1K032", "Confirmed"),
+    ("SUPERGROUT EG - Antique White", "FPS_H900_1K005", "Confirmed"),
+    ("SUPERGROUT EG - AQUA BLUE WITH GLITTER -1Kg", "FPS_H900_1K017", "Confirmed"),
+    ("SUPERGROUT EG - Bright White - 1 Kg", "FPS_H900_1K001", "Confirmed"),
+    ("SUPERGROUT EG - FP- 760g & Resin Kit - 240g", "FPS_H900", "Confirmed"),
+    ("SUPERGROUT EG - FP- Alpine Blue-760g & Resin Kit - 240g", "FPS_H900_1K013", "Confirmed"),
+    ("SUPERGROUT EG-FP- Black-3.8 Kg & Resin Kit-1.2 Kg", "FPS_H900_5K050", "Confirmed"),
+    ("SUPERGROUT EG - FP- Bloom-760g & Resin Kit - 240g", "FPS_H900_1K029", "Confirmed"),
+    ("SUPERGROUT EG - FP- Bright White-3.8Kg & Resin Kit-1.2Kg", "FPS_H900_5K001", "Confirmed"),
+    ("SUPERGROUT EG - FP- Bright White-760g & Resin Kit - 240g", "FPS_H900_1K001", "Confirmed"),
+    ("SUPERGROUT EG-FP-Brown-3.8KG & Resin Kit-1.2KG", "FPS_H900_5K051", "Confirmed"),
+    ("SUPERGROUT EG-FP-Brown-760g & Resin Kit-240g", "FPS_H900_1K051", "Confirmed"),
+    ("SUPERGROUT EG - FP- Burgundy-3.8Kg & Resin Kit-1.2Kg", "FPS_H900_5K012", "Confirmed"),
+    ("SUPERGROUT EG - FP- Burgundy-760g & Resin Kit - 240g", "FPS_H900_1K012", "Confirmed"),
+    ("SUPERGROUT EG - FP- Canyon Red-3.8Kg & Resin Kit - 1.2Kg", "FPS_H900_5K016", "Confirmed"),
+    ("SUPERGROUT EG - FP- Canyon Red-760g & Resin Kit - 240g", "FPS_H900_1K016", "Confirmed"),
+    ("SUPERGROUT EG - FP- Chocolate-760g & Resin Kit - 240g", "FPS_H900_1K044", "Confirmed"),
+    ("SUPERGROUT EG - FP- Citrus Lime-3.8Kg & Resin Kit - 1.2Kg", "FPS_H900_5K040", "Confirmed"),
+    ("SUPERGROUT EG - FP- Citrus Lime-760g & Resin Kit - 240g", "FPS_H900_1K040", "Confirmed"),
+    ("SUPERGROUT EG-FP-COFFEE BROWN-3.8 KG & Resin Kit-1.2KG", "FPS_H900_5K052", "Confirmed"),
+    ("SUPERGROUT EG-FP-COFFEE BROWN-760g & Resin Kit-240g", "FPS_H900_1K052", "Confirmed"),
+    ("SUPERGROUT EG-FP-Dark Brown-3.8 KG & Resin Kit-1.2KG", "FPS_H900_5K053", "Confirmed"),
+    ("SUPERGROUT EG-FP-Dark Brown-760g & Resin Kit-240g", "FPS_H900_1K053", "Confirmed"),
+    ("SUPERGROUT EG-FP- Dark Grey-3.8KG & Resin Kit-1.2KG", "FPS_H900_5K054", "Confirmed"),
+    ("SUPERGROUT EG-FP- Dark Grey-760g & Resin Kit-240g", "FPS_H900_1K054", "Confirmed"),
+    ("SUPERGROUT EG - FP-Gleaming Gold-3.8Kg & Resin Kit-1.2Kg", "FPS_H900_5K034", "Confirmed"),
+    ("SUPERGROUT EG-FP-GleamingGold760G+Resign kit 240G", "FPS_H900_1K034", "Confirmed"),
+    ("SUPERGROUT EG-FP-Gold760G+Resign kit 240G", "FPS_H900_1K049", "Confirmed"),
+    ("SUPERGROUT EG - FP- Gold Glitter (BR White)-760g & Resin Kit - 240g", "FPS_H900_1K001", "Confirmed"),
+    ("SUPERGROUT EG - FP- Gold Glitter (Citrus Lime)-3.8Kg & Resin Kit-1.2Kg", "FPS_H900_5K040", "Confirmed"),
+    ("SUPERGROUT EG - FP- Gold Glitter (Citrus Lime)-760g & Resin Kit - 240g", "FPS_H900_1K040", "Confirmed"),
+    ("SUPERGROUT EG-FP-Grey-3.8KG & Resin Kit-1.2KG", "FPS_H900_5K055", "Confirmed"),
+    ("SUPERGROUT EG-FP-Grey760G+Resign kit 240G", "FPS_H900_1K055", "Confirmed"),
+    ("SUPERGROUT EG-FP-Ivory 3.8KG+Resign kit 1.2KG", "FPS_H900_5K004", "Confirmed"),
+    ("SUPERGROUT EG-FP-Ivory 760G+Resign kit 240G", "FPS_H900_1K004", "Confirmed"),
+    ("SUPERGROUT EG-FP-Jet Black-3.8 Kg & Resin Kit-1.2 Kg", "FPS_H900_5K056", "Confirmed"),
+    ("SUPERGROUT EG-FP- Light Grey-3.8KG & Resin Kit-1.2KG", "FPS_H900_5K057", "Confirmed"),
+    ("SUPERGROUT EG-FP-Light Grey-760g & Resin Kit-240g", "FPS_H900_1K057", "Confirmed"),
+    ("SUPERGROUT EG - FP - Mayan Red-3.8 Kgs + 1.2 Kgs Resign Kit", "FPS_H900_5K018", "Confirmed"),
+    ("SUPERGROUT EG - FP - Mayan Red-760G + 260G Resign Kit", "FPS_H900_1K018", "Confirmed"),
+    ("SUPERGROUT EG-FP- Midnight Black-3.8kg & Resin Kit-1.2kg", "FPS_H900_5K010", "Confirmed"),
+    ("SUPERGROUT EG-FP- Midnight Black-760g & Resin Kit-240g", "FPS_H900_1K010", "Confirmed"),
+    ("SUPERGROUT EG -FP-MOCCA-3.8 KGS & Resin kit 1.2kgs", "FPS_H900_5K008", "Confirmed"),
+    ("SUPERGROUT EG-FP-MOCCA 760G+Resign kit 240G", "FPS_H900_1K008", "Confirmed"),
+    ("SUPERGROUT EG-FP-OFFWHITE 3.8kg + Resign kit 1.2kg", "FPS_H900_5K002", "Confirmed"),
+    ("SUPERGROUT EG-FP-OFF WHITE 760g + Resign kit 240g", "FPS_H900_1K002", "Confirmed"),
+    ("SUPERGROUT EG - FP- Peach-760g & Resin Kit - 240g", "FPS_H900_1K043", "Confirmed"),
+    ("SUPERGROUT EG-FP-Platinum Grey760G+Resign kit 240G", "FPS_H900_1K020", "Confirmed"),
+    ("SUPERGROUT EG-FP-RED 760G+Resign kit 240G", "FPS_H900_1K058", "Confirmed"),
+    ("SUPERGROUT EG - FP- Sandy Gold-760g & Resin Kit - 240g", "FPS_H900_1K059", "Confirmed"),
+    ("SUPERGROUT EG - FP- Silk-3.8Kg & Resin Kit-1.2Kg", "FPS_H900_5K004", "Confirmed"),
+    ("SUPERGROUT EG - FP- Silk-760g & Resin Kit - 240g", "FPS_H900_1K004", "Confirmed"),
+    ("SUPERGROUT EG - FP- Sky Blue-760g & Resin Kit - 240g", "FPS_H900_1K009", "Confirmed"),
+    ("SUPERGROUT EG -FP -Slate Grey-3.8Kgs+ Resign kit 1.2kg", "FPS_H900_5K014", "Confirmed"),
+    ("SUPERGROUT EG - FP- Slate Grey-760g & Resin Kit - 240g", "FPS_H900_1K014", "Confirmed"),
+    ("SUPERGROUT EG -FP-SMOKE-3.8 KGS & Resin kit 1.2kgs", "FPS_H900_5K031", "Confirmed"),
+    ("SUPERGROUT EG-FP- STEEL SMOG-760g & Resin Kit-240g", "FPS_H900_5K037", "Confirmed"),
+    ("SUPERGROUT EG - FP- Terracota-3.8kg & Resin Kit - 1.2kg", "FPS_H900_5K021", "Confirmed"),
+    ("SUPERGROUT EG - FP- Terracota-760g & Resin Kit - 240g", "FPS_H900_1K021", "Confirmed"),
+    ("SUPERGROUT EG - FP-Umbra Slate-3.8Kg & Resin Kit-1.2Kg", "FPS_H900_5K026", "Confirmed"),
+    ("SUPERGROUT EG-FP- Umbra Slate-760g & Resin Kit-240g", "FPS_H900_1K026", "Confirmed"),
+    ("SUPERGROUT EG - GOLDEN SPARKLE – 760G & Resign Kit 240kg", "FPS_H900_1K049", "Confirmed"),
+    ("SUPERGROUT EG -GOLDEN – 3.8 KG & Resign Kit 1.2kg", "FPS_H900_5K049", "Confirmed"),
+    ("SUPERGROUT EG -GOLDEN – 760g & Resign Kit 240g", "FPS_H900_1K049", "Confirmed"),
+    ("TILEGLUE-1.0-Grey-20Kgs", "FPS_H100_20K", "Confirmed"),
+    ("TILEGLUE-2.0-Grey-20Kgs", "FPS_H200_20K", "Confirmed"),
+    ("TILEGLUE-2.0-White-20Kgs", "FPS_H250_20K", "Confirmed"),
+    ("TILEGLUE-3.0-Grey-20Kgs", "FPS_H300_20K", "Confirmed"),
+    ("TILEGLUE-3.0-White-20kgs", "FPS_H350_20K", "Confirmed"),
+    ("TILEGLUE-4.0-Grey-20Kgs", "FPS_H400_20K", "Confirmed"),
+    ("TILEGLUE-4.0-White-20Kgs", "FPS_H450_20K", "Confirmed"),
+    ("TILEGLUE-4.O+ Grey-20Kgs", "FPS_H500_20K", "Confirmed"),
+    ("TILEGLUE-4.O+ -White-20Kgs", "FPS_H550_20K", "Confirmed"),
+    ("TILEGLUE-5.0-Grey-20Kgs", None, "Pending Code Confirmation"),
+    ("TILEGLUE-5.0-White-20Kgs", None, "Pending Code Confirmation"),
+    ("Tileglue super 300 GM", "FPS_H700_0.3K", "Confirmed"),
+    ("TILESMART AC 1 Ltr", "FPS_H1200_1K", "Confirmed"),
+    ("TILESMART AC 500Ml", "FPS_H1200_0.5K", "Confirmed"),
+    ("WALLSAFE - 40Kgs", "FPS_H1300_40K", "Confirmed"),
+    ("WALLSAFE - 5Kgs", "FPS_H1300_5K", "Confirmed"),
+    ("3MM APP Membrane", None, "Pending Code Confirmation"),
+    ("AQUAPROOF CRYSTALLINE - 500 GRAM", "FPS_C050_0.5K", "Confirmed"),
+    ("AQUAPROOF PU W1 10 KGS", "FPS_C400_10K", "Confirmed"),
+    ("CONCAP R", "FPS_E950_32MM", "Confirmed"),
+    ("FCSC FIBERMESH 45", "FPS_C2400", "Confirmed"),
+    ("FCSC Shield 3P", "FPS_C2050", "Confirmed"),
+    ("Plugcon - 25 Kgs", "FPS_D350_25K", "Confirmed"),
+    ("SPECTRA FLOGUARD CP", "FPS_F1200_4.1K", "Confirmed"),
+    ("SPECTRA FLOGUARD EPSL 4K", "FPS_F500_18.6K", "Confirmed"),
+    ("SPECTRA FLOGUARD ERP 2K", "FPS_F700_6K", "Confirmed"),
+    ("SUPERGROUT CG - Red-1Kg", "FPS_H800_1K052", "Confirmed"),
+]
+
+
+SEED_FG_ALIASES = [
+    ("SUPERGROUT CG BRIGHT WHITE 1 KG", "SUPERGROUT CG - Bright White-1Kg"),
+    ("SUPERGROUT CG IVORY 1 KG", "SUPERGROUT CG - Ivory-1Kg"),
+    ("SUPERGROUT CG MIDNIGHT BLACK 1 KG", "SUPERGROUT CG - Midnight Black-1Kg"),
+    ("SUPERGROUT CG SLATE GREY 1 KG", "SUPERGROUT CG - SLATE GREY -1Kg"),
+    ("SUPERGROUT CG CHOCOLATE 1 KG", "SUPERGROUT CG - Chocolate - 1 Kgs"),
+    ("SUPERGROUT CG CHOCOLATE BROWN 1 KG", "SUPERGROUT CG - Chocolate Brown - 1 Kgs"),
+    ("SUPERGROUT CG TERRACOTTA 1 KG", "SUPERGROUT CG - Terracotta - 1 Kgs"),
+    ("SUPERGROUT CG CANYON RED 1 KG", "SUPERGROUT CG - Canyon Red-1Kg"),
+    ("SUPERGROUT CG GLEAMING GOLD 1 KG", "SUPERGROUT CG - Gleaming Gold-1Kg"),
+    ("SUPERGROUT CG BLUE 1 KG", "SUPERGROUT CG - Blue -1Kg"),
+    ("SUPERGROUT CG LINCOLN GREEN 1 KG", "SUPERGROUT CG LINCOLN GREEN - 1 KG"),
+    ("SUPERGROUT EG BRIGHT WHITE 1 KG", "SUPERGROUT EG - Bright White - 1 Kg"),
+    ("TILESMART AC 1 LTR", "TILESMART AC 1 Ltr"),
+    ("TILESMART AC 500 ML", "TILESMART AC 500Ml"),
+    ("ADMIX CG 200 ML", "ADMIX CG 200ML"),
+    ("AQUAPROOF IW 1 KG", "AQUAPROOF IW 1 KGS"),
+    ("AQUAPROOF IW 5 KG", "AQUAPROOF IW 5 KGS"),
+    ("AQUAPROOF IW 10 KG", "AQUAPROOF IW 10 KGS"),
+    ("AQUAPROOF IW 20 KG", "AQUAPROOF IW 20 KGS"),
+    ("ELASTOCEM 4KG", "ELASTOCEM - 4 KGS"),
+    ("CEMBOND SBR 1 KG", "CEMBOND SBR 1 KGS"),
+    ("CEMBOND SBR 5 KG", "CEMBOND SBR 5 KG"),
+    ("CEMBOND SBR 10 KG", "CEMBOND SBR 10 KGS"),
+    ("CEMBOND SBR 20 KG", "CEMBOND SBR 20 KGS"),
+]
+
+
+if cur.execute("SELECT COUNT(*) FROM finished_goods_master").fetchone()[0] == 0:
+    for _fgnm, _fgcode, _fgst in SEED_FINISHED_GOODS_MASTER:
+        cur.execute(
+            "INSERT INTO finished_goods_master(name,code,status,created_at) VALUES (?,?,?,?)",
+            (_fgnm, _fgcode, _fgst, datetime.datetime.now().isoformat(timespec="seconds"))
+        )
+    conn.commit()
+if cur.execute("SELECT COUNT(*) FROM fg_aliases").fetchone()[0] == 0:
+    for _fglegacy, _fgcanon in SEED_FG_ALIASES:
+        cur.execute("INSERT OR IGNORE INTO fg_aliases VALUES (?,?)", (_fglegacy, _fgcanon))
+    conn.commit()
+
 if cur.execute("SELECT COUNT(*) FROM material_codes").fetchone()[0] == 0:
     for _mat, _code in _SEED_MATERIAL_CODES:
         cur.execute("INSERT OR IGNORE INTO material_codes VALUES (?,?)", (_mat, _code))
+    conn.commit()
+if cur.execute("SELECT COUNT(*) FROM materials_master").fetchone()[0] == 0:
+    for _lc, _nm, _pc, _cat, _st in SEED_MATERIALS_MASTER:
+        cur.execute(
+            "INSERT INTO materials_master(lab_code,name,procurement_code,category,status,created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (_lc, _nm, _pc, _cat, _st, datetime.datetime.now().isoformat(timespec="seconds"))
+        )
+    conn.commit()
+if cur.execute("SELECT COUNT(*) FROM material_aliases").fetchone()[0] == 0:
+    for _legacy, _canon in SEED_MATERIAL_ALIASES:
+        cur.execute("INSERT OR IGNORE INTO material_aliases VALUES (?,?)", (_legacy, _canon))
     conn.commit()
 
 # ── Migrations — add new columns to existing databases without data loss ──────
@@ -2269,6 +3382,12 @@ for _mig in [
     # per batch on the Formulation (BOM) module. Left at 0 until set — BOM
     # costing simply shows ₹0 / not-yet-costed for anything not filled in.
     "ALTER TABLE material_codes ADD COLUMN unit_cost REAL DEFAULT 0",
+    # NEW: Stock <-> Production <-> QC <-> Dispatch reconciliation — optional,
+    # nullable link columns only. Existing entry flows are unaffected; these
+    # are populated only when a user explicitly ties a new entry to a QC batch.
+    "ALTER TABLE production ADD COLUMN production_batch_id INTEGER",
+    "ALTER TABLE sales      ADD COLUMN production_batch_id INTEGER",
+    "ALTER TABLE stock      ADD COLUMN rm_batch_id INTEGER",
 ]:
     try:
         cur.execute(_mig)
@@ -2325,145 +3444,231 @@ COST_CATS      = ["Raw Materials", "Labour", "Utilities", "Rent / Lease",
 SAND_TYPES     = ["M-Sand", "River Sand", "Fine Sand", "Coarse Sand", "Other"]
 SAND_UNITS     = ["Bags (50 KG)", "Metric Tonnes", "Cubic Feet", "Cubic Metres", "Kilograms", "Loads"]
 GST_RATES      = [5.0, 12.0, 18.0, 28.0]
-MATERIALS      = [
-    # ── CEMENT & BASE ─────────────────────────────────────────────────────
-    "PPC CEMENT (50 KG)",
-    "Cement", "Fly Ash", "Silica Fume", "GGBS",
-    # ── PREMIX / PRIMIX ───────────────────────────────────────────────────
-    "PREMIX 1 (25 KG)",
-    "PRIMIX 2 (BLACK BOX)",
-    "PRIMIX 3 (BLACK BOX) 25 KG",
-    "PRIMIX 4 (BLACK BOX)",
-    "PRIMIX 5 (BLACK BOX) 25 KG",
-    "PRIMIX 6 (BLACK BOX) 25 KG",
-    # ── PACKAGING & ACCESSORIES ───────────────────────────────────────────
-    "LOCK TIE",
-    "C2310/03",
-    "QR (SHEETS)",
-    "TOKEN - RS 20",
-    # ── OTHER RAW MATERIALS ───────────────────────────────────────────────
-    "Polymer Resin", "Epoxy Base", "Epoxy Hardener", "Pigment",
-    "Chemical Admixture", "Aggregate", "Sand", "Water", "Packaging", "Other",
-    # ── REAL RAW MATERIALS — imported from RM Daily Stock tracker (Jan–Jun 2026) ──
-    # These are the actual materials with vendor/lead-time data in vendor_materials.
-    "ADDAGE PCE 128 (POLY CARBOXYLATE ETHER) POWDER", "ADDAGE PCE POWDER", "ALPHOX-200 H",
-    "ALPOX 200", "ALUMINIUM SULPHATE", "ANTI FOAM POWDER",
-    "APCOTEX TSN 651", "AQUAPHOBE WR2", "BARYTES POWDER 2511",
-    "BONDEX 5800", "BONDEX J-400", "BONDEX T 60",
-    "BUTYL CELLSOLOV", "BYK-9076", "Bondex 5295",
-    "C 400", "C 76", "C-2835/03  PCT135",
-    "CALCIUM CARBONATE 1000", "CALCIUM CHLORIDE", "CALCIUM FORMATE",
-    "CALCIUM STARATE", "CALENDUM", "CAMCURE 2979",
-    "CAMCURE W287", "CAMSPEED 3054", "CEEFAST ALPHA BLUE 15.0 (U)",
-    "CEEFAST BETA BLUE (U)", "CEEFAST CHROMOCYANINE", "CEEFAST CHROMOCYANINE GREEN",
-    "CEEFAST GREEN 7(U)", "CEEFAST RED 48.2", "CEEFAST VIOLET TONER 777",
-    "CEEFST GREEN B 807", "CEEROX BLACK OXIDE", "CEEROX BLACK OXIDE 330",
-    "CEEROX BROWN OXIDE", "CEEROX RED OXIDE 130", "CEEROX RED OXIDE 445",
-    "CEEROX RED OXIDE 473", "CEEROX YELLOW OXIDE E", "CHINA CLAY CP POWDER(KAOLIN CLAY)",
-    "CHINA CLAY CP POWDER(KAOLIN)", "CITRIC ACID MONOHYDRATE", "CMC POWDER",
-    "DIETHANOLAMINE", "DISPLAYER CF707", "DOLOMITE",
-    "DRIED ALUMINIUM HYDROXIDE GEL", "DYN A70", "EASTMAN TEXANOL",
-    "EMERI SAND", "EPOXY CURING AGENT LITE 2401", "EPOXY CURING AGENT NC 541",
-    "FINESET 35", "FORMALDIHYDE", "FORMIC ACID",
-    "GALAXY SLES", "GINOPOL (SLS POWDER)", "GLOBAMINE GREEN",
-    "GLYCERINE", "GYPSUM POWDER", "HIMFLOW CRETE HRWR 3J02 55%",
-    "HIND HFR - WD 500", "HIND HFR - WD 500 C2835/07", "HIND MOULD RELEASE OB",
-    "HYDRATED LIME", "HYDROSOFT SRF 50", "INDOLIGA PSR50(K)",
-    "IPA", "KELCOCRETE DG-F", "LAPOX AH 428",
-    "LAPOX AH 713", "LAPOX B-47", "LAPOX B11",
-    "LIME STONE", "LUBOLICE", "MAK KOTE",
-    "MDEA", "MEK", "MERGAL K14",
-    "METHYL ISOBUTYL KETONE", "MHEC", "MICRO SILICA 85%",
-    "MICRO SILICA 92%", "MUSCLUER OX ULTRA MARINE BLUE CI 2900", "MUSCULAR OXIDE ULFRAMARINE BLUE PIGMENTS CI-2900",
-    "NC 513", "NC 541", "NC 558",
-    "NX 5454", "OPC CEMENT", "ORTHO PHOSPHORIC ACID",
-    "PCE 128 (POLY CARBOXYLATE ETHER)", "PECEVIS 100 PS", "PEG  400",
-    "PHOSPHORIC ACID", "PIGMENTS GREEN B  807/811", "POLY ACRALAMIDE",
-    "POLY ACRYLAMIDE", "POLY PROPYLENE GLYCOL", "POTASSIUM LITHIUM SILICATE KL25",
-    "PPC CEMENT", "PRECIPATED CALCIUM CARBONATE", "PROPLYLENE GLYCOL",
-    "PUTEC 3255", "PVA 2488", "QUARTZ POWDER(300 Mesh or 45 Micron)",
-    "QUARTZ SAND(-300 to 75)", "R 85", "RDP 1    5010",
-    "RDP 2 5044", "RESILANE GTMS", "RHEO PLUS",
-    "RTC-12(2,2,4 TRIMETHYL1,3PENTANEDIOL MONOISOBUTYRATE)", "SAND 2.36", "SAND 600 MICRON",
-    "SAPCO NDW", "SBR LATEX", "SHUTTEROL RA",
-    "SILICA FLOUR(400 Mesh or 37 Micron)", "SILICA POWDER", "SINGLE POLYMER",
-    "SLES 230 KG", "SNF LIQUID", "SNF POWDER",
-    "SNF POWDER (sodium nepthalene sulphonate)", "SODA ASH(Light)", "SODIUM CARBONATE(Light)",
-    "SODIUM GLUCONATE", "SODIUM HYDROXIDE solution", "SODIUM LIGNO 01",
-    "SODIUM NITRATE", "SODIUM SHULPHATE", "SODIUM SILICATE",
-    "SODIUM SILICOFLUORIDE", "SODIUM SULPHATE", "SODIUM THIOCYANATE",
-    "SOLVENT C9", "SUGAR", "SULPHAMIC ACID",
-    "SYNTHETIC IRON OXIDE PIGMENTS", "SYNTHETIC IRON OXIDE RED (MUSCLEROX)", "TALCUM POWDER KOHINOOR",
-    "TEA 99%", "TECHNOCEL-500-I", "TIO2 ®",
-    "UNIWET 3048", "WHITE CEMENT", "XYLINE",
-    "YELLOW OXIDE", "ZINC DUST", "ZINC PHOSPHATE",
-]
+# ── NEW: Material Master (official codification, single source of truth) ─────
+# Every module that lets a user pick a raw material should build its dropdown
+# from get_material_master_names(), not from a hardcoded list. canonical_material()
+# resolves old free-text names (still sitting in historical rm_batches/bom_lines/
+# etc. rows) to the current official name via material_aliases, so nothing has
+# to be rewritten in place — new records just use the canonical name directly.
 
-# ── UPDATED from finished_product_list.xlsx ───────────────────────────────────
-FCSC_PRODUCTS  = [
-    # ── TILEGLUE ──────────────────────────────────────────────────────────
-    "TILEGLUE 1.O (N/T)",
-    "TILEGLUE 1.O (QR)",
-    "TILEGLUE 2.O (N/T)",
-    "TILEGLUE 2.O (QR)",
-    "TILEGLUE 2.O (WHITE) QR",
-    "TILEGLUE 3.O (QR)",
-    "TILEGLUE 3.O (WHITE) TOKEN",
-    "TILEGLUE 4.O (QR)(WHITE)",
-    "TILEGLUE 4.O (QR)(WHITE) (+)",
-    "TILEGLUE SUPER",
-    # ── BUILDING FINISH SOLUTIONS ─────────────────────────────────────────
-    "BLOCKFIX",
-    "WALLSAFE",
-    # ── SUPERGROUT CG (Cementitious Grout) ────────────────────────────────
-    "SUPERGROUT CG BRIGHT WHITE 1 KG",
-    "SUPERGROUT CG OFF WHITE",
-    "SUPERGROUT CG IVORY 1 KG",
-    "SUPERGROUT CG ALMOND",
-    "SUPERGROUT CG MIDNIGHT BLACK 1 KG",
-    "SUPERGROUT CG SLATE GREY 1 KG",
-    "SUPERGROUT CG SMOKEE GREY 1 KG",
-    "SUPERGROUT CG CHOCOLATE 1 KG",
-    "SUPERGROUT CG CHOCOLATE BROWN 1 KG",
-    "SUPERGROUT CG BROWN 1 KG",
-    "SUPERGROUT CG TERRACOTTA 1 KG",
-    "SUPERGROUT CG CANYON RED 1 KG",
-    "SUPERGROUT CG GLEAMING GOLD 1 KG",
-    "SUPERGROUT CG BLUE 1 KG",
-    "SUPERGROUT CG SAPHIRE",
-    "SUPERGROUT CG LINCOLN GREEN 1 KG",
-    "SUPERGROUT CG AUMBURN",
-    # ── SUPERGROUT EG (Epoxy Grout) ───────────────────────────────────────
-    "SUPERGROUT EG BRIGHT WHITE 1 KG",
-    "SUPERGROUT EG WHITE 5 KG",
-    "SUPERGROUT EG IVORY 1 KG",
-    "SUPERGROUT EG MIDNIGHT BLACK 1 KG",
-    "SUPERGROUT EG GOLD 1 KG",
-    "SUPERGROUT EG GOLD 5 KG",
-    "SUPERGROUT EG BROWN 1 KG",
-    # ── TILE CARE ─────────────────────────────────────────────────────────
-    "TILESMART AC 1 LTR",
-    "TILESMART AC 500 ML",
-    "ADMIX CG 200 ML",
-    # ── WATERPROOFING ─────────────────────────────────────────────────────
-    "AQUAPROOF IW 1 KG",
-    "AQUAPROOF IW 5 KG",
-    "AQUAPROOF IW 10 KG",
-    "AQUAPROOF IW 20 KG",
-    "ELASTOCEM 4KG",
-    # ── BONDING & GROUTING ────────────────────────────────────────────────
-    "CEMBOND SBR 1 KG",
-    "CEMBOND SBR 5 KG",
-    "CEMBOND SBR 10 KG",
-    "CEMBOND SBR 20 KG",
-    "CEMGROUT GP-1",
-    # ── OTHER PRODUCTS ────────────────────────────────────────────────────
-    "FCSC FIBERMESH",
-    "FIRSTSHINE-GOLD GLITTER",
-    "FIRSTSHINE-SILVER GLITTER",
-    "FIRSTSHINE-COPPER GLITTER",
-    "Other / Custom",
-]
+def get_material_master_df() -> pd.DataFrame:
+    """Full official material master, one row per item, newest first by category."""
+    df = pd.read_sql_query(
+        "SELECT id, lab_code, name, procurement_code, category, status "
+        "FROM materials_master ORDER BY category, name", conn
+    )
+    # NULL procurement_code (the Pending Code Confirmation items) reads back as
+    # NaN, which breaks search_filter's row-join — display it as blank instead.
+    df["procurement_code"] = df["procurement_code"].fillna("")
+    return df
+
+def get_material_master_names(category: str | None = None) -> list[str]:
+    """Canonical material names for dropdowns. Includes 'Pending Code Confirmation'
+    items (they're usable, just flagged) — see material_label() for the badge.
+    Excludes 'Inactive' materials — see Material Master → Deactivate; historical
+    records referencing them still resolve fine, they just drop out of new pickers."""
+    if category:
+        rows = cur.execute(
+            "SELECT name FROM materials_master WHERE status != 'Inactive' AND category = ? ORDER BY name",
+            (category,)
+        ).fetchall()
+    else:
+        rows = cur.execute(
+            "SELECT name FROM materials_master WHERE status != 'Inactive' ORDER BY name"
+        ).fetchall()
+    return [r[0] for r in rows]
+
+def add_material_master(lab_code: str, name: str, procurement_code: str,
+                         category: str, status: str = "Confirmed") -> tuple[bool, str]:
+    """Adds a new material to the official master. Never touches historical
+    records — this only affects what's available going forward."""
+    name = name.strip()
+    if not name:
+        return False, "Material name is required."
+    if cur.execute("SELECT id FROM materials_master WHERE name = ?", (name,)).fetchone():
+        return False, f"A material named '{name}' already exists."
+    try:
+        cur.execute(
+            "INSERT INTO materials_master(lab_code,name,procurement_code,category,status,created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (lab_code.strip() or None, name, procurement_code.strip() or None, category, status,
+             datetime.datetime.now().isoformat(timespec="seconds"))
+        )
+        conn.commit()
+        log_audit("INSERT", "materials_master", name, f"Added via Material Master admin ({category})")
+        return True, f"Added {name} to the Material Master."
+    except sqlite3.Error as e:
+        return False, f"Database error: {e}"
+
+def update_material_master(material_id: int, lab_code: str, procurement_code: str,
+                            category: str, status: str) -> tuple[bool, str]:
+    """Edits an existing material's codes/category/status. Deactivating a material
+    (status='Inactive') removes it from get_material_master_names() dropdowns
+    without deleting the row or touching any historical record that references it."""
+    try:
+        cur.execute(
+            "UPDATE materials_master SET lab_code=?, procurement_code=?, category=?, status=? WHERE id=?",
+            (lab_code.strip() or None, procurement_code.strip() or None, category, status, material_id)
+        )
+        conn.commit()
+        log_audit("UPDATE", "materials_master", material_id, "Updated via Material Master admin")
+        return True, "Material updated."
+    except sqlite3.Error as e:
+        return False, f"Database error: {e}"
+
+def material_label(name: str) -> str:
+    """User-friendly display label: 'R1001 – ALUMINIUM HYDROXIDE GEL DRIED' when
+    a Procurement Code exists, or just the bare material name when it doesn't —
+    no placeholder text, per the Procurement module's display rule."""
+    row = cur.execute(
+        "SELECT procurement_code FROM materials_master WHERE name = ?", (name,)
+    ).fetchone()
+    if not row or not row[0]:
+        return name
+    return f"{row[0]} – {name}"
+
+def canonical_material(name: str) -> str:
+    """Resolve a legacy free-text material name (from historical records) to its
+    current official name. Returns the input unchanged if it's already canonical
+    or has no known alias — never invents or renames anything."""
+    if not name:
+        return name
+    row = cur.execute(
+        "SELECT canonical_name FROM material_aliases WHERE legacy_name = ?", (name,)
+    ).fetchone()
+    return row[0] if row else name
+
+def material_procurement_code(name: str) -> str:
+    """Official Procurement Code for a material, resolving aliases first. Empty
+    string if the material is unrecognised or still Pending Code Confirmation."""
+    canon = canonical_material(name)
+    row = cur.execute(
+        "SELECT procurement_code FROM materials_master WHERE name = ?", (canon,)
+    ).fetchone()
+    return (row[0] or "") if row else ""
+
+def get_lab_code(material_name: str) -> str:
+    """Official Lab Code (e.g. 'C0330/02') for a material, resolving legacy
+    aliases first. Empty string if the material is unrecognised."""
+    canon = canonical_material(material_name)
+    row = cur.execute(
+        "SELECT lab_code FROM materials_master WHERE name = ?", (canon,)
+    ).fetchone()
+    return (row[0] or "") if row else ""
+
+def lab_code_label(material_name: str) -> str:
+    """Display label using the Lab Code in place of the material name — used by
+    the Stock module, where the Lab Code is the primary identifier shown. Falls
+    back to the bare name if no Lab Code is on file (e.g. an 'Other / Custom'
+    item not yet added to the official master)."""
+    code = get_lab_code(material_name)
+    return code if code else material_name
+MATERIALS      = get_material_master_names()
+# "Other / Custom" kept as a catch-all for anything genuinely not yet in the
+# official master (see Codification_for_System.xlsx) — new/unlisted materials
+# should be added to materials_master via Material Master admin, not typed
+# freehand here.
+MATERIALS.append("Other / Custom")
+
+# ── Official Finished Goods Master (official codification, single source of
+# truth) ─────────────────────────────────────────────────────────────────────
+# Every module that lets a user pick a finished product should build its
+# dropdown from get_finished_goods_master_names(), not from a hardcoded list.
+# canonical_product() resolves old free-text names (still sitting in
+# historical production/sales/stock/dispatch rows) to the current official
+# name via fg_aliases, so nothing has to be rewritten in place — new records
+# just use the canonical name directly.
+
+def get_finished_goods_master_df() -> pd.DataFrame:
+    """Full official finished goods master, one row per SKU."""
+    df = pd.read_sql_query(
+        "SELECT id, name, code, status FROM finished_goods_master ORDER BY name", conn
+    )
+    # NULL code (the Pending Code Confirmation items) reads back as NaN,
+    # which breaks search_filter's row-join — display it as blank instead.
+    df["code"] = df["code"].fillna("")
+    return df
+
+def get_finished_goods_master_names() -> list[str]:
+    """Canonical finished-product names for dropdowns. Includes 'Pending Code
+    Confirmation' items (they're usable, just flagged) — see fg_label() for
+    the badge. Excludes 'Inactive' products — see Finished Goods Master →
+    Deactivate; historical records referencing them still resolve fine, they
+    just drop out of new pickers."""
+    rows = cur.execute(
+        "SELECT name FROM finished_goods_master WHERE status != 'Inactive' ORDER BY name"
+    ).fetchall()
+    return [r[0] for r in rows]
+
+def add_finished_good(name: str, code: str, status: str = "Confirmed") -> tuple[bool, str]:
+    """Adds a new finished product to the official master. Never touches
+    historical records — this only affects what's available going forward."""
+    name = name.strip()
+    if not name:
+        return False, "Product name is required."
+    if cur.execute("SELECT id FROM finished_goods_master WHERE name = ?", (name,)).fetchone():
+        return False, f"A finished product named '{name}' already exists."
+    try:
+        cur.execute(
+            "INSERT INTO finished_goods_master(name,code,status,created_at) VALUES (?,?,?,?)",
+            (name, code.strip() or None, status, datetime.datetime.now().isoformat(timespec="seconds"))
+        )
+        conn.commit()
+        log_audit("INSERT", "finished_goods_master", name, "Added via Finished Goods Master admin")
+        return True, f"Added {name} to the Finished Goods Master."
+    except sqlite3.Error as e:
+        return False, f"Database error: {e}"
+
+def update_finished_good(fg_id: int, code: str, status: str) -> tuple[bool, str]:
+    """Edits an existing product's code/status. Deactivating a product
+    (status='Inactive') removes it from get_finished_goods_master_names()
+    dropdowns without deleting the row or touching any historical record
+    that references it."""
+    try:
+        cur.execute(
+            "UPDATE finished_goods_master SET code=?, status=? WHERE id=?",
+            (code.strip() or None, status, fg_id)
+        )
+        conn.commit()
+        log_audit("UPDATE", "finished_goods_master", fg_id, "Updated via Finished Goods Master admin")
+        return True, "Finished product updated."
+    except sqlite3.Error as e:
+        return False, f"Database error: {e}"
+
+def canonical_product(name: str) -> str:
+    """Resolve a legacy free-text product name (from historical records) to
+    its current official name. Returns the input unchanged if it's already
+    canonical or has no known alias — never invents or renames anything."""
+    if not name:
+        return name
+    row = cur.execute(
+        "SELECT canonical_name FROM fg_aliases WHERE legacy_name = ?", (name,)
+    ).fetchone()
+    return row[0] if row else name
+
+def get_fg_code(product_name: str) -> str:
+    """Official RM/FG Code (e.g. 'FPS_C010_1K') for a finished product,
+    resolving legacy aliases first. Empty string if the product is
+    unrecognised or still Pending Code Confirmation."""
+    canon = canonical_product(product_name)
+    row = cur.execute(
+        "SELECT code FROM finished_goods_master WHERE name = ?", (canon,)
+    ).fetchone()
+    return (row[0] or "") if row else ""
+
+def fg_label(product_name: str) -> str:
+    """User-friendly display label: 'FPS_C010_1K – AQUAPROOF IW 1 KGS' when a
+    code exists, or just the bare product name when it doesn't — no
+    placeholder text, mirroring material_label()."""
+    code = get_fg_code(product_name)
+    return f"{code} – {product_name}" if code else product_name
+
+FCSC_PRODUCTS  = get_finished_goods_master_names()
+# "Other / Custom" kept as a catch-all for anything genuinely not yet in the
+# official master (see finished_good_codification.xlsx) — new/unlisted
+# products should be added to finished_goods_master via Finished Goods
+# Master admin, not typed freehand here.
+FCSC_PRODUCTS.append("Other / Custom")
 LOG_CATEGORIES = ["Production", "Quality Control", "Procurement", "Dispatch",
                    "Maintenance", "HR", "R&D", "Safety", "Finance", "Other"]
 LOG_STATUSES   = ["Completed", "In Progress", "Pending", "Cancelled"]
@@ -2617,8 +3822,11 @@ def paginate_df(df: pd.DataFrame, page_size: int = 50,
     return df.iloc[(page - 1) * page_size: page * page_size]
 
 def delete_row_ui(df: pd.DataFrame, table: str,
-                  label_col: str, key_prefix: str) -> None:
-    """Renders an expander with two-step confirmation before deleting a row."""
+                  label_col: str, key_prefix: str, on_delete=None) -> None:
+    """Renders an expander with two-step confirmation before deleting a row.
+    `on_delete`, if given, is called with the full row (as it was *before*
+    deletion) right after the DELETE commits — used by Production/Dispatch to
+    reverse the linked FG stock movement so nothing is orphaned (Sections 7/8)."""
     assert table in _ALLOWED_TABLES, f"Invalid table: {table}"
     if df.empty:
         return
@@ -2655,10 +3863,13 @@ def delete_row_ui(df: pd.DataFrame, table: str,
             with col_yes:
                 if st.button("✅ Yes, delete it", key=f"{key_prefix}_del_confirm"):
                     rid = options[chosen]
+                    _row_before = df[df["id"] == rid].iloc[0] if "id" in df.columns else None
                     try:
                         cur.execute(f"DELETE FROM {table} WHERE id = ?", (rid,))
                         conn.commit()
                         log_audit("DELETE", table, rid, f"label={chosen}")
+                        if on_delete is not None and _row_before is not None:
+                            on_delete(_row_before)
                         st.session_state[armed_key] = False
                         st.success("Record deleted.")
                         st.rerun()
@@ -2683,6 +3894,34 @@ def progress_bar(label: str, value: float, max_value: float,
         f"height:100%;border-radius:99px;transition:width 0.6s'></div></div></div>",
         unsafe_allow_html=True,
     )
+
+# FIX: RM stock closing-balance integrity (reconciliation review, Section 2).
+# `stock.closing_stock` is a per-row snapshot chained off the *previous row
+# for that (factory, material)* — not recomputed from the ledger on read.
+# Editing or deleting an old row used to leave every later row's
+# closing_stock stale (e.g. correcting Jan 2's Received from +50 to +70
+# left Jan 3 and Jan 4 still showing their original, now-wrong, closing
+# figures) until someone happened to add a brand-new row for that same
+# material/factory. This recomputes the whole chain in one pass, in the
+# same (id ASC) order the app already uses to determine "previous row", so
+# it always matches what the entry/edit screens show as "closing stock" —
+# call it after any INSERT, UPDATE, or DELETE that touches a stock row.
+def recompute_stock_chain(factory: str, material: str) -> None:
+    """Recomputes closing_stock for every row of this (factory, material)
+    pair, walking id ASC and chaining received/used forward. Idempotent —
+    safe to call after an insert even though that row's closing was already
+    correct, and safe to call twice for the same pair."""
+    if not factory or not material:
+        return
+    rows = cur.execute(
+        "SELECT id, received, used FROM stock WHERE factory=? AND material=? ORDER BY id ASC",
+        (factory, material)
+    ).fetchall()
+    running = 0
+    for rid, received, used in rows:
+        running += (received or 0) - (used or 0)
+        cur.execute("UPDATE stock SET closing_stock=? WHERE id=?", (running, rid))
+    conn.commit()
 
 # ── 360° detail pages: Batch / Customer / Material ────────────────────────
 # NEW: a single shared "drill-down" mechanism so clicking a batch, a
@@ -2906,14 +4145,20 @@ def build_digest_html(period_label: str) -> str:
     open_proc = cur.execute("SELECT COUNT(*) FROM procurement_requests WHERE status='Open'").fetchone()[0]
     open_ncr  = cur.execute("SELECT COUNT(*) FROM ncr_capa WHERE status='Open'").fetchone()[0]
 
+    # FIX: Revenue = Dispatch only (goods actually shipped/invoiced). Sales
+    # Orders are booked commitments, not revenue — shown as a separate
+    # "Order Book" line so a booked order isn't double-counted once it
+    # later dispatches.
     total_prod = prod["production"].sum() if not prod.empty else 0
-    revenue = (sales["total"].sum() if not sales.empty else 0) + (so["total"].sum() if not so.empty else 0)
+    revenue = sales["total"].sum() if not sales.empty else 0
+    order_book = so["total"].sum() if not so.empty else 0
     cost = costs["amount"].sum() if not costs.empty else 0
 
     rows = [
         ("Period", f"{since} to {today}"),
         ("Total Production", f"{total_prod:,.2f} MT"),
-        ("Revenue (Dispatch + Sales Orders)", fmt_inr(revenue)),
+        ("Revenue (Dispatch)", fmt_inr(revenue)),
+        ("Order Book (Sales Orders booked, not yet dispatched)", fmt_inr(order_book)),
         ("Costs", fmt_inr(cost)),
         ("Net Profit", fmt_inr(revenue - cost)),
         ("Open Procurement Requests", str(open_proc)),
@@ -3513,18 +4758,24 @@ def generate_batch_no(factory: str) -> str:
 
 def create_production_batch(product: str, formula: str, factory: str, operator: str,
                              machine: str, shift: str, rm_batch_ids: list[int],
-                             qty_used_map: dict[int, float]) -> tuple[int | None, str]:
+                             qty_used_map: dict[int, float], quantity: float | None = None,
+                             quantity_unit: str = "") -> tuple[int | None, str]:
     """Creates a production batch. Refuses if any selected RM batch isn't
-    Approved — this is the actual enforcement, not just a UI filter."""
+    Approved — this is the actual enforcement, not just a UI filter.
+    `quantity`/`quantity_unit` capture the batch's actual output (Section 11)
+    so Dispatch<->Quality reconciliation can compare real quantities instead
+    of a batch count — optional, since historical batches never had it."""
     for rid in rm_batch_ids:
         _status = cur.execute("SELECT status FROM rm_batches WHERE id=?", (rid,)).fetchone()
         if not _status or _status[0] != "Approved":
             return None, f"RM batch id {rid} is not QC-Approved — cannot be used in production."
     batch_no = generate_batch_no(factory)
     cur.execute(
-        "INSERT INTO production_batches VALUES (NULL,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO production_batches "
+        "(batch_no,product,formula,factory,operator,machine,shift,status,created_at,"
+        "quantity,quantity_unit) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (batch_no, product, formula, factory, operator, machine, shift,
-         "Production Started", _now_iso())
+         "Production Started", _now_iso(), quantity, quantity_unit)
     )
     pb_id = cur.lastrowid
     for rid in rm_batch_ids:
@@ -3766,7 +5017,7 @@ def generate_traceability_pdf(trace: dict) -> bytes | None:
 
     story.append(Paragraph("Production Batch", h_style))
     story.append(_kv_table([
-        ("Batch No.", b["batch_no"]), ("Product", b["product"]),
+        ("Batch No.", b["batch_no"]), ("Product", fg_label(b["product"])),
         ("Formula", b.get("formula") or "—"), ("Factory", b["factory"]),
         ("Operator", b["operator"]), ("Machine", b.get("machine") or "—"),
         ("Shift", b.get("shift") or "—"), ("Status", b["status"]),
@@ -3886,7 +5137,7 @@ def generate_invoice_pdf(order_row: dict, customer_row: dict | None) -> bytes | 
     grand = round(taxable + tax_amt, 2)
 
     rows = [["Product", "HSN", "Qty", "Unit Price", "Taxable Value"],
-            [o["product"], o.get("hsn_code") or "—", f"{o['qty']:g}",
+            [fg_label(o["product"]), o.get("hsn_code") or "—", f"{o['qty']:g}",
              fmt_inr(o["unit_price"]), fmt_inr(taxable)]]
     t = Table(rows, colWidths=[55*mm, 25*mm, 20*mm, 30*mm, 35*mm])
     t.setStyle(TableStyle([
@@ -4021,6 +5272,13 @@ with st.sidebar:
     # time a keyed widget is created, before session_state has a value for it).
     module = st.radio("MODULE", available_modules, index=_module_default_idx, key="module_radio")
 
+    # NEW: record a "module view" once per switch (not on every rerun caused
+    # by unrelated widget clicks within the same module) — feeds the Pilot
+    # Dashboard's "Most-used modules" chart.
+    if st.session_state.get("_last_logged_module") != module:
+        log_module_view(st.session_state.username, module)
+        st.session_state["_last_logged_module"] = module
+
     unit = st.selectbox("UNIT SYSTEM", list(UNIT_MAP.keys()))
 
     st.markdown("---")
@@ -4127,6 +5385,7 @@ with st.sidebar:
                                 DELETE FROM stock; DELETE FROM sales; DELETE FROM costs;
                                 DELETE FROM daily_log; DELETE FROM sales_orders;
                                 DELETE FROM sales_targets;
+                                DELETE FROM fg_stock; DELETE FROM inventory_reconciliation;
                             """)
                             conn.commit()
                             log_audit("RESET", "*", "all",
@@ -4169,6 +5428,21 @@ with st.sidebar:
                 conn.commit()
                 st.success("Password updated and saved.")
 
+    # ── Send Feedback — every user, feeds the admin-only Pilot Dashboard ────
+    st.markdown("---")
+    with st.expander("💬 Send feedback", expanded=False):
+        st.caption("Found a bug, or something confusing? Tell us — this goes "
+                   "straight to the admin team's pilot dashboard.")
+        fb_msg = st.text_area("Your feedback", key="fb_msg_input",
+                               placeholder="What happened, and what were you trying to do?",
+                               height=90, label_visibility="collapsed")
+        if st.button("Submit feedback", key="fb_submit_btn"):
+            if not fb_msg.strip():
+                st.warning("Write a line or two first.")
+            else:
+                submit_feedback(st.session_state.username, _user_factory, fb_msg)
+                st.success("Thanks — sent to the admin team.")
+
     # ── Logout ────────────────────────────────────────────────────────────
     if st.button("Log out", width='stretch'):
         for key in list(st.session_state.keys()):
@@ -4198,6 +5472,366 @@ def to_mt(value: float) -> float:
 
 def from_mt(value: float) -> float:
     return float(value) / UNIT_MAP[unit]
+
+# ═════════════════════════════════════════════════════════════════════════
+#  FINISHED GOODS STOCK LEDGER + RECONCILIATION ENGINE
+# ═════════════════════════════════════════════════════════════════════════
+# Core principle (per the Stock/Production/QC/Dispatch reconciliation spec):
+# transactions are entered once, in their own module (Production, Dispatch,
+# QC, Stock). This engine derives FG stock from those transactions and
+# cross-checks the RM side against QC — it never becomes a second place to
+# type the same number, and it never silently corrects a mismatch.
+#
+# FG identity: keyed on (factory, product) using the same free-text product
+# names Production/Dispatch already use. `fg_code` is carried on every row
+# for forward compatibility and back-filled once the FGB-/FGP- scheme from
+# the plant team is finalised — nothing else here needs to change when that
+# happens.
+
+def get_fg_closing_stock(fac: str, product: str) -> float:
+    """Latest closing FG stock for a factory+product. 0 if never logged."""
+    row = cur.execute(
+        "SELECT closing_stock FROM fg_stock WHERE factory=? AND product=? "
+        "ORDER BY id DESC LIMIT 1", (fac, product)
+    ).fetchone()
+    return float(row[0]) if row else 0.0
+
+def record_fg_stock_movement(date_val, fac: str, product: str, *, production_in: float = 0,
+                              dispatch_out: float = 0, adjustment: float = 0,
+                              source_module: str = "", source_ref_id: int | None = None,
+                              fg_code: str = "", movement_type: str = "Entry") -> float:
+    """Appends one FG stock ledger row and returns the new closing balance.
+    Never overwrites a prior row — this is a ledger, not a balance field.
+    FIX: read-previous-then-insert now runs inside _write_lock() so two
+    concurrent movements for the same factory/product can't both read the
+    same previous closing and silently clobber one another (reconciliation
+    review, Section 3)."""
+    with _write_lock():
+        prev = get_fg_closing_stock(fac, product)
+        closing = prev + production_in - dispatch_out + adjustment
+        cur.execute(
+            "INSERT INTO fg_stock (date,factory,product,fg_code,production_in,dispatch_out,"
+            "adjustment,closing_stock,source_module,source_ref_id,created_at,movement_type) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (str(date_val), fac, product, fg_code, production_in, dispatch_out, adjustment,
+             closing, source_module, source_ref_id, _now_iso(), movement_type)
+        )
+    return closing
+
+# ── FG stock edit/delete integrity (Sections 7 & 8) ─────────────────────────
+# Production and Dispatch each write exactly one fg_stock row per save, tagged
+# with (source_module, source_ref_id). To keep the ledger truthful across
+# edits/deletes without ever mutating a historical row, every correction is
+# itself a *new* ledger row that exactly cancels the source's current net
+# contribution. Summing all rows for a given (source_module, source_ref_id)
+# therefore always equals that source's current, post-edit effect on FG stock
+# — this is what makes repeated edits (edit → edit → edit) still net out
+# correctly instead of drifting.
+def get_fg_source_net(source_module: str, source_ref_id: int) -> dict:
+    """Current net FG-stock contribution of one source record, summed across
+    every ledger row ever written for it (original entry + any reversals/
+    corrections already applied)."""
+    row = cur.execute(
+        "SELECT COALESCE(SUM(production_in),0), COALESCE(SUM(dispatch_out),0), "
+        "COALESCE(SUM(adjustment),0) FROM fg_stock WHERE source_module=? AND source_ref_id=?",
+        (source_module, source_ref_id)
+    ).fetchone()
+    return {"production_in": row[0] or 0.0, "dispatch_out": row[1] or 0.0,
+            "adjustment": row[2] or 0.0}
+
+def reverse_fg_stock_for_source(fac: str, product: str, source_module: str,
+                                 source_ref_id: int) -> float | None:
+    """Fully reverses one source record's current net FG-stock contribution
+    by appending an exactly-offsetting ledger row under the *same*
+    (factory, product) it was originally posted against. Returns the new
+    closing balance for that factory+product, or None if the source never
+    had any FG-stock effect to reverse (e.g. it predates this ledger, or a
+    prior reversal already zeroed it out — never double-reverses)."""
+    net = get_fg_source_net(source_module, source_ref_id)
+    if not (net["production_in"] or net["dispatch_out"] or net["adjustment"]):
+        return None
+    return record_fg_stock_movement(
+        datetime.date.today(), fac, product,
+        production_in=-net["production_in"], dispatch_out=-net["dispatch_out"],
+        adjustment=-net["adjustment"], source_module=source_module,
+        source_ref_id=source_ref_id, movement_type="Reversal"
+    )
+
+# ── FG canonical stock unit (Section 6) ──────────────────────────────────────
+# Production is entered as a weight (MT internally, displayed/entered in
+# whatever unit the sidebar UNIT SYSTEM selector is set to). Dispatch is
+# entered as a plain "Qty" — historically and in every existing sales record,
+# that number is a packed-unit count (bags/pieces), not a weight. Those are
+# not the same kind of quantity and must never be added/subtracted directly.
+# fg_product_unit.pack_weight_kg is the weight of one packed unit for a given
+# product; once set, Production's weight is converted into that same packed
+# unit before it's written to fg_stock. Dispatch's Qty is left as-is — it's
+# already in the canonical unit by definition (that's what "Qty" bags means).
+DEFAULT_FG_STOCK_UNIT = "Bags"
+
+def get_fg_stock_unit_cfg(product: str) -> dict:
+    row = cur.execute(
+        "SELECT stock_unit, pack_weight_kg FROM fg_product_unit WHERE product=?", (product,)
+    ).fetchone()
+    if row:
+        return {"stock_unit": row[0] or DEFAULT_FG_STOCK_UNIT, "pack_weight_kg": row[1]}
+    return {"stock_unit": DEFAULT_FG_STOCK_UNIT, "pack_weight_kg": None}
+
+def set_fg_stock_unit_cfg(product: str, stock_unit: str, pack_weight_kg: float | None,
+                           updated_by: str) -> None:
+    cur.execute(
+        "INSERT INTO fg_product_unit (product,stock_unit,pack_weight_kg,updated_by,updated_at) "
+        "VALUES (?,?,?,?,?) ON CONFLICT(product) DO UPDATE SET "
+        "stock_unit=excluded.stock_unit, pack_weight_kg=excluded.pack_weight_kg, "
+        "updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+        (product, stock_unit.strip() or DEFAULT_FG_STOCK_UNIT, pack_weight_kg,
+         updated_by, _now_iso())
+    )
+    conn.commit()
+
+def convert_production_qty_to_fg_unit(qty_display: float, product: str) -> tuple[float, bool, str]:
+    """Converts a Production quantity (entered in the sidebar's weight unit,
+    `qty_display`) into the product's canonical FG stock unit.
+    Returns (converted_qty, is_exact, note).
+    is_exact=False means no reliable conversion exists yet (no pack weight on
+    file for a packed-unit product) — the caller must surface this rather
+    than silently writing an incompatible-unit number to the ledger."""
+    qty_kg = to_mt(qty_display) * 1000.0  # normalise via the existing MT converter
+    cfg = get_fg_stock_unit_cfg(product)
+    stock_unit = cfg["stock_unit"]
+    pack_kg = cfg["pack_weight_kg"]
+    su = stock_unit.strip().lower()
+    if su in ("kg", "kilogram", "kilograms"):
+        return qty_kg, True, ""
+    if su in ("mt", "metric tonne", "metric tonnes", "tonne", "tonnes", "ton"):
+        return qty_kg / 1000.0, True, ""
+    # Packed-unit stock (bags, pieces, drums, ...) — needs a pack weight.
+    if pack_kg and pack_kg > 0:
+        return qty_kg / pack_kg, True, ""
+    return qty_kg, False, (
+        f"No pack weight on file for '{product}' (stock unit: {stock_unit}). "
+        f"Recorded FG movement in KG as an interim value — set the pack weight in "
+        f"Production → ⚙️ FG Stock Unit Settings so this converts correctly."
+    )
+
+def log_reconciliation(check_type: str, fac: str, item_code: str, period_start, period_end,
+                        qty_a: float, qty_b: float, detail: str = "",
+                        critical_threshold: float = 50) -> dict:
+    """Compares two quantities, classifies severity, and appends one row to
+    inventory_reconciliation. Never modifies qty_a/qty_b's source records."""
+    diff = round((qty_a or 0) - (qty_b or 0), 4)
+    if diff == 0:
+        severity = "Matched"
+    elif abs(diff) >= critical_threshold:
+        severity = "Critical"
+    else:
+        severity = "Mismatch"
+    cur.execute(
+        "INSERT INTO inventory_reconciliation (check_type,factory,item_code,period_start,"
+        "period_end,qty_source_a,qty_source_b,difference,severity,detail,checked_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (check_type, fac, item_code, str(period_start), str(period_end),
+         qty_a, qty_b, diff, severity, detail, _now_iso())
+    )
+    conn.commit()
+    return {"check_type": check_type, "factory": fac, "item_code": item_code,
+            "qty_a": qty_a, "qty_b": qty_b, "difference": diff, "severity": severity,
+            "detail": detail, "checked_at": _now_iso()}
+
+def reconcile_rm_incoming(d_start_val, d_end_val, fac_filter: str | None = None) -> list[dict]:
+    """QC Incoming (rm_batches, Approved) vs Stock Incoming (stock.received),
+    aggregated per factory+material over the date window — the two sides
+    don't share a transaction ID, so this compares totals, not line items."""
+    results = []
+    fac_clause = " AND factory=?" if fac_filter and fac_filter != ALL_FACTORIES else ""
+    fac_param  = (fac_filter,) if fac_clause else ()
+    qc_rows = cur.execute(
+        "SELECT factory, material, SUM(quantity) FROM rm_batches "
+        "WHERE status='Approved' AND received_date BETWEEN ? AND ?" + fac_clause +
+        " GROUP BY factory, material",
+        (str(d_start_val), str(d_end_val)) + fac_param
+    ).fetchall()
+    for fac, material, qc_qty in qc_rows:
+        canon = canonical_material(material)
+        stk_row = cur.execute(
+            "SELECT COALESCE(SUM(received),0) FROM stock WHERE factory=? AND date BETWEEN ? AND ? "
+            "AND material=?", (fac, str(d_start_val), str(d_end_val), canon)
+        ).fetchone()
+        stk_qty = stk_row[0] if stk_row else 0
+        results.append(log_reconciliation(
+            "RM_Incoming", fac, get_lab_code(canon) or canon, d_start_val, d_end_val,
+            qc_qty or 0, stk_qty or 0, f"QC rm_batches vs Stock received — {canon}"
+        ))
+    return results
+
+def reconcile_rm_used(d_start_val, d_end_val, fac_filter: str | None = None) -> list[dict]:
+    """QC Material Used (production_batch_materials, via the rm_batch it drew
+    from) vs Stock Material Used (stock.used), aggregated per factory+material."""
+    results = []
+    fac_clause = " AND rb.factory=?" if fac_filter and fac_filter != ALL_FACTORIES else ""
+    fac_param  = (fac_filter,) if fac_clause else ()
+    qc_rows = cur.execute(
+        "SELECT rb.factory, rb.material, SUM(pbm.qty_used) FROM production_batch_materials pbm "
+        "JOIN rm_batches rb ON rb.id = pbm.rm_batch_id "
+        "JOIN production_batches pb ON pb.id = pbm.production_batch_id "
+        "WHERE pb.created_at BETWEEN ? AND ?" + fac_clause +
+        " GROUP BY rb.factory, rb.material",
+        (str(d_start_val) + "T00:00:00", str(d_end_val) + "T23:59:59") + fac_param
+    ).fetchall()
+    for fac, material, qc_qty in qc_rows:
+        canon = canonical_material(material)
+        stk_row = cur.execute(
+            "SELECT COALESCE(SUM(used),0) FROM stock WHERE factory=? AND date BETWEEN ? AND ? "
+            "AND material=?", (fac, str(d_start_val), str(d_end_val), canon)
+        ).fetchone()
+        stk_qty = stk_row[0] if stk_row else 0
+        results.append(log_reconciliation(
+            "RM_Used", fac, get_lab_code(canon) or canon, d_start_val, d_end_val,
+            qc_qty or 0, stk_qty or 0, f"QC production_batch_materials vs Stock used — {canon}"
+        ))
+    return results
+
+def reconcile_dispatch_quality(d_start_val, d_end_val, fac_filter: str | None = None) -> list[dict]:
+    """Dispatch (sales) vs Quality Dispatch — Section 11 fix.
+
+    A batch COUNT is never treated as a quantity. Two genuinely different
+    comparisons are run, and every result is labelled which one it is:
+
+    1. LINKED — sales.production_batch_id points at a specific QC batch.
+       Compares actual Dispatch qty vs that batch's recorded output quantity
+       (production_batches.quantity — see the Quality module's "Create Batch"
+       form). If the linked batch predates quantity capture and has none on
+       file, the comparison is skipped and counted separately as
+       "unverifiable" rather than silently scored as a match.
+    2. FALLBACK — dispatches with no batch link at all (the norm for
+       historical data, since the field is optional). Falls back to
+       aggregate Dispatch qty vs aggregate Production output qty (the same
+       source Production posts to FG Stock) for that factory+product+period.
+       This is explicitly a weaker, aggregate-level proxy — never presented
+       as a verified batch-level match.
+    """
+    results = []
+    fac_clause = " AND s.factory=?" if fac_filter and fac_filter != ALL_FACTORIES else ""
+    fac_param  = (fac_filter,) if fac_clause else ()
+
+    # ── 1) LINKED: real batch-level quantity comparison ─────────────────────
+    linked_rows = cur.execute(
+        "SELECT s.factory, s.product, SUM(s.qty), "
+        "       SUM(CASE WHEN pb.quantity IS NOT NULL THEN pb.quantity ELSE 0 END), "
+        "       SUM(CASE WHEN pb.quantity IS NULL THEN 1 ELSE 0 END), COUNT(*) "
+        "FROM sales s JOIN production_batches pb ON pb.id = s.production_batch_id "
+        "WHERE s.date BETWEEN ? AND ?" + fac_clause + " GROUP BY s.factory, s.product",
+        (str(d_start_val), str(d_end_val)) + fac_param
+    ).fetchall()
+    for fac, product, disp_qty, qc_qty, n_missing, n_total in linked_rows:
+        if n_missing == n_total:
+            # Every linked batch in this group is pre-quantity-capture — there is
+            # nothing real to compare; log it as unverifiable, not as a match.
+            results.append(log_reconciliation(
+                "Dispatch_Quality_Unverifiable", fac, product, d_start_val, d_end_val,
+                disp_qty or 0, 0,
+                f"{n_total} dispatch(es) linked to a QC batch, but none of the linked "
+                f"batches have an output quantity on file (created before quantity "
+                f"capture was added) — cannot verify, do not treat as matched."
+            ))
+            continue
+        detail = "Dispatch qty vs linked QC batch output quantity (production_batches.quantity)."
+        if n_missing:
+            detail += (f" {n_missing} of {n_total} linked batch(es) have no quantity on "
+                       f"file and were excluded from the QC-side total below.")
+        results.append(log_reconciliation(
+            "Dispatch_Quality_Linked", fac, product, d_start_val, d_end_val,
+            disp_qty or 0, qc_qty or 0, detail
+        ))
+
+    # ── 2) FALLBACK: unlinked dispatches, aggregate proxy vs Production ─────
+    unlinked_rows = cur.execute(
+        "SELECT s.factory, s.product, SUM(s.qty) FROM sales s "
+        "WHERE s.production_batch_id IS NULL AND s.date BETWEEN ? AND ?" + fac_clause +
+        " GROUP BY s.factory, s.product",
+        (str(d_start_val), str(d_end_val)) + fac_param
+    ).fetchall()
+    prod_fac_clause = fac_clause.replace("s.factory", "factory")
+    for fac, product, disp_qty in unlinked_rows:
+        prod_row = cur.execute(
+            "SELECT COALESCE(SUM(production),0) FROM production WHERE product=? "
+            "AND date BETWEEN ? AND ?" + prod_fac_clause,
+            (product, str(d_start_val), str(d_end_val)) + fac_param
+        ).fetchone()
+        prod_mt = prod_row[0] if prod_row else 0
+        _fg_qty, _fg_exact, _ = convert_production_qty_to_fg_unit(from_mt(prod_mt or 0), product)
+        results.append(log_reconciliation(
+            "Dispatch_Quality_Fallback", fac, product, d_start_val, d_end_val,
+            disp_qty or 0, _fg_qty,
+            "⚠️ FALLBACK — no QC batch link on these dispatch records. Weak, "
+            "aggregate-level match: total Dispatch qty vs total Production output "
+            "(converted to FG stock unit) for this factory+product+period — "
+            "not a verified batch-level check." +
+            ("" if _fg_exact else " Production-side conversion is also unverified — "
+             "no pack weight on file for this product.")
+        ))
+    return results
+
+def reconcile_fg_stock(fac_filter: str | None = None) -> list[dict]:
+    """Self-check: the latest fg_stock closing balance for each factory+product
+    vs an independent re-derivation from the full fg_stock ledger."""
+    results = []
+    fac_clause = " AND factory=?" if fac_filter and fac_filter != ALL_FACTORIES else ""
+    fac_param  = (fac_filter,) if fac_clause else ()
+    pairs = cur.execute(
+        "SELECT DISTINCT factory, product FROM fg_stock WHERE 1=1" + fac_clause, fac_param
+    ).fetchall()
+    for fac, product in pairs:
+        recorded = get_fg_closing_stock(fac, product)
+        derived_row = cur.execute(
+            "SELECT COALESCE(SUM(production_in),0) - COALESCE(SUM(dispatch_out),0) "
+            "+ COALESCE(SUM(adjustment),0) FROM fg_stock WHERE factory=? AND product=?",
+            (fac, product)
+        ).fetchone()
+        derived = derived_row[0] if derived_row else 0
+        results.append(log_reconciliation(
+            "FG_Stock", fac, product, "-", "-", recorded, derived,
+            "Latest fg_stock closing_stock vs full-ledger re-derivation"
+        ))
+    return results
+
+def reconcile_rm_stock(fac_filter: str | None = None) -> list[dict]:
+    """Self-check: the latest stock.closing_stock for each factory+material
+    vs an independent re-derivation from the full stock ledger."""
+    results = []
+    fac_clause = " AND factory=?" if fac_filter and fac_filter != ALL_FACTORIES else ""
+    fac_param  = (fac_filter,) if fac_clause else ()
+    pairs = cur.execute(
+        "SELECT DISTINCT factory, material FROM stock WHERE 1=1" + fac_clause, fac_param
+    ).fetchall()
+    for fac, material in pairs:
+        recorded_row = cur.execute(
+            "SELECT closing_stock FROM stock WHERE factory=? AND material=? ORDER BY id DESC LIMIT 1",
+            (fac, material)
+        ).fetchone()
+        recorded = recorded_row[0] if recorded_row else 0
+        derived_row = cur.execute(
+            "SELECT COALESCE(SUM(received),0) - COALESCE(SUM(used),0) FROM stock "
+            "WHERE factory=? AND material=?", (fac, material)
+        ).fetchone()
+        derived = derived_row[0] if derived_row else 0
+        results.append(log_reconciliation(
+            "RM_Stock", fac, get_lab_code(material) or material, "-", "-", recorded, derived,
+            "Latest stock.closing_stock vs full-ledger re-derivation"
+        ))
+    return results
+
+def run_all_reconciliations(d_start_val, d_end_val, fac_filter: str | None = None) -> dict:
+    """Runs every check and returns a combined summary. Called on demand from
+    the Reconciliation module — never runs automatically on every page load,
+    to avoid writing to inventory_reconciliation on every single rerun."""
+    return {
+        "RM Incoming — QC vs Stock":       reconcile_rm_incoming(d_start_val, d_end_val, fac_filter),
+        "RM Used — QC vs Stock":           reconcile_rm_used(d_start_val, d_end_val, fac_filter),
+        "Dispatch vs Quality":             reconcile_dispatch_quality(d_start_val, d_end_val, fac_filter),
+        "FG Stock self-check":             reconcile_fg_stock(fac_filter),
+        "RM Stock self-check":             reconcile_rm_stock(fac_filter),
+    }
 
 # ── Customer master ───────────────────────────────────────────────────────
 @st.cache_data(ttl=120)
@@ -4265,7 +5899,7 @@ def render_batch_detail_page(batch_no: str) -> None:
     st.title(f"🧪 Batch {b['batch_no']}")
 
     hc1, hc2, hc3, hc4 = st.columns(4)
-    hc1.metric("Product", b["product"])
+    hc1.metric("Product", fg_label(b["product"]))
     hc2.metric("Factory", b["factory"])
     hc3.metric("Operator", b["operator"] or "—")
     with hc4:
@@ -4479,7 +6113,7 @@ def render_customer_360(customer_name: str) -> None:
             st.info("No products purchased yet.")
         else:
             for _p in _products:
-                st.markdown(f"- {_p}")
+                st.markdown(f"- {fg_label(_p)}")
 
     with tab_complaints:
         st.caption(
@@ -4499,9 +6133,10 @@ def render_customer_360(customer_name: str) -> None:
             st.dataframe(_pay, width='stretch', hide_index=True)
             _pd_ = _dispatches[["date", "product", "qty", "total", "status", "challan_no"]].copy()
             _pd_["total"] = _pd_["total"].apply(fmt_inr)
+            _pd_.insert(2, "rm_code", _pd_["product"].apply(get_fg_code))
             st.dataframe(
-                _pd_.rename(columns={"date": "Date", "product": "Product", "qty": "Qty",
-                                       "total": "Value", "status": "Status",
+                _pd_.rename(columns={"date": "Date", "product": "Product", "rm_code": "RM Code",
+                                       "qty": "Qty", "total": "Value", "status": "Status",
                                        "challan_no": "Challan No."}),
                 width='stretch', hide_index=True
             )
@@ -4513,7 +6148,7 @@ def render_customer_360(customer_name: str) -> None:
             st.warning("Install `reportlab` (pip install reportlab) to enable invoice PDF export.")
         else:
             _o_opts = {
-                f"#{r['id']:05d} — {r['product']} — {fmt_inr(r['total'])} ({r['date']})": r["id"]
+                f"#{r['id']:05d} — {fg_label(r['product'])} — {fmt_inr(r['total'])} ({r['date']})": r["id"]
                 for _, r in _orders.iterrows()
             }
             _o_pick = st.selectbox("Select order to invoice", list(_o_opts.keys()),
@@ -4542,6 +6177,20 @@ def render_material_360(material_name: str) -> None:
     detail_back_button("← Back to app")
 
     st.title(f"🧱 {material_name}")
+
+    _mm_row = cur.execute(
+        "SELECT lab_code, procurement_code, category, status FROM materials_master WHERE name = ?",
+        (material_name,)
+    ).fetchone()
+    if _mm_row:
+        _lab_code, _proc_code, _category, _status = _mm_row
+        idc1, idc2, idc3 = st.columns(3)
+        idc1.metric("Lab Code", _lab_code or "—")
+        idc2.metric("Procurement Code", _proc_code or "⏳ Pending")
+        idc3.metric("Category", _category)
+        if _status == "Pending Code Confirmation":
+            st.warning("⏳ This material's Procurement Code is still awaiting plant-team "
+                       "confirmation — see the Material Master tab under Stock to update it.")
 
     _hist = pd.read_sql_query(
         "SELECT * FROM stock WHERE material = ? ORDER BY date", conn, params=(material_name,))
@@ -4816,22 +6465,27 @@ if module == "Dashboard":
     t_sales = pd.read_sql_query(f"SELECT * FROM sales WHERE date=? {_fac_q}",       conn, params=(today_str,*_fac_p))
     t_so    = pd.read_sql_query(f"SELECT * FROM sales_orders WHERE date=? {_fac_q}",conn, params=(today_str,*_fac_p))
     t_costs = pd.read_sql_query(f"SELECT * FROM costs WHERE date=? {_fac_q}",       conn, params=(today_str,*_fac_p))
-    _t_rev  = (t_sales["total"].sum() if not t_sales.empty else 0) + \
-              (t_so["total"].sum()    if not t_so.empty    else 0)
+    # FIX: Revenue = Dispatch only (goods actually shipped/invoiced). Sales
+    # Orders are booked commitments, not revenue — see P&L module notes.
+    _t_rev  = t_sales["total"].sum() if not t_sales.empty else 0
+    _t_so   = t_so["total"].sum()    if not t_so.empty    else 0
 
     st.markdown("<div class='fc-section-label'>Today</div>", unsafe_allow_html=True)
     ts1, ts2, ts3, ts4 = st.columns(4)
     ts1.metric("Production", f"{from_mt(t_prod['production'].sum()):,.2f} {unit}" if not t_prod.empty else "—")
-    ts2.metric("Revenue",    fmt_inr(_t_rev) if _t_rev else "—")
+    ts2.metric("Revenue (Dispatched)", fmt_inr(_t_rev) if _t_rev else "—",
+               help=f"Sales Orders booked today (not included): {fmt_inr(_t_so)}")
     ts3.metric("Costs",      fmt_inr(t_costs["amount"].sum()) if not t_costs.empty else "—")
     ts4.metric("Entries logged", len(t_prod) + len(t_sales) + len(t_so) + len(t_costs))
 
     st.markdown("<div class='fc-divider-tight'></div>", unsafe_allow_html=True)
 
+    # FIX: Revenue = Dispatch only. Sales Orders (so_rev) are the order
+    # book — shown alongside, never summed into recognised revenue.
     total_prod   = prod_df["production"].sum() if not prod_df.empty else 0
     disp_rev     = sales_df["total"].sum()     if not sales_df.empty else 0
     so_rev       = so_df["total"].sum()         if not so_df.empty   else 0
-    revenue      = disp_rev + so_rev   # Dispatch + Sales Orders combined
+    revenue      = disp_rev             # Dispatch = recognised revenue
     cost         = cost_df["amount"].sum()     if not cost_df.empty else 0
     profit     = revenue - cost
     margin_pct = safe_ratio_pct(profit, revenue) or 0
@@ -4847,10 +6501,10 @@ if module == "Dashboard":
         q  = f"SELECT COALESCE(SUM({col}),0) FROM {table} WHERE date LIKE ? {_fac_clause}"
         return pd.read_sql_query(q, conn, params=(f"{month}%", *_fac_param)).iloc[0,0]
 
-    _rev_this  = _month_sum("sales",        "total",      _this_m) \
-               + _month_sum("sales_orders", "total",      _this_m)
-    _rev_last  = _month_sum("sales",        "total",      _last_m) \
-               + _month_sum("sales_orders", "total",      _last_m)
+    # FIX: month-over-month Revenue delta now tracks Dispatch only, matching
+    # the Revenue metric it's attached to.
+    _rev_this  = _month_sum("sales",        "total",      _this_m)
+    _rev_last  = _month_sum("sales",        "total",      _last_m)
     _cost_this = _month_sum("costs",        "amount",     _this_m)
     _cost_last = _month_sum("costs",        "amount",     _last_m)
     _prod_this = _month_sum("production",   "production", _this_m)
@@ -4870,8 +6524,9 @@ if module == "Dashboard":
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric(f"Production ({unit})", f"{from_mt(total_prod):,.2f}",
               delta=_mom_delta(_prod_this, _prod_last))
-    c2.metric("Revenue",  fmt_inr(revenue),
-              delta=_mom_delta(_rev_this,  _rev_last))
+    c2.metric("Revenue (Dispatched)",  fmt_inr(revenue),
+              delta=_mom_delta(_rev_this,  _rev_last),
+              help=f"Sales Orders booked in range (not included in Revenue): {fmt_inr(so_rev)}")
     c3.metric("Costs",    fmt_inr(cost),
               delta=_mom_delta(_cost_this, _cost_last),
               delta_color="inverse")
@@ -5063,13 +6718,15 @@ elif module == "My Factory":
     t1.metric(f"Production ({unit})",
               f"{from_mt(mf_prod_today['production'].sum()):,.2f}"
               if not mf_prod_today.empty else "—")
+    # FIX: Revenue = Dispatch only; Sales Orders booked today shown via help text.
     _mf_so_today = pd.read_sql_query(
         "SELECT * FROM sales_orders WHERE factory=? AND date=?",
         conn, params=(fac, today_str))
-    _mf_today_rev = (mf_sales_today["total"].sum() if not mf_sales_today.empty else 0) + \
-                    (_mf_so_today["total"].sum()   if not _mf_so_today.empty   else 0)
+    _mf_today_rev = mf_sales_today["total"].sum() if not mf_sales_today.empty else 0
+    _mf_so_today_total = _mf_so_today["total"].sum() if not _mf_so_today.empty else 0
     t2.metric("Revenue (Today)",
-              fmt_inr(_mf_today_rev) if _mf_today_rev else "—")
+              fmt_inr(_mf_today_rev) if _mf_today_rev else "—",
+              help=f"Sales Orders booked today (not included): {fmt_inr(_mf_so_today_total)}")
     t3.metric("Costs",
               fmt_inr(mf_costs_today["amount"].sum())
               if not mf_costs_today.empty else "—")
@@ -5083,17 +6740,20 @@ elif module == "My Factory":
     # ── THIS MONTH ─────────────────────────────────────────────────────────
     st.subheader(f"📆 This Month — {datetime.date.today().strftime('%B %Y')}")
     m1, m2, m3, m4 = st.columns(4)
+    # FIX: Revenue = Dispatch only. Sales Orders booked this month are
+    # shown as a separate order-book figure, not summed into Revenue.
     month_prod     = mf_prod_month["production"].sum()   if not mf_prod_month.empty  else 0
     _mf_disp_rev   = mf_sales_month["total"].sum()       if not mf_sales_month.empty else 0
     _mf_so_month   = pd.read_sql_query(
         "SELECT * FROM sales_orders WHERE factory=? AND date LIKE ?",
         conn, params=(fac, f"{month_str}%"))
     _mf_so_rev     = _mf_so_month["total"].sum() if not _mf_so_month.empty else 0
-    month_rev      = _mf_disp_rev + _mf_so_rev  # Dispatch + Sales Orders
+    month_rev      = _mf_disp_rev               # Dispatch = recognised revenue
     month_cost  = mf_costs_month["amount"].sum()      if not mf_costs_month.empty else 0
     month_profit= month_rev - month_cost
     m1.metric(f"Production ({unit})", f"{from_mt(month_prod):,.2f}")
-    m2.metric("Revenue",   fmt_inr(month_rev))
+    m2.metric("Revenue",   fmt_inr(month_rev),
+              help=f"Sales Orders booked this month (not included): {fmt_inr(_mf_so_rev)}")
     m3.metric("Costs",     fmt_inr(month_cost))
     m4.metric("Net Result",fmt_inr(month_profit),
               delta=("Profit" if month_profit >= 0 else "Loss"))
@@ -5323,7 +6983,12 @@ elif module == "Daily Log":
 elif module == "Production":
 
     st.title("⚙️ Production")
-    tab_entry, tab_log, tab_edit_p = st.tabs(["➕ Log Production", "📋 Records", "✏️ Edit Record"])
+    _prod_tab_labels = ["➕ Log Production", "📋 Records", "✏️ Edit Record"]
+    if _is_admin:
+        _prod_tab_labels.append("⚙️ FG Stock Unit Settings")
+    _prod_tabs = st.tabs(_prod_tab_labels)
+    tab_entry, tab_log, tab_edit_p = _prod_tabs[0], _prod_tabs[1], _prod_tabs[2]
+    tab_fg_units = _prod_tabs[3] if _is_admin else None
 
     with tab_entry:
         st.subheader("New Production Entry")
@@ -5332,7 +6997,7 @@ elif module == "Production":
             pr_date    = st.date_input("Date", key="pr_d")
             pr_factory = st.selectbox("Factory", FACTORIES, key="pr_f",
                                        index=FACTORIES.index(factory) if factory in FACTORIES else 0)
-            pr_product = st.selectbox("Product", FCSC_PRODUCTS, key="pr_p")
+            pr_product = st.selectbox("Product", FCSC_PRODUCTS, key="pr_p", format_func=fg_label)
             pr_custom  = st.text_input("Custom name (if 'Other / Custom')", key="pr_cust")
         with c2:
             pr_labour  = st.number_input("Labour (workers)", min_value=0, step=1, key="pr_l")
@@ -5371,14 +7036,32 @@ elif module == "Production":
                 else:
                     try:
                         cur.execute(
-                            "INSERT INTO production VALUES (NULL,?,?,?,?,?,?,?)",
+                            "INSERT INTO production (date,factory,product,labour,hours,"
+                            "production,efficiency) VALUES (?,?,?,?,?,?,?)",
                             (str(pr_date), pr_factory, final_product,
                              pr_labour, pr_hours, pr_mt, round(pr_eff, 4))
                         )
                         conn.commit()
+                        _new_prod_id = cur.lastrowid
                         log_audit("INSERT", "production", "new",
                                   f"{pr_factory} | {final_product} | {pr_display} {unit}")
-                        st.success(f"✅ Saved — {pr_display:,.2f} {unit} of {final_product} | Efficiency: {pr_eff:.4f}")
+                        # Production -> FG Stock IN (Section 3). Converted into the
+                        # product's canonical FG stock unit (Section 6) — Production
+                        # is entered in a weight unit, Dispatch's "Qty" is a packed-unit
+                        # count, and the two must never be mixed unconverted.
+                        _fg_qty, _fg_exact, _fg_note = convert_production_qty_to_fg_unit(
+                            pr_display, final_product)
+                        _fg_unit = get_fg_stock_unit_cfg(final_product)["stock_unit"]
+                        _new_fg_closing = record_fg_stock_movement(
+                            pr_date, pr_factory, final_product,
+                            production_in=_fg_qty, source_module="Production",
+                            source_ref_id=_new_prod_id
+                        )
+                        st.success(f"✅ Saved — {pr_display:,.2f} {unit} of {final_product} | "
+                                   f"Efficiency: {pr_eff:.4f} | FG Stock ({_fg_unit}) now "
+                                   f"{_new_fg_closing:,.2f}")
+                        if not _fg_exact:
+                            st.warning(f"⚠️ {_fg_note}")
                         st.rerun()
                     except sqlite3.Error as e:
                         st.error(f"Database error: {e}")
@@ -5390,8 +7073,9 @@ elif module == "Production":
         else:
             disp = prod_df.copy()
             disp["production"] = disp["production"].apply(lambda x: round(from_mt(x), 3))
+            disp.insert(disp.columns.get_loc("product") + 1, "rm_code", disp["product"].apply(get_fg_code))
             disp = disp.rename(columns={"production": f"Production ({unit})",
-                                         "efficiency": "Efficiency"})
+                                         "efficiency": "Efficiency", "rm_code": "RM Code"})
 
             disp = search_filter(disp, "Search production records", key="prod_search")
             disp = paginate_df(disp, key="prod_page")
@@ -5399,7 +7083,19 @@ elif module == "Production":
             st.dataframe(disp.drop(columns=["id"], errors="ignore"),
                          width='stretch', hide_index=True, height=320)
 
-            delete_row_ui(prod_df, "production", "product", "prod")
+            def _on_production_deleted(_row) -> None:
+                # Section 7: deleting a Production record must not leave an
+                # orphaned FG stock movement behind.
+                _closing = reverse_fg_stock_for_source(
+                    _row["factory"], _row["product"], "Production", int(_row["id"]))
+                if _closing is not None:
+                    log_audit("REVERSE", "fg_stock", int(_row["id"]),
+                              f"Production #{int(_row['id'])} deleted — FG stock movement "
+                              f"reversed | {_row['factory']} | {_row['product']} | "
+                              f"FG stock now {_closing:,.2f}")
+
+            delete_row_ui(prod_df, "production", "product", "prod",
+                           on_delete=_on_production_deleted)
 
             st.markdown("---")
             st.subheader("Quick Summary")
@@ -5430,7 +7126,7 @@ elif module == "Production":
             st.info("No records to edit in the current date range.")
         else:
             opts = {
-                f"ID {r['id']} — {r['product']} ({r['date']})": r["id"]
+                f"ID {r['id']} — {fg_label(r['product'])} ({r['date']})": r["id"]
                 for _, r in prod_df.iterrows()
             }
             sel_label = st.selectbox("Select record to edit", list(opts.keys()),
@@ -5449,7 +7145,7 @@ elif module == "Production":
                 cur_prod_idx = FCSC_PRODUCTS.index(sel_row["product"]) \
                                if sel_row["product"] in FCSC_PRODUCTS else len(FCSC_PRODUCTS) - 1
                 e_pr_product = st.selectbox("Product", FCSC_PRODUCTS, key="e_pr_p",
-                    index=cur_prod_idx)
+                    index=cur_prod_idx, format_func=fg_label)
                 e_pr_custom  = st.text_input("Custom name (if Other / Custom)",
                     value=sel_row["product"] if sel_row["product"] not in FCSC_PRODUCTS else "",
                     key="e_pr_cust")
@@ -5486,10 +7182,76 @@ elif module == "Production":
                         conn.commit()
                         log_audit("UPDATE", "production", sel_id,
                                   f"{e_pr_factory} | {final_p} | {e_pr_display} {unit}")
-                        st.success("✅ Production record updated.")
+                        # Section 7: an edit must correct FG Stock too, not just the
+                        # production row — reverse the old movement (posted under the
+                        # *old* factory/product, in case those changed) then apply the
+                        # new one, so the final FG impact reflects only the new value.
+                        reverse_fg_stock_for_source(
+                            sel_row["factory"], sel_row["product"], "Production", int(sel_id))
+                        _e_fg_qty, _e_fg_exact, _e_fg_note = convert_production_qty_to_fg_unit(
+                            e_pr_display, final_p)
+                        _e_fg_unit = get_fg_stock_unit_cfg(final_p)["stock_unit"]
+                        _e_fg_closing = record_fg_stock_movement(
+                            e_pr_date, e_pr_factory, final_p,
+                            production_in=_e_fg_qty, source_module="Production",
+                            source_ref_id=int(sel_id), movement_type="Correction"
+                        )
+                        st.success(f"✅ Production record updated — FG Stock ({_e_fg_unit}) "
+                                   f"for {final_p} @ {e_pr_factory} now {_e_fg_closing:,.2f}.")
+                        if not _e_fg_exact:
+                            st.warning(f"⚠️ {_e_fg_note}")
                         st.rerun()
                     except sqlite3.Error as e:
                         st.error(f"Database error: {e}")
+
+
+    if tab_fg_units is not None:
+        with tab_fg_units:
+            st.subheader("FG Stock Unit Settings")
+            st.caption(
+                "Section 6 fix: Production is logged as a weight (MT/KG); Dispatch's "
+                "\"Qty\" field is a packed-unit count that's already the de-facto FG "
+                "stock unit. To combine them safely in one ledger, set each product's "
+                "canonical stock unit and, for packed-unit products, the pack weight — "
+                "Production entries are converted into that unit before they hit FG Stock. "
+                "Left unconfigured, a product defaults to **Bags** with no conversion, "
+                "which is flagged on every Production save until it's set here."
+            )
+            _fgu_rows = []
+            for _p in FCSC_PRODUCTS:
+                if _p == "Other / Custom":
+                    continue
+                _cfg = get_fg_stock_unit_cfg(_p)
+                _fgu_rows.append({"Product": _p, "Stock Unit": _cfg["stock_unit"],
+                                   "Pack Weight (KG)": _cfg["pack_weight_kg"]})
+            st.dataframe(pd.DataFrame(_fgu_rows), width='stretch', hide_index=True, height=280)
+
+            st.markdown("---")
+            st.subheader("Set / Update a Product's FG Stock Unit")
+            fu1, fu2, fu3 = st.columns(3)
+            with fu1:
+                fu_product = st.selectbox("Product", [p for p in FCSC_PRODUCTS
+                                                       if p != "Other / Custom"], key="fu_product")
+            with fu2:
+                fu_unit = st.selectbox("Stock Unit", ["Bags", "Pieces", "Drums", "KG", "MT"],
+                                        key="fu_unit")
+            with fu3:
+                fu_pack_kg = st.number_input(
+                    "Pack Weight (KG per unit)", min_value=0.0, step=0.5, value=0.0,
+                    key="fu_pack_kg",
+                    help="Required for packed-unit stock (Bags/Pieces/Drums) so Production's "
+                         "weight can be converted. Not needed if the stock unit is KG or MT."
+                )
+            if st.button("💾 Save FG Stock Unit", key="fu_save"):
+                set_fg_stock_unit_cfg(
+                    fu_product, fu_unit, fu_pack_kg if fu_pack_kg > 0 else None,
+                    st.session_state.get("username", "")
+                )
+                log_audit("UPDATE", "fg_product_unit", fu_product,
+                          f"stock_unit={fu_unit} | pack_weight_kg={fu_pack_kg or '—'}")
+                st.success(f"✅ {fu_product} → {fu_unit}"
+                          + (f" (pack weight {fu_pack_kg:g} KG)" if fu_pack_kg > 0 else ""))
+                st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5519,7 +7281,7 @@ elif module == "Formulation":
         st.subheader("Material Requirement Calculator")
         fc1, fc2, fc3 = st.columns(3)
         with fc1:
-            fm_calc_product = st.selectbox("Product", FCSC_PRODUCTS, key="fm_calc_product")
+            fm_calc_product = st.selectbox("Product", FCSC_PRODUCTS, key="fm_calc_product", format_func=fg_label)
         with fc2:
             fm_calc_qty = st.number_input("Planned Production Qty", min_value=0.0, step=1.0,
                                            value=100.0, key="fm_calc_qty")
@@ -5591,7 +7353,7 @@ elif module == "Formulation":
         else:
             _fm_search = search_filter(_fm_all_active, "Search products", key="fm_view_search")
             for _, _b in _fm_search.iterrows():
-                with st.expander(f"{_b['product']} — {_b['version']} "
+                with st.expander(f"{fg_label(_b['product'])} — {_b['version']} "
                                    f"({_b['formula_code'] or 'no code'})"):
                     st.caption(f"Reference batch: {_b['batch_size']:g} {_b['batch_unit']}"
                                 + (f" · {_b['notes']}" if _b['notes'] else ""))
@@ -5619,7 +7381,7 @@ elif module == "Formulation":
 
             mb1, mb2, mb3 = st.columns(3)
             with mb1:
-                mb_product = st.selectbox("Product", FCSC_PRODUCTS, key="fm_mgmt_product")
+                mb_product = st.selectbox("Product", FCSC_PRODUCTS, key="fm_mgmt_product", format_func=fg_label)
                 _fm_existing = get_active_bom(mb_product)
                 if _fm_existing:
                     st.caption(f"Current active version: **{_fm_existing['version']}**")
@@ -5649,6 +7411,7 @@ elif module == "Formulation":
                 _show_labels = (_i == 0)
                 with lc1:
                     _m = st.selectbox("Material", MATERIALS, key=f"fm_line_mat_{_i}",
+                                       format_func=material_label,
                                        label_visibility="visible" if _show_labels else "collapsed")
                 with lc2:
                     _q = st.number_input("Qty/Batch", min_value=0.0, step=0.1, key=f"fm_line_qty_{_i}",
@@ -5709,7 +7472,7 @@ elif module == "Formulation":
             st.caption("Optional — set a ₹/unit cost per material to see standard batch costs above.")
             uc1, uc2, uc3 = st.columns([2, 1, 1])
             with uc1:
-                uc_material = st.selectbox("Material", MATERIALS, key="fm_uc_material")
+                uc_material = st.selectbox("Material", MATERIALS, key="fm_uc_material", format_func=material_label)
             with uc2:
                 _uc_row = cur.execute("SELECT unit_cost FROM material_codes WHERE material=?",
                                        (uc_material,)).fetchone()
@@ -5872,6 +7635,8 @@ elif module == "Sand":
 elif module == "Stock":
 
     st.title("🧱 Raw Material Stock")
+    st.caption("Finished Goods stock (produced automatically from Production, consumed by "
+               "Dispatch) is in the **📦 Finished Goods Stock** tab below.")
 
     # ── Persistent reorder banner — visible on every tab ─────────────────────
     _fac_for_banner = factory if factory != ALL_FACTORIES else None
@@ -5904,8 +7669,10 @@ elif module == "Stock":
         if _critical.empty and _low.empty:
             st.success("✅ All materials at healthy stock levels")
 
-    tab_entry, tab_log, tab_edit_stk, tab_status, tab_codes = st.tabs(
-        ["➕ Log Stock", "📋 Records", "✏️ Edit Record", "📦 Current Levels", "🏷️ Material Codes"]
+    tab_entry, tab_log, tab_edit_stk, tab_status, tab_fg, tab_master, tab_fgmaster, tab_codes = st.tabs(
+        ["➕ Log Stock", "📋 Records", "✏️ Edit Record", "📦 Current Levels",
+         "🏭 Finished Goods Stock", "📇 Material Master", "🏷️ Finished Goods Master",
+         "🏷️ Material Codes (legacy)"]
     )
 
     with tab_entry:
@@ -5916,12 +7683,18 @@ elif module == "Stock":
             st_factory = st.selectbox("Factory", FACTORIES, key="stk_f",
                                        index=FACTORIES.index(factory) if factory in FACTORIES else 0)
         with c2:
-            st_material = st.selectbox("Material", MATERIALS, key="stk_m")
-            _stk_suggested_code = get_material_code(st_material)
-            st_code = st.text_input(
-                "Material Code", value=_stk_suggested_code, key="stk_code",
-                placeholder="e.g. C0665/01",
-                help="Auto-filled from the material master if a code is on file. Edit freely.")
+            st_material = st.selectbox("Material", MATERIALS, key="stk_m", format_func=lab_code_label)
+            _stk_lab_code = get_lab_code(st_material)
+            if _stk_lab_code:
+                st.text_input("Lab Code", value=_stk_lab_code, key="stk_code_display", disabled=True,
+                              help="From the official Material Master — not editable here.")
+                st_code = _stk_lab_code
+            else:
+                st_code = st.text_input(
+                    "Lab Code", value=get_material_code(st_material), key="stk_code",
+                    placeholder="e.g. C0665/01",
+                    help="This material isn't in the official Material Master yet — "
+                         "enter its code manually, or add it via the Material Master tab.")
             st_received = st.number_input("Received (units)", min_value=0, step=1, key="stk_r")
         with c3:
             st_used = st.number_input("Used (units)", min_value=0, step=1, key="stk_u")
@@ -5936,34 +7709,52 @@ elif module == "Stock":
             st.metric("Closing Stock Preview", f"{closing:,}")
 
         if st.button("💾 Save Stock"):
-            # Duplicate guard: same date + factory + material
-            _stk_dup = pd.read_sql_query(
-                "SELECT id FROM stock WHERE date=? AND factory=? AND material=?",
-                conn, params=(str(st_date), st_factory, st_material)
-            )
-            if not _stk_dup.empty:
-                st.warning(
-                    f"⚠️ A **{st_material}** entry for **{st_factory}** on **{st_date}** "
-                    f"already exists. Use the ✏️ Edit tab to modify it."
-                )
-            else:
-                try:
-                    cur.execute(
-                        "INSERT INTO stock (date,factory,material,received,used,"
-                        "closing_stock,unit,code) VALUES (?,?,?,?,?,?,?,?)",
-                        (str(st_date), st_factory, st_material, st_received, st_used,
-                         closing, st_unit, st_code.strip())
+            try:
+                # FIX: duplicate-check + insert now run inside _write_lock so
+                # two sessions saving the same date/factory/material at
+                # nearly the same moment can't both pass the "no duplicate
+                # yet" check before either has inserted — the second one now
+                # waits for the first to commit, then correctly sees the
+                # duplicate. recompute_stock_chain() re-derives closing_stock
+                # for the whole (factory, material) ledger from the stored
+                # received/used values afterwards, so the row's closing
+                # balance is always correct regardless of what else was
+                # written concurrently.
+                with _write_lock():
+                    _stk_dup = pd.read_sql_query(
+                        "SELECT id FROM stock WHERE date=? AND factory=? AND material=?",
+                        conn, params=(str(st_date), st_factory, st_material)
                     )
-                    conn.commit()
-                    # keep the material master's code in sync if it changed / is new
-                    if st_code.strip() and st_code.strip() != _stk_suggested_code:
+                    if not _stk_dup.empty:
+                        _stk_saved = False
+                    else:
+                        cur.execute(
+                            "INSERT INTO stock (date,factory,material,received,used,"
+                            "closing_stock,unit,code) VALUES (?,?,?,?,?,?,?,?)",
+                            (str(st_date), st_factory, st_material, st_received, st_used,
+                             closing, st_unit, st_code.strip())
+                        )
+                        _stk_saved = True
+
+                if not _stk_saved:
+                    st.warning(
+                        f"⚠️ A **{lab_code_label(st_material)}** entry for **{st_factory}** on "
+                        f"**{st_date}** already exists. Use the ✏️ Edit tab to modify it."
+                    )
+                else:
+                    recompute_stock_chain(st_factory, st_material)
+                    # Only sync to the legacy material_codes table for items with no
+                    # official Lab Code on file (e.g. "Other / Custom") — materials
+                    # already in materials_master keep their authoritative code and
+                    # are never overwritten from a stock entry.
+                    if not _stk_lab_code and st_code.strip():
                         set_material_code(st_material, st_code.strip())
                     log_audit("INSERT", "stock", "new",
                               f"{st_factory} | {st_material} ({st_code.strip() or 'no code'}) | closing={closing}")
-                    st.success(f"✅ {st_material} closing stock: {closing:,} units")
+                    st.success(f"✅ {lab_code_label(st_material)} closing stock: {closing:,} units")
                     st.rerun()
-                except sqlite3.Error as e:
-                    st.error(f"Database error: {e}")
+            except sqlite3.Error as e:
+                st.error(f"Database error: {e}")
 
     with tab_log:
         if stock_df.empty:
@@ -5973,11 +7764,29 @@ elif module == "Stock":
             _stk_k1.metric("Total Entries",   len(stock_df))
             _stk_k2.metric("Total Received",  f"{int(stock_df['received'].sum()):,} units")
             _stk_k3.metric("Total Used",      f"{int(stock_df['used'].sum()):,} units")
-            filtered_stock = search_filter(stock_df, "Search stock records", key="stk_search")
+            # Display copy with Lab Code in place of the material name (per the
+            # Stock module's display rule) — deletion below still keys off `id`,
+            # never the label text, so this swap is purely cosmetic and safe.
+            # FIX: keep the raw (factory, material) around under a hidden
+            # column so on_delete can recompute the right ledger chain after
+            # a deletion — the visible table still drops it before display.
+            _stock_df_disp = stock_df.copy()
+            _stock_df_disp["_raw_material"] = _stock_df_disp["material"]
+            _stock_df_disp["material"] = _stock_df_disp["material"].apply(lab_code_label)
+            _stock_df_disp = _stock_df_disp.rename(columns={"material": "Lab Code"})
+            filtered_stock = search_filter(_stock_df_disp, "Search stock records", key="stk_search")
             filtered_stock = paginate_df(filtered_stock, key="stk_page")
-            st.dataframe(filtered_stock.drop(columns=["id"], errors="ignore"),
+            st.dataframe(filtered_stock.drop(columns=["id", "_raw_material"], errors="ignore"),
                          width='stretch', hide_index=True, height=320)
-            delete_row_ui(stock_df, "stock", "material", "stock")
+
+            def _on_stock_delete(_row) -> None:
+                # FIX: a deleted row's later chain-mates would otherwise
+                # keep whatever closing_stock they had *including* the
+                # deleted row's received/used — recompute the chain for
+                # the pair the deleted row belonged to.
+                recompute_stock_chain(_row["factory"], _row["_raw_material"])
+
+            delete_row_ui(_stock_df_disp, "stock", "Lab Code", "stock", on_delete=_on_stock_delete)
 
     with tab_edit_stk:
         st.subheader("Edit a Stock Record")
@@ -5985,7 +7794,7 @@ elif module == "Stock":
             st.info("No records to edit in the current date range.")
         else:
             opts = {
-                f"ID {r['id']} — {r['material']} ({r['date']})": r["id"]
+                f"ID {r['id']} — {lab_code_label(r['material'])} ({r['date']})": r["id"]
                 for _, r in stock_df.iterrows()
             }
             sel_label = st.selectbox("Select record to edit", list(opts.keys()),
@@ -6004,9 +7813,20 @@ elif module == "Stock":
             with skc2:
                 e_st_material = st.selectbox("Material", MATERIALS, key="e_stk_m",
                     index=MATERIALS.index(sel_row["material"])
-                          if sel_row["material"] in MATERIALS else 0)
-                _e_stk_code_cur = sel_row.get("code", "") or get_material_code(e_st_material)
-                e_st_code = st.text_input("Material Code", value=_e_stk_code_cur, key="e_stk_code")
+                          if sel_row["material"] in MATERIALS else 0,
+                    format_func=lab_code_label)
+                _e_stk_lab_code = get_lab_code(e_st_material)
+                if _e_stk_lab_code:
+                    st.text_input("Lab Code", value=_e_stk_lab_code, key="e_stk_code_display",
+                                  disabled=True,
+                                  help="From the official Material Master — not editable here.")
+                    e_st_code = _e_stk_lab_code
+                else:
+                    e_st_code = st.text_input(
+                        "Lab Code", value=sel_row.get("code", "") or get_material_code(e_st_material),
+                        key="e_stk_code",
+                        help="This material isn't in the official Material Master yet — "
+                             "enter its code manually, or add it via the Material Master tab.")
                 e_st_received = st.number_input("Received (units)",
                     min_value=0, step=1, value=int(sel_row["received"]), key="e_stk_r")
             with skc3:
@@ -6026,6 +7846,11 @@ elif module == "Stock":
                 st.metric("New Closing Stock", f"{e_st_close:,}")
 
             if st.button("💾 Update Stock Record", key="stk_upd_btn"):
+                # FIX: remember the pair this row belonged to *before* the
+                # update — needed below to fix up the old chain too, since
+                # factory/material are editable and the row may be moving
+                # to a different (factory, material) ledger entirely.
+                _old_factory, _old_material = sel_row["factory"], sel_row["material"]
                 try:
                     cur.execute(
                         "UPDATE stock SET date=?,factory=?,material=?,"
@@ -6035,11 +7860,20 @@ elif module == "Stock":
                          e_st_code.strip(), sel_id)
                     )
                     conn.commit()
-                    if e_st_code.strip():
+                    # FIX: this edit can change received/used on a row that
+                    # has later rows chained after it (and/or move the row
+                    # to a different material/factory) — recompute both the
+                    # old chain (rows that used to follow this one) and the
+                    # new chain (rows this one now belongs to) so nothing
+                    # downstream is left showing a stale closing_stock.
+                    recompute_stock_chain(_old_factory, _old_material)
+                    recompute_stock_chain(e_st_factory, e_st_material)
+                    if not _e_stk_lab_code and e_st_code.strip():
                         set_material_code(e_st_material, e_st_code.strip())
                     log_audit("UPDATE", "stock", sel_id,
                               f"{e_st_factory} | {e_st_material} | closing={e_st_close}")
-                    st.success("✅ Stock record updated.")
+                    st.success("✅ Stock record updated — downstream closing balances "
+                               "for this material recalculated.")
                     st.rerun()
                 except sqlite3.Error as e:
                     st.error(f"Database error: {e}")
@@ -6072,13 +7906,15 @@ elif module == "Stock":
                 if qty < 200:  return "🟢 OK"
                 return "🔵 High"
             current["Status"] = current["closing_stock"].apply(stock_status_label)
-            # backfill code from the material master for older rows saved before this field existed
-            current["code"] = current.apply(
-                lambda r: r["code"] if r["code"] else get_material_code(r["material"]), axis=1)
+            # Lab Code is the primary identifier shown here — authoritative code
+            # from the Material Master, falling back to the legacy free-text code
+            # (or the bare name as a last resort) only for items not yet catalogued.
+            current["Lab Code"] = current.apply(
+                lambda r: get_lab_code(r["material"]) or r["code"] or r["material"], axis=1)
             st.dataframe(
-                current[["material","code","factory","closing_stock","date","Status"]]
+                current[["Lab Code","factory","closing_stock","date","Status"]]
                     .rename(columns={
-                        "material":"Material","code":"Code","factory":"Factory",
+                        "factory":"Factory",
                         "closing_stock":"Closing Stock","date":"Last Updated"
                     }),
                 width='stretch', hide_index=True
@@ -6092,7 +7928,7 @@ elif module == "Stock":
                     color = ("#6E1423" if row["closing_stock"] < 20 else
                              "#A8791E" if row["closing_stock"] < 50 else "#145C3C")
                     progress_bar(
-                        f"{row['material']} ({row['factory']})",
+                        f"{row['Lab Code']} ({row['factory']})",
                         row["closing_stock"],
                         max_stock,
                         color=color
@@ -6104,29 +7940,441 @@ elif module == "Stock":
                         "and exhaustion forecast — all in one page.")
             for _mat in sorted(current["material"].unique()):
                 mrow1, mrow2 = st.columns([5, 1])
-                mrow1.markdown(f"🧱 **{_mat}**")
+                mrow1.markdown(f"🧱 **{lab_code_label(_mat)}**")
                 if mrow2.button("360° →", key=f"mat360_{_mat}", use_container_width=True):
                     open_detail_view("material", _mat)
 
             if HAS_PLOTLY and not current.empty:
                 fig_stk = px.bar(
                     current.sort_values("closing_stock", ascending=True),
-                    x="closing_stock", y="material",
+                    x="closing_stock", y="Lab Code",
                     orientation="h",
                     color="closing_stock",
                     color_continuous_scale=["#6E1423","#D4AF37","#145C3C"],
                     template="plotly_white",
                     title="Current Stock by Material",
-                    labels={"closing_stock":"Closing Stock","material":"Material"}
+                    labels={"closing_stock":"Closing Stock","Lab Code":"Lab Code"}
                 )
                 fig_stk.update_layout(height=max(220, len(current) * 30 + 60),
                                        margin=dict(l=10,r=10,t=36,b=10),
                                        showlegend=False)
                 st.plotly_chart(fig_stk, width='stretch')
 
+    with tab_fg:
+        st.subheader("🏭 Finished Goods Stock")
+        st.caption("Derived automatically — Production entries add to it, Dispatch entries "
+                   "subtract from it. Nothing is typed in here directly except manual "
+                   "adjustments below.")
+
+        _fg_fac_clause = " AND factory=?" if factory != ALL_FACTORIES else ""
+        _fg_fac_param  = (factory,) if factory != ALL_FACTORIES else ()
+        _fg_current = pd.read_sql_query(
+            "SELECT factory, product, closing_stock, date FROM fg_stock f1 "
+            "WHERE id = (SELECT MAX(id) FROM fg_stock f2 "
+            "WHERE f2.factory = f1.factory AND f2.product = f1.product)"
+            + _fg_fac_clause + " ORDER BY product",
+            conn, params=_fg_fac_param
+        )
+        if _fg_current.empty:
+            st.info("No Finished Goods stock movements yet — save a Production or Dispatch "
+                    "entry to start the ledger.")
+        else:
+            _fg_current_disp = _fg_current.copy()
+            _fg_current_disp.insert(2, "rm_code", _fg_current_disp["product"].apply(get_fg_code))
+            st.dataframe(
+                _fg_current_disp.rename(columns={
+                    "factory": "Factory", "product": "Product", "rm_code": "RM Code",
+                    "closing_stock": "Closing FG Stock", "date": "Last Movement"
+                }),
+                width='stretch', hide_index=True, height=300
+            )
+            if HAS_PLOTLY:
+                fig_fg = px.bar(
+                    _fg_current.sort_values("closing_stock", ascending=True),
+                    x="closing_stock", y="product", orientation="h",
+                    color="closing_stock",
+                    color_continuous_scale=["#6E1423", "#D4AF37", "#145C3C"],
+                    template="plotly_white", title="Current FG Stock by Product",
+                    labels={"closing_stock": "Closing Stock", "product": "Product"}
+                )
+                fig_fg.update_layout(height=max(220, len(_fg_current) * 30 + 60),
+                                      margin=dict(l=10, r=10, t=36, b=10), showlegend=False)
+                st.plotly_chart(fig_fg, width='stretch')
+
+        st.markdown("---")
+        st.markdown("#### ➕ Manual Adjustment")
+        st.caption("For opening balances, physical count corrections, or damage/write-offs — "
+                   "not for routine production or dispatch, which are captured automatically.")
+        fgc1, fgc2, fgc3 = st.columns(3)
+        with fgc1:
+            fg_adj_factory = st.selectbox("Factory", FACTORIES, key="fg_adj_f",
+                                           index=FACTORIES.index(factory) if factory in FACTORIES else 0)
+            fg_adj_product = st.selectbox("Product", FCSC_PRODUCTS, key="fg_adj_p", format_func=fg_label)
+        with fgc2:
+            fg_adj_custom = st.text_input("Custom name (if 'Other / Custom')", key="fg_adj_p_cust")
+            fg_adj_qty    = st.number_input("Adjustment (+/-)", step=1.0, key="fg_adj_qty",
+                                             help="Positive to add stock, negative to remove.")
+        with fgc3:
+            fg_adj_reason = st.text_input("Reason", key="fg_adj_reason",
+                                           placeholder="e.g. Opening balance, physical count")
+            _fg_adj_final_product = (fg_adj_custom.strip()
+                                      if fg_adj_product == "Other / Custom" and fg_adj_custom.strip()
+                                      else fg_adj_product)
+            if _fg_adj_final_product and _fg_adj_final_product != "Other / Custom":
+                st.metric("Current FG Stock",
+                          f"{get_fg_closing_stock(fg_adj_factory, _fg_adj_final_product):,.2f}")
+        if st.button("💾 Save Adjustment", key="fg_adj_save"):
+            if not _fg_adj_final_product or _fg_adj_final_product == "Other / Custom":
+                st.warning("Please select or enter a product.")
+            elif fg_adj_qty == 0:
+                st.warning("Enter a non-zero adjustment.")
+            else:
+                _fg_new_closing = record_fg_stock_movement(
+                    datetime.date.today(), fg_adj_factory, _fg_adj_final_product,
+                    adjustment=fg_adj_qty, source_module="Manual Adjustment"
+                )
+                log_audit("INSERT", "fg_stock", "adjustment",
+                          f"{fg_adj_factory} | {_fg_adj_final_product} | {fg_adj_qty:+} | {fg_adj_reason}")
+                st.success(f"✅ Adjustment saved — {_fg_adj_final_product} @ {fg_adj_factory} "
+                           f"FG Stock now {_fg_new_closing:,.2f}")
+                st.rerun()
+
+    with tab_master:
+        st.subheader("📇 Material Master")
+        st.caption("The official codification — Raw Materials, Packaging, Labels/Stickers, "
+                    "and Process/Intermediate items — sourced from the plant team's "
+                    "Codification_for_System.xlsx. This is the single source of truth used "
+                    "by every dropdown across the ERP.")
+
+        _mm_all = get_material_master_df()
+        _mm_pending = _mm_all[_mm_all["status"] == "Pending Code Confirmation"]
+
+        cmm1, cmm2, cmm3 = st.columns(3)
+        cmm1.metric("Total Materials", len(_mm_all))
+        cmm2.metric("Confirmed", len(_mm_all) - len(_mm_pending))
+        cmm3.metric("⏳ Pending Code Confirmation", len(_mm_pending))
+
+        if not _mm_pending.empty:
+            with st.expander(f"⏳ {len(_mm_pending)} materials awaiting plant-team code confirmation", expanded=False):
+                st.caption("These materials had a code collision in the source sheet (the same "
+                           "Procurement Code assigned to two different materials, or a material "
+                           "listed twice with two different codes). They work everywhere in the "
+                           "ERP already — they're just flagged until the plant QC head confirms "
+                           "the correct code. Update the code below the moment you hear back; "
+                           "no other change is needed anywhere else in the app.")
+                st.dataframe(
+                    _mm_pending[["lab_code", "name", "category"]].rename(
+                        columns={"lab_code": "Lab Code", "name": "Material", "category": "Category"}),
+                    width='stretch', hide_index=True
+                )
+
+        st.markdown("---")
+        st.markdown("#### Browse Material Master")
+        _mm_cat = st.selectbox(
+            "Category", ["All"] + sorted(_mm_all["category"].unique().tolist()), key="mm_cat_filter"
+        )
+        _mm_view = _mm_all if _mm_cat == "All" else _mm_all[_mm_all["category"] == _mm_cat]
+        _mm_view = search_filter(_mm_view, "Search materials, lab codes, or procurement codes", key="mm_search")
+        st.dataframe(
+            _mm_view[["lab_code", "name", "procurement_code", "category", "status"]].rename(
+                columns={"lab_code": "Lab Code", "name": "Material Name",
+                         "procurement_code": "Procurement Code", "category": "Category",
+                         "status": "Status"}),
+            width='stretch', hide_index=True, height=360
+        )
+
+        st.markdown("---")
+        st.markdown("#### Confirm a Pending Procurement Code")
+        st.caption("Use this once the plant team resolves a code collision — this is the only "
+                    "place you need to update it.")
+        if not _mm_pending.empty:
+            mmp1, mmp2 = st.columns([2, 1])
+            with mmp1:
+                mm_pending_pick = st.selectbox(
+                    "Material", _mm_pending["name"].tolist(), key="mm_pending_pick")
+            with mmp2:
+                mm_new_code = st.text_input("Confirmed Procurement Code", key="mm_new_code",
+                                             placeholder="e.g. R1009")
+            if st.button("✅ Confirm Code", key="mm_confirm_code"):
+                if not mm_new_code.strip():
+                    st.error("Enter the confirmed code before saving.")
+                else:
+                    cur.execute(
+                        "UPDATE materials_master SET procurement_code = ?, status = 'Confirmed' "
+                        "WHERE name = ?", (mm_new_code.strip(), mm_pending_pick)
+                    )
+                    conn.commit()
+                    log_audit("UPDATE", "materials_master", mm_pending_pick,
+                               f"procurement_code confirmed = {mm_new_code.strip()}")
+                    st.success(f"✅ {mm_pending_pick} → {mm_new_code.strip()} (now Confirmed)")
+                    st.rerun()
+        else:
+            st.success("✅ No materials currently pending code confirmation.")
+
+        st.markdown("---")
+        st.markdown("#### ➕ Add New Material")
+        am1, am2, am3 = st.columns(3)
+        with am1:
+            am_name = st.text_input("Material Name *", key="mm_add_name")
+            am_lab_code = st.text_input("Lab Code / RM Code", key="mm_add_lab", placeholder="e.g. C9999/01")
+        with am2:
+            am_proc_code = st.text_input("Procurement Code", key="mm_add_proc", placeholder="e.g. R9999")
+            am_category = st.selectbox("Category",
+                ["Raw Material", "Packaging", "Label/Sticker", "Process/Intermediate"], key="mm_add_cat")
+        with am3:
+            am_status = st.selectbox("Status", ["Confirmed", "Pending Code Confirmation"], key="mm_add_status")
+        if st.button("💾 Add Material", key="mm_add_btn"):
+            ok, msg = add_material_master(am_lab_code, am_name, am_proc_code, am_category, am_status)
+            (st.success if ok else st.error)(msg)
+            if ok:
+                st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### ✏️ Edit / Deactivate a Material")
+        _mm_edit_names = _mm_all["name"].tolist()
+        if _mm_edit_names:
+            em_pick = st.selectbox("Material", _mm_edit_names, key="mm_edit_pick")
+            _em_row = _mm_all[_mm_all["name"] == em_pick].iloc[0]
+            _cat_opts = ["Raw Material", "Packaging", "Label/Sticker", "Process/Intermediate"]
+            em1, em2, em3 = st.columns(3)
+            with em1:
+                em_lab = st.text_input("Lab Code / RM Code", value=_em_row["lab_code"] or "", key="mm_edit_lab")
+            with em2:
+                em_proc = st.text_input("Procurement Code", value=_em_row["procurement_code"] or "", key="mm_edit_proc")
+            with em3:
+                _status_opts = ["Confirmed", "Pending Code Confirmation", "Inactive"]
+                _cur_status = _em_row["status"] if _em_row["status"] in _status_opts else "Confirmed"
+                em_status = st.selectbox("Status", _status_opts, index=_status_opts.index(_cur_status), key="mm_edit_status")
+            em_cat = st.selectbox("Category", _cat_opts,
+                index=(_cat_opts.index(_em_row["category"]) if _em_row["category"] in _cat_opts else 0),
+                key="mm_edit_cat")
+            if st.button("💾 Save Changes", key="mm_edit_save"):
+                ok, msg = update_material_master(int(_em_row["id"]), em_lab, em_proc, em_cat, em_status)
+                (st.success if ok else st.error)(msg)
+                if ok:
+                    st.rerun()
+            st.caption("Setting status to **Inactive** removes it from every dropdown (Stock, Quality, "
+                        "Procurement, Formulation) without touching historical records that reference it.")
+
+        st.markdown("---")
+        st.markdown("#### 📤 Import Material Master (Excel / CSV)")
+        st.caption("Columns expected: lab_code, name, procurement_code, category, status. "
+                    "Matches on name — existing materials update, new names get added.")
+        mm_upload = st.file_uploader("Upload file", type=["xlsx", "csv"], key="mm_upload")
+        if mm_upload is not None:
+            try:
+                _imp_df = pd.read_csv(mm_upload) if mm_upload.name.endswith(".csv") else pd.read_excel(mm_upload)
+                _imp_df.columns = [c.strip().lower() for c in _imp_df.columns]
+                if "name" not in _imp_df.columns:
+                    st.error("File must include at least a 'name' column.")
+                else:
+                    st.dataframe(_imp_df.head(10), width='stretch', hide_index=True)
+                    if st.button(f"✅ Import {len(_imp_df)} row(s)", key="mm_import_btn"):
+                        _added, _updated = 0, 0
+                        for _, _r in _imp_df.iterrows():
+                            _nm = str(_r.get("name", "")).strip()
+                            if not _nm:
+                                continue
+                            _lc = str(_r.get("lab_code", "") or "").strip() or None
+                            _pc = str(_r.get("procurement_code", "") or "").strip() or None
+                            _ct = str(_r.get("category", "") or "Raw Material").strip() or "Raw Material"
+                            _st_ = str(_r.get("status", "") or "Confirmed").strip() or "Confirmed"
+                            _exist = cur.execute("SELECT id FROM materials_master WHERE name=?", (_nm,)).fetchone()
+                            if _exist:
+                                cur.execute(
+                                    "UPDATE materials_master SET lab_code=?, procurement_code=?, category=?, status=? WHERE id=?",
+                                    (_lc, _pc, _ct, _st_, _exist[0]))
+                                _updated += 1
+                            else:
+                                cur.execute(
+                                    "INSERT INTO materials_master(lab_code,name,procurement_code,category,status,created_at) "
+                                    "VALUES (?,?,?,?,?,?)",
+                                    (_lc, _nm, _pc, _ct, _st_, datetime.datetime.now().isoformat(timespec="seconds")))
+                                _added += 1
+                        conn.commit()
+                        log_audit("INSERT", "materials_master", "bulk_import",
+                                   f"{_added} added, {_updated} updated by {st.session_state.username}")
+                        st.success(f"✅ Import complete — {_added} added, {_updated} updated.")
+                        st.rerun()
+            except Exception as e:
+                st.error(f"Could not read file: {e}")
+
+        st.markdown("---")
+        st.markdown("#### 📥 Export Material Master")
+        _mm_export_buf = BytesIO()
+        with pd.ExcelWriter(_mm_export_buf, engine="openpyxl") as _mm_writer:
+            _mm_all.to_excel(_mm_writer, sheet_name="Material Master", index=False)
+        _mm_export_buf.seek(0)
+        st.download_button(
+            "📥 Download Material Master (Excel)", data=_mm_export_buf,
+            file_name=f"FCSC_MaterialMaster_{datetime.date.today()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="mm_export_btn"
+        )
+
+    with tab_fgmaster:
+        st.subheader("🏷️ Finished Goods Master")
+        st.caption("The official finished-product codification — sourced from the plant team's "
+                    "finished_good_codification.xlsx. This is the single source of truth used "
+                    "by every Product dropdown across the ERP (Production, Sales, Dispatch, "
+                    "Formulation, Quality).")
+
+        _fgm_all = get_finished_goods_master_df()
+        _fgm_pending = _fgm_all[_fgm_all["status"] == "Pending Code Confirmation"]
+
+        cfg1, cfg2, cfg3 = st.columns(3)
+        cfg1.metric("Total Finished Products", len(_fgm_all))
+        cfg2.metric("Confirmed", len(_fgm_all) - len(_fgm_pending))
+        cfg3.metric("⏳ Pending Code Confirmation", len(_fgm_pending))
+
+        if not _fgm_pending.empty:
+            with st.expander(f"⏳ {len(_fgm_pending)} products awaiting a code", expanded=False):
+                st.caption("These finished products had no code assigned yet in the source "
+                           "sheet. They work everywhere in the ERP already — they're just "
+                           "flagged until the plant team assigns the code. Update it below the "
+                           "moment you hear back; no other change is needed anywhere else in "
+                           "the app.")
+                st.dataframe(
+                    _fgm_pending[["name"]].rename(columns={"name": "Product"}),
+                    width='stretch', hide_index=True
+                )
+
+        st.markdown("---")
+        st.markdown("#### Browse Finished Goods Master")
+        _fgm_view = search_filter(_fgm_all, "Search products or codes", key="fgm_search")
+        st.dataframe(
+            _fgm_view[["name", "code", "status"]].rename(
+                columns={"name": "Product", "code": "RM Code", "status": "Status"}),
+            width='stretch', hide_index=True, height=360
+        )
+
+        st.markdown("---")
+        st.markdown("#### Confirm a Pending Code")
+        st.caption("Use this once the plant team assigns the code — this is the only place "
+                    "you need to update it.")
+        if not _fgm_pending.empty:
+            fgmp1, fgmp2 = st.columns([2, 1])
+            with fgmp1:
+                fgm_pending_pick = st.selectbox(
+                    "Product", _fgm_pending["name"].tolist(), key="fgm_pending_pick")
+            with fgmp2:
+                fgm_new_code = st.text_input("Confirmed RM Code", key="fgm_new_code",
+                                              placeholder="e.g. FPS_C010_1K")
+            if st.button("✅ Confirm Code", key="fgm_confirm_code"):
+                if not fgm_new_code.strip():
+                    st.error("Enter the confirmed code before saving.")
+                else:
+                    cur.execute(
+                        "UPDATE finished_goods_master SET code = ?, status = 'Confirmed' "
+                        "WHERE name = ?", (fgm_new_code.strip(), fgm_pending_pick)
+                    )
+                    conn.commit()
+                    log_audit("UPDATE", "finished_goods_master", fgm_pending_pick,
+                               f"code confirmed = {fgm_new_code.strip()}")
+                    st.success(f"✅ {fgm_pending_pick} → {fgm_new_code.strip()} (now Confirmed)")
+                    st.rerun()
+        else:
+            st.success("✅ No finished products currently pending a code.")
+
+        st.markdown("---")
+        st.markdown("#### ➕ Add New Finished Product")
+        afg1, afg2 = st.columns(2)
+        with afg1:
+            afg_name = st.text_input("Product Name *", key="fgm_add_name")
+        with afg2:
+            afg_code = st.text_input("RM Code", key="fgm_add_code", placeholder="e.g. FPS_C010_1K")
+        afg_status = st.selectbox("Status", ["Confirmed", "Pending Code Confirmation"], key="fgm_add_status")
+        if st.button("💾 Add Finished Product", key="fgm_add_btn"):
+            ok, msg = add_finished_good(afg_name, afg_code, afg_status)
+            (st.success if ok else st.error)(msg)
+            if ok:
+                st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### ✏️ Edit / Deactivate a Finished Product")
+        _fgm_edit_names = _fgm_all["name"].tolist()
+        if _fgm_edit_names:
+            efg_pick = st.selectbox("Product", _fgm_edit_names, key="fgm_edit_pick")
+            _efg_row = _fgm_all[_fgm_all["name"] == efg_pick].iloc[0]
+            efg1, efg2 = st.columns(2)
+            with efg1:
+                efg_code = st.text_input("RM Code", value=_efg_row["code"] or "", key="fgm_edit_code")
+            with efg2:
+                _fgm_status_opts = ["Confirmed", "Pending Code Confirmation", "Inactive"]
+                _fgm_cur_status = _efg_row["status"] if _efg_row["status"] in _fgm_status_opts else "Confirmed"
+                efg_status = st.selectbox("Status", _fgm_status_opts,
+                    index=_fgm_status_opts.index(_fgm_cur_status), key="fgm_edit_status")
+            if st.button("💾 Save Changes", key="fgm_edit_save"):
+                ok, msg = update_finished_good(int(_efg_row["id"]), efg_code, efg_status)
+                (st.success if ok else st.error)(msg)
+                if ok:
+                    st.rerun()
+            st.caption("Setting status to **Inactive** removes it from every dropdown (Production, "
+                        "Sales, Dispatch, Formulation) without touching historical records that "
+                        "reference it.")
+
+        st.markdown("---")
+        st.markdown("#### 📤 Import Finished Goods Master (Excel / CSV)")
+        st.caption("Columns expected: name, code, status. Matches on name — existing products "
+                    "update, new names get added.")
+        fgm_upload = st.file_uploader("Upload file", type=["xlsx", "csv"], key="fgm_upload")
+        if fgm_upload is not None:
+            try:
+                _fgm_imp_df = pd.read_csv(fgm_upload) if fgm_upload.name.endswith(".csv") else pd.read_excel(fgm_upload)
+                _fgm_imp_df.columns = [c.strip().lower() for c in _fgm_imp_df.columns]
+                if "name" not in _fgm_imp_df.columns:
+                    st.error("File must include at least a 'name' column.")
+                else:
+                    st.dataframe(_fgm_imp_df.head(10), width='stretch', hide_index=True)
+                    if st.button(f"✅ Import {len(_fgm_imp_df)} row(s)", key="fgm_import_btn"):
+                        _fgm_added, _fgm_updated = 0, 0
+                        for _, _r in _fgm_imp_df.iterrows():
+                            _nm = str(_r.get("name", "")).strip()
+                            if not _nm:
+                                continue
+                            _cd = str(_r.get("code", "") or "").strip() or None
+                            _st_ = str(_r.get("status", "") or "Confirmed").strip() or "Confirmed"
+                            _exist = cur.execute("SELECT id FROM finished_goods_master WHERE name=?", (_nm,)).fetchone()
+                            if _exist:
+                                cur.execute(
+                                    "UPDATE finished_goods_master SET code=?, status=? WHERE id=?",
+                                    (_cd, _st_, _exist[0]))
+                                _fgm_updated += 1
+                            else:
+                                cur.execute(
+                                    "INSERT INTO finished_goods_master(name,code,status,created_at) "
+                                    "VALUES (?,?,?,?)",
+                                    (_nm, _cd, _st_, datetime.datetime.now().isoformat(timespec="seconds")))
+                                _fgm_added += 1
+                        conn.commit()
+                        log_audit("INSERT", "finished_goods_master", "bulk_import",
+                                   f"{_fgm_added} added, {_fgm_updated} updated by {st.session_state.username}")
+                        st.success(f"✅ Import complete — {_fgm_added} added, {_fgm_updated} updated.")
+                        st.rerun()
+            except Exception as e:
+                st.error(f"Could not read file: {e}")
+
+        st.markdown("---")
+        st.markdown("#### 📥 Export Finished Goods Master")
+        _fgm_export_buf = BytesIO()
+        with pd.ExcelWriter(_fgm_export_buf, engine="openpyxl") as _fgm_writer:
+            _fgm_all.to_excel(_fgm_writer, sheet_name="Finished Goods Master", index=False)
+        _fgm_export_buf.seek(0)
+        st.download_button(
+            "📥 Download Finished Goods Master (Excel)", data=_fgm_export_buf,
+            file_name=f"FCSC_FinishedGoodsMaster_{datetime.date.today()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="fgm_export_btn"
+        )
+
     with tab_codes:
-        st.subheader("🏷️ Material Codes")
+        st.subheader("🏷️ Material Codes (legacy)")
+        st.info("Superseded by the **📇 Material Master** tab above, which is now the "
+                 "authoritative source. This legacy editor is kept only for any custom/"
+                 "not-yet-catalogued materials — new materials should be added to the "
+                 "official master (Codification_for_System.xlsx), not typed in here.")
         st.caption("Internal codes (e.g. C0665/01) for raw materials, pre-loaded from "
+
                     "the factory's RM Daily Stock tracker. These auto-fill the "
                     "'Material Code' field whenever that material is logged in Stock.")
 
@@ -6150,7 +8398,7 @@ elif module == "Stock":
         st.markdown("#### Set / Update a Material's Code")
         mc1, mc2 = st.columns([2, 1])
         with mc1:
-            mc_material = st.selectbox("Material", MATERIALS, key="mc_material")
+            mc_material = st.selectbox("Material", MATERIALS, key="mc_material", format_func=material_label)
         with mc2:
             mc_code = st.text_input(
                 "Code", value=get_material_code(st.session_state.get("mc_material", MATERIALS[0])),
@@ -6225,9 +8473,11 @@ elif module == "Procurement":
                 total_stages = len(stages_df)
                 pct = (done / total_stages * 100) if total_stages else 0
                 trigger_tag = "🤖 Auto (Low Stock)" if req["trigger_type"] == "auto_low_stock" else "✍️ Manual"
+                _proc_code = material_procurement_code(req["material"])
+                _mat_display = f"{_proc_code} – {req['material']}" if _proc_code else req["material"]
 
                 with st.expander(
-                    f"PR-{req_id:05d} — {req['material']} @ {req['factory']}  ·  "
+                    f"PR-{req_id:05d} — {_mat_display} @ {req['factory']}  ·  "
                     f"{trigger_tag}  ·  {pct:.0f}% complete",
                     expanded=False,
                 ):
@@ -6336,7 +8586,7 @@ elif module == "Procurement":
         with nr1:
             nr_factory = st.selectbox(
                 "Factory", FACTORIES if _is_admin else [_user_factory], key="nr_factory")
-            nr_material = st.selectbox("Material", MATERIALS, key="nr_material")
+            nr_material = st.selectbox("Material", MATERIALS, key="nr_material", format_func=material_label)
         with nr2:
             nr_qty  = st.number_input("Quantity Needed", min_value=0.0, step=1.0, key="nr_qty")
             nr_unit = st.selectbox(
@@ -6515,7 +8765,7 @@ elif module == "Procurement":
             st.markdown("#### Set / Change a Material's Vendor")
             mm1, mm2 = st.columns(2)
             with mm1:
-                mm_material = st.selectbox("Material", MATERIALS, key="mm_material")
+                mm_material = st.selectbox("Material", MATERIALS, key="mm_material", format_func=material_label)
             with mm2:
                 _mm_vendor_names = [r[0] for r in cur.execute(
                     "SELECT name FROM vendors ORDER BY name").fetchall()]
@@ -6610,7 +8860,7 @@ elif module == "Procurement":
             with rl1:
                 rl_factory = st.selectbox("Factory", FACTORIES, key="rl_factory")
             with rl2:
-                rl_material = st.selectbox("Material", MATERIALS, key="rl_material")
+                rl_material = st.selectbox("Material", MATERIALS, key="rl_material", format_func=material_label)
             with rl3:
                 rl_threshold = st.number_input(
                     "Reorder Threshold", min_value=0.0, value=float(DEFAULT_REORDER_THRESHOLD),
@@ -6820,7 +9070,7 @@ elif module == "Quality":
                                   else im_supplier_manual.strip())
             im_po = st.text_input("PO Number", key="im_po")
         with ic2:
-            im_material = st.selectbox("Material", MATERIALS, key="im_material")
+            im_material = st.selectbox("Material", MATERIALS, key="im_material", format_func=lab_code_label)
             im_batch_no = st.text_input("Supplier Batch Number", key="im_batch_no")
         with ic3:
             im_qty  = st.number_input("Quantity", min_value=0.0, step=1.0, key="im_qty")
@@ -6902,7 +9152,7 @@ elif module == "Quality":
 
             pcb1, pcb2 = st.columns(2)
             with pcb1:
-                pb_product = st.selectbox("Product", FCSC_PRODUCTS, key="pb_product")
+                pb_product = st.selectbox("Product", FCSC_PRODUCTS, key="pb_product", format_func=fg_label)
                 pb_formula = st.text_input("Formula / Recipe reference", key="pb_formula",
                                              placeholder="e.g. TG3.0-STD-v2")
                 pb_factory = st.selectbox("Factory", FACTORIES if _is_admin else [_user_factory], key="pb_factory")
@@ -6910,6 +9160,17 @@ elif module == "Quality":
                 pb_operator = st.text_input("Operator", key="pb_operator")
                 pb_machine  = st.text_input("Machine", key="pb_machine")
                 pb_shift    = st.selectbox("Shift", SHIFTS, key="pb_shift")
+
+            st.caption("Output quantity (optional, but needed for an accurate Dispatch ↔ "
+                       "Quality reconciliation later — without it, dispatches linked to this "
+                       "batch can only be checked with a weaker fallback).")
+            pqc1, pqc2 = st.columns(2)
+            with pqc1:
+                pb_out_qty = st.number_input("Output Quantity", min_value=0.0, step=1.0,
+                                              value=0.0, key="pb_out_qty")
+            with pqc2:
+                pb_out_unit = st.selectbox(
+                    "Output Unit", ["Bags", "Pieces", "Drums", "KG", "MT"], key="pb_out_unit")
 
             _pb_bom = get_active_bom(pb_product)
             if _pb_bom:
@@ -6952,7 +9213,9 @@ elif module == "Quality":
                 else:
                     pb_id, result = create_production_batch(
                         pb_product, pb_formula.strip(), pb_factory, pb_operator.strip(),
-                        pb_machine.strip(), pb_shift, _selected_rm_ids, _qty_used_map
+                        pb_machine.strip(), pb_shift, _selected_rm_ids, _qty_used_map,
+                        quantity=(pb_out_qty if pb_out_qty > 0 else None),
+                        quantity_unit=(pb_out_unit if pb_out_qty > 0 else "")
                     )
                     if pb_id is None:
                         st.error(result)
@@ -6969,7 +9232,7 @@ elif module == "Quality":
                 st.info("No production batches yet.")
             else:
                 for _, pb in _pb_all.iterrows():
-                    with st.expander(f"{pb['batch_no']} — {pb['product']} @ {pb['factory']} — {pb['status']}"):
+                    with st.expander(f"{pb['batch_no']} — {fg_label(pb['product'])} @ {pb['factory']} — {pb['status']}"):
                         if st.button("🔍 Open Batch 360° page →", key=f"batch360_{pb['id']}"):
                             open_detail_view("batch", pb["batch_no"])
                         render_batch_progress(pb["status"])
@@ -6998,7 +9261,7 @@ elif module == "Quality":
             st.success("✅ No batches awaiting Process QC.")
         else:
             for _, pb in _proc_pending.iterrows():
-                with st.expander(f"{pb['batch_no']} — {pb['product']} @ {pb['factory']}"):
+                with st.expander(f"{pb['batch_no']} — {fg_label(pb['product'])} @ {pb['factory']}"):
                     pq1, pq2 = st.columns(2)
                     with pq1:
                         _pq_visc = st.text_input("Viscosity", key=f"pq_visc_{pb['id']}")
@@ -7027,7 +9290,7 @@ elif module == "Quality":
             st.success("✅ No batches awaiting Finished Goods QC.")
         else:
             for _, pb in _fg_pending.iterrows():
-                with st.expander(f"{pb['batch_no']} — {pb['product']} @ {pb['factory']}"):
+                with st.expander(f"{pb['batch_no']} — {fg_label(pb['product'])} @ {pb['factory']}"):
                     fg1, fg2 = st.columns(2)
                     with fg1:
                         _fg_adh = st.text_input("Adhesion", key=f"fg_adh_{pb['id']}")
@@ -7056,7 +9319,7 @@ elif module == "Quality":
             st.success("✅ No batches awaiting Packing QC.")
         else:
             for _, pb in _pk_pending.iterrows():
-                with st.expander(f"{pb['batch_no']} — {pb['product']} @ {pb['factory']}"):
+                with st.expander(f"{pb['batch_no']} — {fg_label(pb['product'])} @ {pb['factory']}"):
                     pk1, pk2 = st.columns(2)
                     with pk1:
                         _pk_bag   = st.checkbox("Correct Bag", key=f"pk_bag_{pb['id']}")
@@ -7084,7 +9347,7 @@ elif module == "Quality":
             st.info("No batches awaiting PDI.")
         else:
             for _, pb in _pdi_pending.iterrows():
-                with st.expander(f"{pb['batch_no']} — {pb['product']} @ {pb['factory']}"):
+                with st.expander(f"{pb['batch_no']} — {fg_label(pb['product'])} @ {pb['factory']}"):
                     _pdi_done = st.checkbox("PDI Completed?", key=f"pdi_{pb['id']}")
                     if st.button("💾 Submit", key=f"pdi_submit_{pb['id']}"):
                         record_dispatch_approval(pb["id"], _pdi_done, st.session_state.username)
@@ -7107,7 +9370,7 @@ elif module == "Quality":
                 ccol1.markdown(
                     f"{status_pill('Cleared', 'success')} &nbsp; "
                     f"<code style='font-size:12.5px;'>{pb['batch_no']}</code> — "
-                    f"{pb['product']} @ {pb['factory']}",
+                    f"{fg_label(pb['product'])} @ {pb['factory']}",
                     unsafe_allow_html=True
                 )
                 if ccol2.button("🚚 Mark Dispatched", key=f"dispatched_{pb['id']}"):
@@ -7176,7 +9439,7 @@ elif module == "Quality":
             else:
                 b = trace["batch"]
                 tc1, tc2, tc3, tc4 = st.columns(4)
-                tc1.metric("Product", b["product"])
+                tc1.metric("Product", fg_label(b["product"]))
                 tc2.metric("Factory", b["factory"])
                 tc3.metric("Status", b["status"])
                 tc4.metric("Operator", b["operator"])
@@ -7317,11 +9580,28 @@ elif module == "Dispatch":
                                             placeholder="New / one-time customer")
             sl_cust = _sl_cust_pick if _sl_cust_pick != "— Type below —" else sl_cust_manual.strip()
         with c2:
-            sl_product    = st.selectbox("Product", FCSC_PRODUCTS, key="sl_p_sel")
+            sl_product    = st.selectbox("Product", FCSC_PRODUCTS, key="sl_p_sel", format_func=fg_label)
             sl_custom_prd = st.text_input("Custom name (if 'Other / Custom')", key="sl_p_cust")
             sl_qty        = st.number_input("Qty", min_value=0, step=1, key="sl_q")
             sl_price      = st.number_input("Unit Price (₹)", min_value=0.0, step=0.01,
                                              format="%.2f", key="sl_p")
+            # Optional link to a QC-cleared batch, for Dispatch <-> Quality
+            # reconciliation. Purely optional — leaving it unset just means
+            # that reconciliation falls back to a factory+product proxy match.
+            _sl_batch_opts = pd.read_sql_query(
+                "SELECT id, batch_no, product FROM production_batches "
+                "WHERE factory=? AND status IN ('Dispatch Approved','Dispatched') "
+                "ORDER BY id DESC LIMIT 50", conn, params=(sl_factory,)
+            )
+            _sl_batch_map = {"— None / not batch-tracked —": None}
+            _sl_batch_map.update({
+                f"{r['batch_no']} ({r['product']})": r["id"] for _, r in _sl_batch_opts.iterrows()
+            })
+            sl_batch_label = st.selectbox("Link to QC Batch (optional)", list(_sl_batch_map.keys()),
+                                           key="sl_batch_link",
+                                           help="Links this dispatch to a QC-cleared production batch "
+                                                "for accurate Dispatch <-> Quality reconciliation.")
+            sl_batch_id = _sl_batch_map[sl_batch_label]
         with c3:
             sl_status   = st.selectbox("Payment Status",
                                         ["Paid","Pending","Partial","Overdue"], key="sl_s")
@@ -7358,20 +9638,45 @@ elif module == "Dispatch":
                         f"Use the ✏️ Edit tab to modify it."
                     )
                 else:
+                    # Dispatch -> FG Stock OUT (Section 4 of the reconciliation spec):
+                    # flag/require override rather than silently allowing negative
+                    # FG stock, since a genuine backdated correction is legitimate.
+                    _sl_available = get_fg_closing_stock(sl_factory, final_sl_product)
+                    _sl_override_needed = sl_qty > _sl_available
+                    _sl_proceed = True
+                    if _sl_override_needed:
+                        st.error(
+                            f"🚨 **Dispatch exceeds available FG stock** — "
+                            f"{final_sl_product} @ {sl_factory}: available {_sl_available:,.2f}, "
+                            f"dispatching {sl_qty:,.2f}. This will push FG stock negative."
+                        )
+                        _sl_proceed = st.checkbox(
+                            "Proceed anyway (e.g. backdated entry, opening stock not yet logged)",
+                            key="sl_force_negative"
+                        )
+                    if not _sl_proceed:
+                        st.stop()
                     try:
                         cur.execute(
                             "INSERT INTO sales(date,factory,customer,product,qty,price,total,"
-                            "status,challan_no,gstin,hsn_code,gst_rate)"
-                            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            "status,challan_no,gstin,hsn_code,gst_rate,production_batch_id)"
+                            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (str(sl_date), sl_factory, sl_cust,
                              final_sl_product, sl_qty, sl_price, round(sl_total, 2),
                              sl_status, sl_challan.strip(),
-                             sl_gstin.strip(), sl_hsn.strip(), sl_gst_rate)
+                             sl_gstin.strip(), sl_hsn.strip(), sl_gst_rate, sl_batch_id)
                         )
                         conn.commit()
+                        _new_sale_id = cur.lastrowid
                         log_audit("INSERT", "sales", "new",
                                   f"{sl_factory} | {final_sl_product} | {sl_cust} | {fmt_inr(sl_total)} | {sl_status}")
-                        st.success(f"✅ Dispatch saved — {fmt_inr(sl_total)} | {sl_cust} | {sl_status}")
+                        _new_fg_closing = record_fg_stock_movement(
+                            sl_date, sl_factory, final_sl_product,
+                            dispatch_out=sl_qty, source_module="Dispatch",
+                            source_ref_id=_new_sale_id
+                        )
+                        st.success(f"✅ Dispatch saved — {fmt_inr(sl_total)} | {sl_cust} | {sl_status} | "
+                                   f"FG Stock now {_new_fg_closing:,.2f}")
                         st.rerun()
                     except sqlite3.Error as e:
                         st.error(f"Database error: {e}")
@@ -7392,13 +9697,28 @@ elif module == "Dispatch":
             disp = sales_df.copy()
             disp["total"] = disp["total"].apply(fmt_inr)
             disp["price"] = disp["price"].apply(fmt_inr)
+            if "product" in disp.columns:
+                disp.insert(disp.columns.get_loc("product") + 1, "RM Code",
+                            disp["product"].apply(get_fg_code))
 
             disp = search_filter(disp, "Search sales records", key="sales_search")
             disp = paginate_df(disp, key="sales_page")
             st.dataframe(disp.drop(columns=["id"], errors="ignore"),
                          width='stretch', hide_index=True, height=320)
 
-            delete_row_ui(sales_df, "sales", "customer", "sales")
+            def _on_dispatch_deleted(_row) -> None:
+                # Section 8: deleting a Dispatch record must not leave an
+                # orphaned FG stock movement behind.
+                _closing = reverse_fg_stock_for_source(
+                    _row["factory"], _row["product"], "Dispatch", int(_row["id"]))
+                if _closing is not None:
+                    log_audit("REVERSE", "fg_stock", int(_row["id"]),
+                              f"Dispatch #{int(_row['id'])} deleted — FG stock movement "
+                              f"reversed | {_row['factory']} | {_row['product']} | "
+                              f"FG stock now {_closing:,.2f}")
+
+            delete_row_ui(sales_df, "sales", "customer", "sales",
+                           on_delete=_on_dispatch_deleted)
 
             if HAS_PLOTLY and not sales_df.empty:
                 ca, cb = st.columns(2)
@@ -7439,7 +9759,7 @@ elif module == "Dispatch":
             st.info("No records to edit in the current date range.")
         else:
             opts = {
-                f"ID {r['id']} — {r['customer']} | {r['product']} ({r['date']})": r["id"]
+                f"ID {r['id']} — {r['customer']} | {fg_label(r['product'])} ({r['date']})": r["id"]
                 for _, r in sales_df.iterrows()
             }
             sel_label = st.selectbox("Select record to edit", list(opts.keys()),
@@ -7461,7 +9781,7 @@ elif module == "Dispatch":
                 cur_sl_prod_idx = FCSC_PRODUCTS.index(sel_row["product"]) \
                                   if sel_row["product"] in FCSC_PRODUCTS else len(FCSC_PRODUCTS) - 1
                 e_sl_product    = st.selectbox("Product", FCSC_PRODUCTS, key="e_sl_p_sel",
-                    index=cur_sl_prod_idx)
+                    index=cur_sl_prod_idx, format_func=fg_label)
                 e_sl_custom_prd = st.text_input("Custom name (if Other / Custom)",
                     value=sel_row["product"] if sel_row["product"] not in FCSC_PRODUCTS else "",
                     key="e_sl_p_cust")
@@ -7511,10 +9831,121 @@ elif module == "Dispatch":
                         conn.commit()
                         log_audit("UPDATE", "sales", sel_id,
                                   f"{e_sl_factory} | {final_e_product} | {e_sl_cust} | {fmt_inr(e_sl_total)} | {e_sl_status}")
-                        st.success("✅ Sale record updated.")
+                        # Section 8: an edit must correct FG Stock too — reverse the
+                        # old dispatch-out movement (posted under the *old*
+                        # factory/product, in case those changed) then apply the new
+                        # one, so the final FG impact reflects only the new quantity.
+                        reverse_fg_stock_for_source(
+                            sel_row["factory"], sel_row["product"], "Dispatch", int(sel_id))
+                        _e_sl_fg_closing = record_fg_stock_movement(
+                            e_sl_date, e_sl_factory, final_e_product,
+                            dispatch_out=e_sl_qty, source_module="Dispatch",
+                            source_ref_id=int(sel_id), movement_type="Correction"
+                        )
+                        st.success(f"✅ Sale record updated — FG Stock for {final_e_product} "
+                                   f"@ {e_sl_factory} now {_e_sl_fg_closing:,.2f}.")
+                        if _e_sl_fg_closing < 0:
+                            st.warning(
+                                "⚠️ This edit has pushed FG stock negative for "
+                                f"{final_e_product} @ {e_sl_factory}. Review the dispatch "
+                                "quantity or log the missing opening/production stock."
+                            )
                         st.rerun()
                     except sqlite3.Error as e:
                         st.error(f"Database error: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  RECONCILIATION  (NEW — Stock <-> Production <-> QC <-> Dispatch verification)
+# ─────────────────────────────────────────────────────────────────────────────
+elif module == "Reconciliation":
+
+    st.title("🔎 Inventory Reconciliation")
+    st.caption("Cross-checks Stock, Production, QC and Dispatch against each other. "
+               "Nothing here ever edits a source record — mismatches are logged and "
+               "surfaced for investigation, never auto-corrected.")
+
+    rc_f1, rc_f2 = st.columns([1, 1])
+    with rc_f1:
+        rc_fac = st.selectbox("Factory", [ALL_FACTORIES] + FACTORIES, key="rc_fac",
+                               index=([ALL_FACTORIES] + FACTORIES).index(factory)
+                               if factory in ([ALL_FACTORIES] + FACTORIES) else 0)
+    with rc_f2:
+        rc_days = st.selectbox("Period", [7, 14, 30, 90], index=2, key="rc_days",
+                                format_func=lambda d: f"Last {d} days")
+    rc_end   = datetime.date.today()
+    rc_start = rc_end - datetime.timedelta(days=rc_days)
+
+    if st.button("▶️ Run Reconciliation", type="primary", key="rc_run"):
+        with st.spinner("Running checks..."):
+            _rc_results = run_all_reconciliations(
+                rc_start, rc_end, rc_fac if rc_fac != ALL_FACTORIES else None
+            )
+        st.session_state["rc_last_run"] = _rc_results
+        st.session_state["rc_last_run_at"] = _now_iso()
+        log_audit("RUN", "inventory_reconciliation", "manual",
+                  f"Reconciliation run by {st.session_state.get('username')} | "
+                  f"{rc_fac} | {rc_start} to {rc_end}")
+        st.rerun()
+
+    tab_summary, tab_history = st.tabs(["📊 Latest Run", "📜 Full History"])
+
+    with tab_summary:
+        _rc_last = st.session_state.get("rc_last_run")
+        if not _rc_last:
+            st.info("No reconciliation run yet this session — click **▶️ Run Reconciliation** above.")
+        else:
+            st.caption(f"Last run: {st.session_state.get('rc_last_run_at', '—')}")
+            _rc_summary_rows = []
+            for _check_name, _results in _rc_last.items():
+                for _r in _results:
+                    _rc_summary_rows.append({
+                        "Verification": _check_name,
+                        "Check Type": _r["check_type"],
+                        "Factory": _r["factory"],
+                        "Item": _r["item_code"],
+                        "Source A": _r["qty_a"],
+                        "Source B": _r["qty_b"],
+                        "Difference": _r["difference"],
+                        "Status": {"Matched": "✅ Matched", "Mismatch": "⚠️ Mismatch",
+                                   "Critical": "🚨 Critical"}[_r["severity"]],
+                        "Detail": _r.get("detail", ""),
+                        "Checked At": _r.get("checked_at", ""),
+                    })
+            if not _rc_summary_rows:
+                st.info("No transactions found in this period/factory to reconcile.")
+            else:
+                _rc_df = pd.DataFrame(_rc_summary_rows)
+                rk1, rk2, rk3, rk4 = st.columns(4)
+                rk1.metric("Checks Run", len(_rc_df))
+                rk2.metric("✅ Matched", int((_rc_df["Status"] == "✅ Matched").sum()))
+                rk3.metric("⚠️ Mismatch", int((_rc_df["Status"] == "⚠️ Mismatch").sum()))
+                rk4.metric("🚨 Critical", int((_rc_df["Status"] == "🚨 Critical").sum()))
+
+                _rc_show_only_issues = st.checkbox("Show mismatches/critical only", value=True,
+                                                    key="rc_filter_issues")
+                _rc_view = _rc_df if not _rc_show_only_issues else _rc_df[_rc_df["Status"] != "✅ Matched"]
+                if _rc_view.empty:
+                    st.success("✅ Everything matched for this period and factory.")
+                else:
+                    st.dataframe(_rc_view, width='stretch', hide_index=True, height=360)
+
+    with tab_history:
+        st.subheader("Reconciliation History")
+        _rc_hist_clause = " WHERE factory=?" if rc_fac != ALL_FACTORIES else ""
+        _rc_hist_param  = (rc_fac,) if rc_fac != ALL_FACTORIES else ()
+        _rc_hist = pd.read_sql_query(
+            "SELECT check_type, factory, item_code, period_start, period_end, "
+            "qty_source_a, qty_source_b, difference, severity, detail, checked_at "
+            "FROM inventory_reconciliation" + _rc_hist_clause +
+            " ORDER BY id DESC LIMIT 500", conn, params=_rc_hist_param
+        )
+        if _rc_hist.empty:
+            st.info("No reconciliation history yet.")
+        else:
+            _rc_hist_filtered = search_filter(_rc_hist, "Search history", key="rc_hist_search")
+            _rc_hist_filtered = paginate_df(_rc_hist_filtered, key="rc_hist_page")
+            st.dataframe(_rc_hist_filtered, width='stretch', hide_index=True, height=380)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7550,7 +9981,7 @@ elif module == "Sales":
             so_cust = (_so_cust_pick if _so_cust_pick != "— Type below —"
                         else so_cust_manual.strip())
         with c2:
-            so_product    = st.selectbox("Product", FCSC_PRODUCTS, key="so_p_sel")
+            so_product    = st.selectbox("Product", FCSC_PRODUCTS, key="so_p_sel", format_func=fg_label)
             so_custom_prd = st.text_input("Custom name (if 'Other / Custom')", key="so_p_cust")
             so_qty        = st.number_input("Quantity", min_value=0, step=1, key="so_qty")
             so_price      = st.number_input("Unit Price (₹)", min_value=0.0,
@@ -7644,6 +10075,9 @@ elif module == "Sales":
             disp_so = so_df.copy()
             disp_so["total"]      = disp_so["total"].apply(fmt_inr)
             disp_so["unit_price"] = disp_so["unit_price"].apply(fmt_inr)
+            if "product" in disp_so.columns:
+                disp_so.insert(disp_so.columns.get_loc("product") + 1, "rm_code",
+                                disp_so["product"].apply(get_fg_code))
             disp_so = search_filter(disp_so, "Search orders", key="so_search")
             disp_so = paginate_df(disp_so, key="so_page")
             st.dataframe(
@@ -7651,7 +10085,7 @@ elif module == "Sales":
                         .rename(columns={
                             "date":"Date","factory":"Factory",
                             "customer":"Customer","sales_rep":"Sales Rep",
-                            "product":"Product","unit_price":"Unit Price",
+                            "product":"Product","rm_code":"RM Code","unit_price":"Unit Price",
                             "qty":"Qty","total":"Total"
                         }),
                 width='stretch', hide_index=True, height=340
@@ -7700,7 +10134,7 @@ elif module == "Sales":
             st.info("No records to edit in the current date range.")
         else:
             opts_so = {
-                f"ID {r['id']} — {r['customer']} | {r['product']} | {r['sales_rep']} ({r['date']})": r["id"]
+                f"ID {r['id']} — {r['customer']} | {fg_label(r['product'])} | {r['sales_rep']} ({r['date']})": r["id"]
                 for _, r in so_df.iterrows()
             }
             sel_so_label = st.selectbox("Select order to edit",
@@ -7722,7 +10156,7 @@ elif module == "Sales":
                 cur_so_idx = FCSC_PRODUCTS.index(sel_so_row["product"]) \
                              if sel_so_row["product"] in FCSC_PRODUCTS else len(FCSC_PRODUCTS) - 1
                 e_so_product    = st.selectbox("Product", FCSC_PRODUCTS,
-                    index=cur_so_idx, key="e_so_p_sel")
+                    index=cur_so_idx, key="e_so_p_sel", format_func=fg_label)
                 e_so_custom_prd = st.text_input("Custom name (if Other / Custom)",
                     value=sel_so_row["product"] if sel_so_row["product"] not in FCSC_PRODUCTS else "",
                     key="e_so_p_cust")
@@ -8137,19 +10571,29 @@ elif module == "P&L":
         unsafe_allow_html=True,
     )
 
+    # FIX: Revenue is recognised on DISPATCH only. A Sales Order is a
+    # commercial commitment / order-book entry, not yet invoiced or shipped
+    # goods — summing it into Revenue double-counted the same business once
+    # it later dispatches (Order booked ₹10L + Dispatched ₹6L was being
+    # reported as ₹16L "Revenue" when only ₹6L had actually been earned).
+    # Sales Orders are shown as a separate Order Book figure below instead.
     _disp_rev = sales_df["total"].sum() if not sales_df.empty else 0
-    _so_rev   = so_df["total"].sum()    if not so_df.empty    else 0
-    revenue   = _disp_rev + _so_rev   # Dispatch + Sales Orders combined
+    _so_booked = so_df["total"].sum()   if not so_df.empty    else 0
+    revenue   = _disp_rev              # Dispatch = recognised revenue
     cost      = cost_df["amount"].sum() if not cost_df.empty  else 0
     profit    = revenue - cost
     margin    = safe_ratio_pct(profit, revenue) or 0
 
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Revenue",      fmt_inr(revenue))
+    k1.metric("Revenue (Dispatched)", fmt_inr(revenue))
     k2.metric("Total Costs",  fmt_inr(cost))
     k3.metric("Net Profit",   fmt_inr(profit),
               delta=f"{margin:.1f}% margin" if revenue else None)
     k4.metric("Break-Even",   "✅ Profitable" if profit >= 0 else "❌ Loss")
+    st.caption(
+        f"📖 Order Book (Sales Orders booked, not yet dispatched/invoiced): "
+        f"**{fmt_inr(_so_booked)}** — shown separately, not included in Revenue above."
+    )
 
     st.markdown("---")
 
@@ -8180,8 +10624,10 @@ elif module == "P&L":
 
         pl_row("INCOME", 0, "section")
         pl_row("  Dispatch Revenue", _disp_rev)
-        pl_row("  Sales Orders Revenue", _so_rev)
         pl_row("GROSS INCOME", revenue, "total")
+
+        pl_row("ORDER BOOK (memo — not yet dispatched, excluded from Income)", 0, "section")
+        pl_row("  Sales Orders Booked", _so_booked)
 
         pl_row("OPERATING COSTS", 0, "section")
         if not cost_df.empty:
@@ -8238,13 +10684,12 @@ elif module == "P&L":
         else:
             st.bar_chart(pnl_df.set_index("Label")["Amount"])
 
+        # FIX: monthly trend uses Dispatch revenue only, matching the
+        # Revenue figure above — Sales Orders are booked value, not
+        # recognised revenue, so they no longer feed this chart either.
         months: dict = {}
         if not sales_df.empty:
             for _, row in sales_df.iterrows():
-                m = str(row["date"])[:7]
-                months.setdefault(m, {"rev": 0, "cost": 0})["rev"] += row["total"]
-        if not so_df.empty:   # Add Sales Orders to monthly revenue
-            for _, row in so_df.iterrows():
                 m = str(row["date"])[:7]
                 months.setdefault(m, {"rev": 0, "cost": 0})["rev"] += row["total"]
         if not cost_df.empty:
@@ -8807,6 +11252,186 @@ elif module == "Customers":
                         st.rerun()
                     except sqlite3.Error as e:
                         st.error(f"Database error: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PILOT DASHBOARD  (admin only — listed in ADMIN_MODULES, not in SUPERVISOR_MODULES)
+#  The pilot's control room: who's actually using FC Central, where, on what,
+#  what's breaking, and what people are asking for — one page instead of
+#  having to ask around.
+# ─────────────────────────────────────────────────────────────────────────────
+elif module == "Pilot Dashboard":
+
+    st.title("🚦 Pilot Dashboard")
+    st.markdown(
+        "<p style='color:#8A93A1;font-size:13px;margin-top:-10px;'>"
+        "Live signal on pilot adoption — logins, module usage, errors and feedback. "
+        "Visible to admins only.</p>",
+        unsafe_allow_html=True,
+    )
+
+    _pd_users     = pd.read_sql_query("SELECT username, role, factory, display FROM users", conn)
+    _pd_logins    = pd.read_sql_query("SELECT * FROM login_log ORDER BY id DESC", conn)
+    _pd_modules   = pd.read_sql_query("SELECT * FROM module_usage ORDER BY id DESC", conn)
+    _pd_errors    = pd.read_sql_query("SELECT * FROM app_errors ORDER BY id DESC", conn)
+    _pd_feedback  = pd.read_sql_query("SELECT * FROM feedback ORDER BY id DESC", conn)
+    _pd_today_str = datetime.date.today().isoformat()
+
+    # ── top-line metrics ────────────────────────────────────────────────────
+    _today_logins   = _pd_logins[_pd_logins["timestamp"].str[:10] == _pd_today_str] if not _pd_logins.empty else _pd_logins
+    _users_today    = _today_logins["username"].nunique() if not _today_logins.empty else 0
+    _total_users    = len(_pd_users)
+    _errors_7d      = 0
+    if not _pd_errors.empty:
+        _cutoff = (datetime.datetime.now() - datetime.timedelta(days=7)).isoformat(timespec="seconds")
+        _errors_7d = len(_pd_errors[_pd_errors["timestamp"] >= _cutoff])
+    _pending_fb     = len(_pd_feedback[_pd_feedback["status"] == "pending"]) if not _pd_feedback.empty else 0
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Logged in today",   f"{_users_today} / {_total_users}")
+    m2.metric("Total logins",      len(_pd_logins))
+    m3.metric("Errors (7 days)",   _errors_7d)
+    m4.metric("Pending feedback",  _pending_fb)
+    m5.metric("Modules tracked",   _pd_modules["module"].nunique() if not _pd_modules.empty else 0)
+
+    st.markdown("---")
+
+    # ── plant-wise login counts ─────────────────────────────────────────────
+    st.subheader("Plant-wise Login Counts")
+    if _pd_logins.empty:
+        st.info("No logins recorded yet.")
+    else:
+        _plant_counts = _pd_logins.copy()
+        _plant_counts["factory"] = _plant_counts["factory"].fillna("Admin / HQ")
+        _plant_counts = (_plant_counts.groupby("factory").size()
+                          .reset_index(name="logins").sort_values("logins", ascending=False))
+        pc1, pc2 = st.columns([3, 2])
+        with pc1:
+            if HAS_PLOTLY:
+                fig_pc = px.bar(_plant_counts, x="factory", y="logins",
+                                 template="plotly_white", title="Total logins by plant",
+                                 color_discrete_sequence=["#2B4C7E"])
+                fig_pc.update_layout(height=280, margin=dict(l=10, r=10, t=36, b=10))
+                st.plotly_chart(fig_pc, width='stretch')
+            else:
+                st.bar_chart(_plant_counts.set_index("factory")["logins"])
+        with pc2:
+            st.dataframe(_plant_counts.rename(columns={"factory": "Plant", "logins": "Logins"}),
+                         hide_index=True, width='stretch', height=280)
+
+    st.markdown("---")
+
+    # ── most-used modules ────────────────────────────────────────────────────
+    st.subheader("Most-Used Modules")
+    if _pd_modules.empty:
+        st.info("No module views recorded yet.")
+    else:
+        _mod_counts = (_pd_modules.groupby("module").size()
+                        .reset_index(name="views").sort_values("views", ascending=False))
+        mc1, mc2 = st.columns([3, 2])
+        with mc1:
+            if HAS_PLOTLY:
+                fig_mc = px.bar(_mod_counts.head(15), x="views", y="module", orientation="h",
+                                 template="plotly_white", title="Views per module",
+                                 color_discrete_sequence=["#1E6B45"])
+                fig_mc.update_layout(height=320, margin=dict(l=10, r=10, t=36, b=10),
+                                      yaxis=dict(categoryorder="total ascending"))
+                st.plotly_chart(fig_mc, width='stretch')
+            else:
+                st.bar_chart(_mod_counts.set_index("module")["views"])
+        with mc2:
+            st.dataframe(_mod_counts.rename(columns={"module": "Module", "views": "Views"}),
+                         hide_index=True, width='stretch', height=320)
+
+    st.markdown("---")
+
+    # ── errors reported ──────────────────────────────────────────────────────
+    st.subheader("Errors Reported")
+    if _pd_errors.empty:
+        st.success("No errors logged. 🎉")
+    else:
+        ec1, ec2 = st.columns(2)
+        ec1.metric("Total errors/warnings", len(_pd_errors))
+        ec2.metric("Last 7 days", _errors_7d)
+
+        def _lvl_pill(l: str) -> str:
+            return {"ERROR": "🔴 ERROR", "CRITICAL": "🔴 CRITICAL",
+                    "WARNING": "🟡 WARNING"}.get(l, l)
+
+        _disp_err = _pd_errors.head(50).copy()
+        _disp_err["level"] = _disp_err["level"].apply(_lvl_pill)
+        st.dataframe(
+            _disp_err[["timestamp", "level", "username", "message"]]
+                .rename(columns={"timestamp": "Timestamp", "level": "Level",
+                                  "username": "User", "message": "Message"}),
+            hide_index=True, width='stretch', height=280
+        )
+        st.caption("Showing the 50 most recent. Full history also lives in fcsc_app.log on disk.")
+
+    st.markdown("---")
+
+    # ── pending feedback ─────────────────────────────────────────────────────
+    st.subheader("Pending Feedback")
+    if _pd_feedback.empty:
+        st.info("No feedback submitted yet. Users can send feedback from the sidebar.")
+    else:
+        _pending = _pd_feedback[_pd_feedback["status"] == "pending"]
+        if _pending.empty:
+            st.success("Nothing pending — all feedback has been reviewed. 🎉")
+        for _, _fb in _pending.iterrows():
+            with st.container(border=True):
+                fb1, fb2 = st.columns([5, 1])
+                with fb1:
+                    st.markdown(f"**{_fb['username']}** "
+                                f"({_fb['factory'] or 'Admin'}) — "
+                                f"<span style='color:#8A93A1;font-size:12px;'>"
+                                f"{_fb['timestamp'][:16].replace('T',' ')}</span>",
+                                unsafe_allow_html=True)
+                    st.write(_fb["message"])
+                with fb2:
+                    if st.button("✅ Resolve", key=f"fb_resolve_{_fb['id']}"):
+                        cur.execute("UPDATE feedback SET status='resolved' WHERE id=?", (_fb["id"],))
+                        conn.commit()
+                        st.rerun()
+
+        with st.expander(f"Show resolved feedback ({len(_pd_feedback) - len(_pending)})"):
+            _resolved = _pd_feedback[_pd_feedback["status"] != "pending"]
+            if _resolved.empty:
+                st.caption("None yet.")
+            else:
+                st.dataframe(
+                    _resolved[["timestamp", "username", "factory", "message"]]
+                        .rename(columns={"timestamp": "Timestamp", "username": "User",
+                                          "factory": "Plant", "message": "Message"}),
+                    hide_index=True, width='stretch'
+                )
+
+    st.markdown("---")
+
+    # ── last login per user ──────────────────────────────────────────────────
+    st.subheader("Last Login per User")
+    if _pd_logins.empty:
+        _last_login = pd.DataFrame(columns=["username", "timestamp"])
+    else:
+        _last_login = (_pd_logins.sort_values("timestamp")
+                        .groupby("username", as_index=False).last()[["username", "timestamp"]])
+
+    _user_summary = _pd_users.merge(_last_login, on="username", how="left")
+    _user_summary["factory"] = _user_summary["factory"].fillna("Admin / HQ")
+    _user_summary["timestamp"] = _user_summary["timestamp"].fillna("Never logged in")
+    _user_summary = _user_summary.sort_values("timestamp", ascending=False)
+
+    st.dataframe(
+        _user_summary[["display", "username", "role", "factory", "timestamp"]]
+            .rename(columns={"display": "Name", "username": "Username", "role": "Role",
+                              "factory": "Plant", "timestamp": "Last Login"}),
+        hide_index=True, width='stretch', height=300
+    )
+
+    _never = _user_summary[_user_summary["timestamp"] == "Never logged in"]
+    if not _never.empty:
+        st.warning(f"⚠️ {len(_never)} user(s) have never logged in: "
+                   f"{', '.join(_never['display'].tolist())}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
