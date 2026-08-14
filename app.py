@@ -2051,8 +2051,22 @@ def _safe_add_column(table: str, coldef: str) -> None:
     try:
         cur.execute(f"ALTER TABLE {table} ADD COLUMN {coldef}")
         conn.commit()
-    except sqlite3.OperationalError:
-        pass  # column already exists — additive migration is idempotent
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" in str(e).lower():
+            pass  # column already exists — additive migration is idempotent
+        else:
+            # Some other ALTER failure (locked db, bad syntax, etc.) —
+            # don't silently hide it, but don't crash the whole app either.
+            st.warning(f"Migration warning on {table}.{coldef}: {e}")
+    except sqlite3.DatabaseError as e:
+        # Covers corruption ("disk image is malformed"), closed-connection
+        # errors, etc. — anything outside plain OperationalError that was
+        # previously escaping this try/except and crashing the app.
+        st.error(
+            f"Database error while migrating {table}.{coldef}: {e}. "
+            "The database file may be corrupted or unavailable — check "
+            "'Manage app' logs for details."
+        )
 
 _safe_add_column("fg_stock", "movement_type TEXT DEFAULT 'Entry'")
 _safe_add_column("production_batches", "quantity REAL")
