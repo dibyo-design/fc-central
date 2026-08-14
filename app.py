@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 import datetime
+from zoneinfo import ZoneInfo
 import hashlib
 import hmac
 import os
@@ -15,6 +16,25 @@ import contextlib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from io import BytesIO
+
+# ================= TIMEZONE =================
+# FIX: Streamlit Cloud runs its servers in UTC. Every timestamp in the app
+# (login times, audit trail, batch-number date prefixes, "Generated at"
+# footers, the Pilot Dashboard, etc.) used bare now_ist() /
+# today_ist(), which silently returned server (UTC) time instead
+# of India time — a ~5.5 hour drift from what's shown on any local machine
+# or phone. now_ist()/today_ist() below are drop-in replacements: they
+# return plain (timezone-naive) datetime/date objects, exactly like the
+# calls they replace, but the wall-clock value is always IST — so every
+# existing f-string, .isoformat(), .strftime(), and DB comparison keeps
+# working unchanged, it's just correct now.
+_IST = ZoneInfo("Asia/Kolkata")
+
+def now_ist() -> datetime.datetime:
+    return datetime.datetime.now(_IST).replace(tzinfo=None)
+
+def today_ist() -> datetime.date:
+    return now_ist().date()
 
 # ── optional: plotly preferred, bar_chart fallback ────────────────────────────
 try:
@@ -463,7 +483,7 @@ class _SQLiteLogHandler(logging.Handler):
                 pass
             cur.execute(
                 "INSERT INTO app_errors (timestamp, level, username, message) VALUES (?,?,?,?)",
-                (datetime.datetime.now().isoformat(timespec="seconds"),
+                (now_ist().isoformat(timespec="seconds"),
                  record.levelname, _uname, self.format(record))
             )
             conn.commit()
@@ -476,7 +496,7 @@ def log_login(username: str, factory: str | None, role: str) -> None:
     try:
         cur.execute(
             "INSERT INTO login_log (username, factory, role, timestamp) VALUES (?,?,?,?)",
-            (username, factory, role, datetime.datetime.now().isoformat(timespec="seconds"))
+            (username, factory, role, now_ist().isoformat(timespec="seconds"))
         )
         conn.commit()
     except Exception as e:
@@ -486,7 +506,7 @@ def log_module_view(username: str, module: str) -> None:
     try:
         cur.execute(
             "INSERT INTO module_usage (username, module, timestamp) VALUES (?,?,?)",
-            (username, module, datetime.datetime.now().isoformat(timespec="seconds"))
+            (username, module, now_ist().isoformat(timespec="seconds"))
         )
         conn.commit()
     except Exception as e:
@@ -495,7 +515,7 @@ def log_module_view(username: str, module: str) -> None:
 def submit_feedback(username: str, factory: str | None, message: str) -> None:
     cur.execute(
         "INSERT INTO feedback (username, factory, message, status, timestamp) VALUES (?,?,?,'pending',?)",
-        (username, factory, message.strip(), datetime.datetime.now().isoformat(timespec="seconds"))
+        (username, factory, message.strip(), now_ist().isoformat(timespec="seconds"))
     )
     conn.commit()
 
@@ -548,7 +568,7 @@ def _get_lockout(username: str) -> tuple[int, datetime.datetime | None]:
 def _register_failed_attempt(username: str) -> tuple[int, datetime.datetime | None]:
     attempts, _ = _get_lockout(username)
     attempts += 1
-    locked_until = (datetime.datetime.now() + datetime.timedelta(minutes=_LOCKOUT_MINS)
+    locked_until = (now_ist() + datetime.timedelta(minutes=_LOCKOUT_MINS)
                      if attempts >= _MAX_ATTEMPTS else None)
     cur.execute(
         "INSERT INTO login_attempts VALUES (?,?,?) "
@@ -898,7 +918,7 @@ def get_festival_banner_info(within_days: int = 10) -> dict | None:
     any), otherwise the nearest upcoming one within `within_days`. Returns
     None if nothing qualifies — the banner is then simply not shown, rather
     than displaying a stale or irrelevant note."""
-    today = datetime.date.today()
+    today = today_ist()
     ongoing, upcoming = [], []
     for f in WB_FESTIVALS_2026:
         start, end = _parse_iso_date(f["start"]), _parse_iso_date(f["end"])
@@ -963,7 +983,7 @@ def render_festival_banner(compact: bool = False) -> None:
 MONSOON_MONTHS = {6, 7, 8, 9}
 
 def is_monsoon_season(_today: datetime.date | None = None) -> bool:
-    today = _today or datetime.date.today()
+    today = _today or today_ist()
     return today.month in MONSOON_MONTHS
 
 _STORM_SCENE_CSS = """
@@ -1183,7 +1203,7 @@ def get_notifications(is_admin: bool, user_factory: str | None) -> list[dict]:
             n_overdue = cur.execute(
                 f"SELECT COUNT(*) FROM procurement_stages WHERE request_id IN ({_ph}) "
                 f"AND status NOT IN ('Completed','Skipped') AND due_date < ?",
-                (*_ids, str(datetime.date.today()))
+                (*_ids, str(today_ist()))
             ).fetchone()[0]
             if n_overdue:
                 notes.append({"icon": "⏰", "severity": "warning", "module": "Procurement",
@@ -1582,10 +1602,10 @@ def show_login_page() -> None:
         if submitted:
             uname = username.strip().lower()
             attempts, locked_until = _get_lockout(uname)
-            _locked = locked_until is not None and datetime.datetime.now() < locked_until
+            _locked = locked_until is not None and now_ist() < locked_until
 
             if _locked:
-                _wait = int((locked_until - datetime.datetime.now()).total_seconds())
+                _wait = int((locked_until - now_ist()).total_seconds())
                 st.error(f"Too many failed attempts. Try again in {_wait}s.")
             else:
                 user = get_user(uname)
@@ -1635,7 +1655,7 @@ if not st.session_state.logged_in:
 
 # ── Session inactivity timeout (2 hours) ─────────────────────────────────────
 _TIMEOUT_SECONDS = 7200  # 2 hours
-_now = datetime.datetime.now()
+_now = now_ist()
 if "last_activity" not in st.session_state:
     st.session_state.last_activity = _now
 elif (_now - st.session_state.last_activity).total_seconds() > _TIMEOUT_SECONDS:
@@ -2122,7 +2142,7 @@ def save_user_prefs(username: str, factory_val: str | None, days_back: int, modu
         "default_days_back=excluded.default_days_back, default_module=excluded.default_module, "
         "updated_at=excluded.updated_at",
         (username, factory_val, days_back, module_val,
-         datetime.datetime.now().isoformat(timespec="seconds"))
+         now_ist().isoformat(timespec="seconds"))
     )
     conn.commit()
 
@@ -2333,7 +2353,7 @@ if cur.execute("SELECT COUNT(*) FROM vendors").fetchone()[0] == 0:
     for _vname, _vlead in _SEED_VENDORS:
         cur.execute(
             "INSERT OR IGNORE INTO vendors VALUES (?,?,?,?,?,?)",
-            (_vname, "", "", _vlead, "", datetime.datetime.now().isoformat(timespec="seconds"))
+            (_vname, "", "", _vlead, "", now_ist().isoformat(timespec="seconds"))
         )
     for _mat, _ven, _lead, _pack in _SEED_VENDOR_MATERIALS:
         cur.execute(
@@ -3349,7 +3369,7 @@ if cur.execute("SELECT COUNT(*) FROM finished_goods_master").fetchone()[0] == 0:
     for _fgnm, _fgcode, _fgst in SEED_FINISHED_GOODS_MASTER:
         cur.execute(
             "INSERT INTO finished_goods_master(name,code,status,created_at) VALUES (?,?,?,?)",
-            (_fgnm, _fgcode, _fgst, datetime.datetime.now().isoformat(timespec="seconds"))
+            (_fgnm, _fgcode, _fgst, now_ist().isoformat(timespec="seconds"))
         )
     conn.commit()
 if cur.execute("SELECT COUNT(*) FROM fg_aliases").fetchone()[0] == 0:
@@ -3366,7 +3386,7 @@ if cur.execute("SELECT COUNT(*) FROM materials_master").fetchone()[0] == 0:
         cur.execute(
             "INSERT INTO materials_master(lab_code,name,procurement_code,category,status,created_at) "
             "VALUES (?,?,?,?,?,?)",
-            (_lc, _nm, _pc, _cat, _st, datetime.datetime.now().isoformat(timespec="seconds"))
+            (_lc, _nm, _pc, _cat, _st, now_ist().isoformat(timespec="seconds"))
         )
     conn.commit()
 if cur.execute("SELECT COUNT(*) FROM material_aliases").fetchone()[0] == 0:
@@ -3506,7 +3526,7 @@ def add_material_master(lab_code: str, name: str, procurement_code: str,
             "INSERT INTO materials_master(lab_code,name,procurement_code,category,status,created_at) "
             "VALUES (?,?,?,?,?,?)",
             (lab_code.strip() or None, name, procurement_code.strip() or None, category, status,
-             datetime.datetime.now().isoformat(timespec="seconds"))
+             now_ist().isoformat(timespec="seconds"))
         )
         conn.commit()
         log_audit("INSERT", "materials_master", name, f"Added via Material Master admin ({category})")
@@ -3625,7 +3645,7 @@ def add_finished_good(name: str, code: str, status: str = "Confirmed") -> tuple[
     try:
         cur.execute(
             "INSERT INTO finished_goods_master(name,code,status,created_at) VALUES (?,?,?,?)",
-            (name, code.strip() or None, status, datetime.datetime.now().isoformat(timespec="seconds"))
+            (name, code.strip() or None, status, now_ist().isoformat(timespec="seconds"))
         )
         conn.commit()
         log_audit("INSERT", "finished_goods_master", name, "Added via Finished Goods Master admin")
@@ -3963,7 +3983,7 @@ def log_audit(action: str, table: str, record_id: int | str, detail: str = "") -
         cur.execute(
             "INSERT INTO audit_log VALUES (NULL,?,?,?,?,?,?)",
             (
-                datetime.datetime.now().isoformat(timespec="seconds"),
+                now_ist().isoformat(timespec="seconds"),
                 st.session_state.get("username", "system"),
                 action,
                 table,
@@ -4045,7 +4065,7 @@ def add_alert_recipient(email: str, added_by: str) -> tuple[bool, str]:
         cur.execute(
             "INSERT INTO procurement_recipients VALUES (?,?,?) "
             "ON CONFLICT(email) DO NOTHING",
-            (email, added_by, datetime.datetime.now().isoformat(timespec="seconds"))
+            (email, added_by, now_ist().isoformat(timespec="seconds"))
         )
         conn.commit()
         return True, f"Added {email}."
@@ -4134,7 +4154,7 @@ def add_digest_recipient(email: str, added_by: str) -> tuple[bool, str]:
     try:
         cur.execute(
             "INSERT INTO digest_recipients VALUES (?,?,?) ON CONFLICT(email) DO NOTHING",
-            (email, added_by, datetime.datetime.now().isoformat(timespec="seconds"))
+            (email, added_by, now_ist().isoformat(timespec="seconds"))
         )
         conn.commit()
         return True, f"Added {email}."
@@ -4148,7 +4168,7 @@ def remove_digest_recipient(email: str) -> None:
 def build_digest_html(period_label: str) -> str:
     """Plain-language summary of the last `period_label` across all
     factories — production, revenue, costs, open procurement, open NCRs."""
-    today = datetime.date.today()
+    today = today_ist()
     since = {"Today": today, "Last 7 Days": today - datetime.timedelta(days=7),
              "This Month": today.replace(day=1)}.get(period_label, today - datetime.timedelta(days=7))
 
@@ -4187,7 +4207,7 @@ def build_digest_html(period_label: str) -> str:
         f"<h2 style='color:#6E1423;'>FCSC ERP — {period_label} Digest</h2>"
         f"<table style='border-collapse:collapse;font-family:sans-serif;font-size:13px;'>"
         f"{row_html}</table>"
-        f"<p style='color:#8C7B62;font-size:12px;'>Generated {datetime.datetime.now():%Y-%m-%d %H:%M}. "
+        f"<p style='color:#8C7B62;font-size:12px;'>Generated {now_ist():%Y-%m-%d %H:%M}. "
         f"See the ERP for full detail.</p>"
     )
 
@@ -4201,7 +4221,7 @@ def send_digest_email(period_label: str) -> tuple[bool, str]:
     try:
         html = build_digest_html(period_label)
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"FCSC ERP — {period_label} Digest — {datetime.date.today()}"
+        msg["Subject"] = f"FCSC ERP — {period_label} Digest — {today_ist()}"
         msg["From"] = transport["sender"]
         msg["To"] = ", ".join(recipients)
         msg.attach(MIMEText(html, "html"))
@@ -4263,7 +4283,7 @@ def upsert_vendor(name: str, email: str, phone: str, lead_time_days: int, notes:
             "ON CONFLICT(name) DO UPDATE SET email=excluded.email, phone=excluded.phone, "
             "lead_time_days=excluded.lead_time_days, notes=excluded.notes",
             (name, email.strip(), phone.strip(), lead_time_days, notes.strip(),
-             datetime.datetime.now().isoformat(timespec="seconds"))
+             now_ist().isoformat(timespec="seconds"))
         )
         conn.commit()
         return True, f"Saved vendor {name}."
@@ -4326,14 +4346,14 @@ def _open_procurement_request(material: str, factory: str, trigger_type: str,
     """Creates a procurement_requests row plus its 8-stage workflow. Returns
     the new request id. If vendor isn't given, auto-fills from the material's
     default vendor (vendor_materials) when one is on file."""
-    now_iso = datetime.datetime.now().isoformat(timespec="seconds")
+    now_iso = now_ist().isoformat(timespec="seconds")
     vendor = vendor or get_default_vendor_for_material(material) or ""
     cur.execute(
         "INSERT INTO procurement_requests VALUES (NULL,?,?,?,?,?,?,?,?,NULL,?)",
         (now_iso, factory, material, trigger_type, qty, unit, "Open", notes, vendor)
     )
     req_id = cur.lastrowid
-    today = datetime.date.today()
+    today = today_ist()
     # FIX: "Material Received" due date now reflects the vendor's actual
     # lead_time_days when a vendor is on file, instead of a flat +6 days —
     # this is what makes the promised-vs-actual vendor performance
@@ -4495,7 +4515,7 @@ def add_phone_recipient(phone: str, channel: str, events: list[str], added_by: s
         cur.execute(
             "INSERT INTO whatsapp_recipients VALUES (?,?,?,?,?) "
             "ON CONFLICT(phone) DO UPDATE SET channel=excluded.channel, events=excluded.events",
-            (phone, channel, ",".join(events), added_by, datetime.datetime.now().isoformat(timespec="seconds"))
+            (phone, channel, ",".join(events), added_by, now_ist().isoformat(timespec="seconds"))
         )
         conn.commit()
         return True, f"Saved {phone} ({channel})."
@@ -4556,7 +4576,7 @@ def reorder_forecast(days_history: int = 30) -> pd.DataFrame:
     with average daily usage, days remaining until the reorder threshold,
     and a projected reorder date. NaN/None days_remaining means usage has
     been zero/flat over the lookback window, so no forecast can be made."""
-    cutoff = str(datetime.date.today() - datetime.timedelta(days=days_history))
+    cutoff = str(today_ist() - datetime.timedelta(days=days_history))
     hist = pd.read_sql_query(
         "SELECT factory, material, date, used, closing_stock FROM stock "
         "WHERE date >= ? ORDER BY factory, material, date",
@@ -4585,7 +4605,7 @@ def reorder_forecast(days_history: int = 30) -> pd.DataFrame:
 
     out["days_to_threshold"] = out.apply(_days_remaining, axis=1)
     out["projected_reorder_date"] = out["days_to_threshold"].apply(
-        lambda d: str(datetime.date.today() + datetime.timedelta(days=int(d))) if d is not None else "—"
+        lambda d: str(today_ist() + datetime.timedelta(days=int(d))) if d is not None else "—"
     )
     return out.sort_values("days_to_threshold", na_position="last").reset_index(drop=True)
 
@@ -4709,7 +4729,7 @@ def bom_standard_cost(product: str) -> float | None:
 # by mistake.
 
 def _now_iso() -> str:
-    return datetime.datetime.now().isoformat(timespec="seconds")
+    return now_ist().isoformat(timespec="seconds")
 
 def raise_ncr(source_stage: str, reference_id: int, batch_no: str, description: str) -> int:
     """Auto-opens a Non-Conformance Record whenever any QC stage fails."""
@@ -4764,7 +4784,7 @@ def record_incoming_inspection(rm_batch_id: int, appearance: str, colour: str, m
 
 # ── Stage 3: Production Batch ────────────────────────────────────────────────
 def generate_batch_no(factory: str) -> str:
-    _prefix = f"FCSC-{factory[:3].upper()}-{datetime.date.today().strftime('%Y%m%d')}"
+    _prefix = f"FCSC-{factory[:3].upper()}-{today_ist().strftime('%Y%m%d')}"
     _count = cur.execute(
         "SELECT COUNT(*) FROM production_batches WHERE batch_no LIKE ?", (f"{_prefix}%",)
     ).fetchone()[0]
@@ -5013,7 +5033,7 @@ def generate_traceability_pdf(trace: dict) -> bytes | None:
     story = [
         Paragraph("FCSC — Batch Traceability Certificate", title_style),
         Paragraph(f"Firstchoice Speciality Chemicals Pvt. Ltd. &nbsp;|&nbsp; "
-                  f"Generated {datetime.date.today().strftime('%d %B %Y')}", body),
+                  f"Generated {today_ist().strftime('%d %B %Y')}", body),
         Spacer(1, 8),
     ]
 
@@ -5318,7 +5338,7 @@ with st.sidebar:
     bounds      = pd.DataFrame({"mn": [_mn], "mx": [_mx]})
     _mn         = bounds.iloc[0, 0]
     _mx         = bounds.iloc[0, 1]
-    _today      = datetime.date.today()
+    _today      = today_ist()
     default_start = pd.to_datetime(_mn).date() if _mn else _today.replace(day=1)
     # Always extend end to today so freshly saved entries are immediately visible
     default_end   = max(pd.to_datetime(_mx).date(), _today) if _mx else _today
@@ -5387,7 +5407,7 @@ with st.sidebar:
                             _rbk_dir = "fcsc_backups"
                             os.makedirs(_rbk_dir, exist_ok=True)
                             _rbk_name = (f"{_rbk_dir}/fcsc_pre_reset_"
-                                         f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.db")
+                                         f"{now_ist().strftime('%Y%m%d_%H%M%S')}.db")
                             conn.commit()
                             shutil.copy2("fcsc.db", _rbk_name)
 
@@ -5416,7 +5436,7 @@ with st.sidebar:
                         st.rerun()
         st.markdown("---")
 
-    st.caption(f"Today: {datetime.date.today()}")
+    st.caption(f"Today: {today_ist()}")
 
     # ── Change Password ───────────────────────────────────────────────────
     st.markdown("---")
@@ -5468,7 +5488,7 @@ if _is_admin and "db_backed_up" not in st.session_state:
     try:
         _backup_dir = "fcsc_backups"
         os.makedirs(_backup_dir, exist_ok=True)
-        _backup_name = f"{_backup_dir}/fcsc_{datetime.date.today()}.db"
+        _backup_name = f"{_backup_dir}/fcsc_{today_ist()}.db"
         if not os.path.exists(_backup_name):
             shutil.copy2("fcsc.db", _backup_name)
             # keep only last 30 daily backups
@@ -5565,7 +5585,7 @@ def reverse_fg_stock_for_source(fac: str, product: str, source_module: str,
     if not (net["production_in"] or net["dispatch_out"] or net["adjustment"]):
         return None
     return record_fg_stock_movement(
-        datetime.date.today(), fac, product,
+        today_ist(), fac, product,
         production_in=-net["production_in"], dispatch_out=-net["dispatch_out"],
         adjustment=-net["adjustment"], source_module=source_module,
         source_ref_id=source_ref_id, movement_type="Reversal"
@@ -5880,7 +5900,7 @@ _data_skel.empty()
 # Runs once per session per day (cheap guard via session_state) rather than on
 # every single rerun. Admins can force an immediate re-scan from
 # Procurement → Settings.
-_today_str = str(datetime.date.today())
+_today_str = str(today_ist())
 if st.session_state.get("procurement_scan_date") != _today_str:
     _new_proc_alerts = scan_low_stock_and_trigger_procurement()
     st.session_state["procurement_scan_date"] = _today_str
@@ -6218,7 +6238,7 @@ def render_material_360(material_name: str) -> None:
         _first = _hist_range.sort_values("date").iloc[0]
         _opening = _first["closing_stock"] - _first["received"] + _first["used"]
 
-    _today_str_m = str(datetime.date.today())
+    _today_str_m = str(today_ist())
     _today_used  = _hist[_hist["date"] == _today_str_m]["used"].sum()
     _avg_used    = _hist_range["used"].mean() if not _hist_range.empty else _hist["used"].mean()
 
@@ -6458,7 +6478,7 @@ if module == "Dashboard":
 
     # ── Page header: eyebrow / title / context — one clear read, no ornament ──
     st.markdown(
-        f"<div class='fc-page-eyebrow'>{datetime.date.today().strftime('%A, %d %B %Y')}</div>"
+        f"<div class='fc-page-eyebrow'>{today_ist().strftime('%A, %d %B %Y')}</div>"
         f"<h1 style='margin-bottom:0;'>Dashboard</h1>"
         f"<p class='fc-page-sub'>{fac_label}</p>",
         unsafe_allow_html=True,
@@ -6472,7 +6492,7 @@ if module == "Dashboard":
 
     # ── Today: the number a plant manager checks first, promoted to the top
     # instead of buried in a collapsed expander ─────────────────────────────
-    today_str  = str(datetime.date.today())
+    today_str  = str(today_ist())
     _fac_q     = "AND factory=?" if factory != ALL_FACTORIES else ""
     _fac_p     = (factory,) if factory != ALL_FACTORIES else ()
     t_prod  = pd.read_sql_query(f"SELECT * FROM production WHERE date=? {_fac_q}",  conn, params=(today_str,*_fac_p))
@@ -6505,7 +6525,7 @@ if module == "Dashboard":
     margin_pct = safe_ratio_pct(profit, revenue) or 0
 
     # ── Month-over-month comparison ────────────────────────────────────────
-    _today      = datetime.date.today()
+    _today      = today_ist()
     _this_m     = _today.strftime("%Y-%m")
     _last_m     = (_today.replace(day=1) - datetime.timedelta(days=1)).strftime("%Y-%m")
     _fac_param  = (factory,) if factory != ALL_FACTORIES else ()
@@ -6675,14 +6695,14 @@ if module == "Dashboard":
 elif module == "My Factory":
 
     fac = _user_factory or factory   # always the supervisor's own factory
-    today_str  = str(datetime.date.today())
-    month_str  = datetime.date.today().strftime("%Y-%m")
+    today_str  = str(today_ist())
+    month_str  = today_ist().strftime("%Y-%m")
 
     st.markdown(f"# 🏭 {fac} — Factory Overview")
     st.markdown(
         f"<p style='color:#8C7B62;font-size:13px;margin-top:-10px;'>"
         f"Logged in as <strong style='color:#1E3A5F'>{st.session_state.display_name}</strong>"
-        f" &nbsp;|&nbsp; {datetime.date.today().strftime('%d %B %Y')}</p>",
+        f" &nbsp;|&nbsp; {today_ist().strftime('%d %B %Y')}</p>",
         unsafe_allow_html=True,
     )
 
@@ -6752,7 +6772,7 @@ elif module == "My Factory":
     st.markdown("---")
 
     # ── THIS MONTH ─────────────────────────────────────────────────────────
-    st.subheader(f"📆 This Month — {datetime.date.today().strftime('%B %Y')}")
+    st.subheader(f"📆 This Month — {today_ist().strftime('%B %Y')}")
     m1, m2, m3, m4 = st.columns(4)
     # FIX: Revenue = Dispatch only. Sales Orders booked this month are
     # shown as a separate order-book figure, not summed into Revenue.
@@ -7555,7 +7575,7 @@ elif module == "Sand":
 
     with tab_log:
         st.subheader("Sand Records")
-        thismonth = datetime.date.today().strftime("%Y-%m")
+        thismonth = today_ist().strftime("%Y-%m")
         month_total = sand_df[sand_df["date"].str.startswith(thismonth)]["qty"].sum() if not sand_df.empty else 0
 
         k1, k2, k3 = st.columns(3)
@@ -8044,7 +8064,7 @@ elif module == "Stock":
                 st.warning("Enter a non-zero adjustment.")
             else:
                 _fg_new_closing = record_fg_stock_movement(
-                    datetime.date.today(), fg_adj_factory, _fg_adj_final_product,
+                    today_ist(), fg_adj_factory, _fg_adj_final_product,
                     adjustment=fg_adj_qty, source_module="Manual Adjustment"
                 )
                 log_audit("INSERT", "fg_stock", "adjustment",
@@ -8203,7 +8223,7 @@ elif module == "Stock":
                                 cur.execute(
                                     "INSERT INTO materials_master(lab_code,name,procurement_code,category,status,created_at) "
                                     "VALUES (?,?,?,?,?,?)",
-                                    (_lc, _nm, _pc, _ct, _st_, datetime.datetime.now().isoformat(timespec="seconds")))
+                                    (_lc, _nm, _pc, _ct, _st_, now_ist().isoformat(timespec="seconds")))
                                 _added += 1
                         conn.commit()
                         log_audit("INSERT", "materials_master", "bulk_import",
@@ -8221,7 +8241,7 @@ elif module == "Stock":
         _mm_export_buf.seek(0)
         st.download_button(
             "📥 Download Material Master (Excel)", data=_mm_export_buf,
-            file_name=f"FCSC_MaterialMaster_{datetime.date.today()}.xlsx",
+            file_name=f"FCSC_MaterialMaster_{today_ist()}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="mm_export_btn"
         )
@@ -8358,7 +8378,7 @@ elif module == "Stock":
                                 cur.execute(
                                     "INSERT INTO finished_goods_master(name,code,status,created_at) "
                                     "VALUES (?,?,?,?)",
-                                    (_nm, _cd, _st_, datetime.datetime.now().isoformat(timespec="seconds")))
+                                    (_nm, _cd, _st_, now_ist().isoformat(timespec="seconds")))
                                 _fgm_added += 1
                         conn.commit()
                         log_audit("INSERT", "finished_goods_master", "bulk_import",
@@ -8376,7 +8396,7 @@ elif module == "Stock":
         _fgm_export_buf.seek(0)
         st.download_button(
             "📥 Download Finished Goods Master (Excel)", data=_fgm_export_buf,
-            file_name=f"FCSC_FinishedGoodsMaster_{datetime.date.today()}.xlsx",
+            file_name=f"FCSC_FinishedGoodsMaster_{today_ist()}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="fgm_export_btn"
         )
@@ -8464,7 +8484,7 @@ elif module == "Procurement":
             overdue_count = cur.execute(
                 f"SELECT COUNT(*) FROM procurement_stages WHERE request_id IN ({_ph}) "
                 f"AND status NOT IN ('Completed','Skipped') AND due_date < ?",
-                (*_ids, str(datetime.date.today()))
+                (*_ids, str(today_ist()))
             ).fetchone()[0]
         pm2.metric("Overdue Stages", overdue_count)
         pm3.metric("Auto-Triggered",
@@ -8559,7 +8579,7 @@ elif module == "Procurement":
                             if (new["Status"] != orig["status"] or new["Owner"] != orig["owner"]
                                     or new_due != orig["due_date"]):
                                 completed_at = (
-                                    datetime.datetime.now().isoformat(timespec="seconds")
+                                    now_ist().isoformat(timespec="seconds")
                                     if new["Status"] in ("Completed", "Skipped") else None
                                 )
                                 try:
@@ -8582,7 +8602,7 @@ elif module == "Procurement":
                         if remaining == 0:
                             cur.execute(
                                 "UPDATE procurement_requests SET status='Closed', closed_at=? WHERE id=?",
-                                (datetime.datetime.now().isoformat(timespec="seconds"), req_id)
+                                (now_ist().isoformat(timespec="seconds"), req_id)
                             )
                             conn.commit()
                             log_audit("UPDATE", "procurement_requests", req_id,
@@ -9887,7 +9907,7 @@ elif module == "Reconciliation":
     with rc_f2:
         rc_days = st.selectbox("Period", [7, 14, 30, 90], index=2, key="rc_days",
                                 format_func=lambda d: f"Last {d} days")
-    rc_end   = datetime.date.today()
+    rc_end   = today_ist()
     rc_start = rc_end - datetime.timedelta(days=rc_days)
 
     if st.button("▶️ Run Reconciliation", type="primary", key="rc_run"):
@@ -10233,7 +10253,7 @@ elif module == "Sales":
 
         _tgt_month = st.selectbox(
             "Month",
-            [( datetime.date.today().replace(day=1)
+            [( today_ist().replace(day=1)
                - datetime.timedelta(days=i*28) ).strftime("%Y-%m")
              for i in range(-1, 13)],
             key="tgt_month"
@@ -10977,7 +10997,7 @@ elif module == "Reports":
                 f"SELECT * FROM {table} ORDER BY date DESC", conn
             )
         elif rpt_period == "This Month":
-            m = datetime.date.today().strftime("%Y-%m")
+            m = today_ist().strftime("%Y-%m")
             if fac_filter:
                 return pd.read_sql_query(
                     f"SELECT * FROM {table} WHERE date LIKE ? AND factory = ?",
@@ -10988,7 +11008,7 @@ elif module == "Reports":
                 conn, params=(f"{m}%",)
             )
         elif rpt_period == "This Year":
-            y = datetime.date.today().strftime("%Y")
+            y = today_ist().strftime("%Y")
             if fac_filter:
                 return pd.read_sql_query(
                     f"SELECT * FROM {table} WHERE date LIKE ? AND factory = ?",
@@ -11017,7 +11037,7 @@ elif module == "Reports":
     st.markdown(f"### {rpt_type} Report — "
                 f"{'All Factories' if rpt_scope == SCOPE_ALL else factory} | {rpt_period}")
     st.markdown(f"<span style='font-size:12px;color:#8C7B62;'>Generated: "
-                f"{datetime.datetime.now().strftime('%d %B %Y, %H:%M')}</span>",
+                f"{now_ist().strftime('%d %B %Y, %H:%M')}</span>",
                 unsafe_allow_html=True)
     st.markdown("---")
 
@@ -11091,7 +11111,7 @@ elif module == "Reports":
         summary.to_excel(writer, sheet_name="Summary", index=False)
     buffer.seek(0)
 
-    fname = f"FCSC_{scope_label}_{rpt_type.replace(' ','_')}_{datetime.date.today()}.xlsx"
+    fname = f"FCSC_{scope_label}_{rpt_type.replace(' ','_')}_{today_ist()}.xlsx"
     st.download_button(
         label="📥 Download Excel Report",
         data=buffer,
@@ -11289,7 +11309,7 @@ elif module == "Pilot Dashboard":
     _pd_modules   = pd.read_sql_query("SELECT * FROM module_usage ORDER BY id DESC", conn)
     _pd_errors    = pd.read_sql_query("SELECT * FROM app_errors ORDER BY id DESC", conn)
     _pd_feedback  = pd.read_sql_query("SELECT * FROM feedback ORDER BY id DESC", conn)
-    _pd_today_str = datetime.date.today().isoformat()
+    _pd_today_str = today_ist().isoformat()
 
     # ── top-line metrics ────────────────────────────────────────────────────
     _today_logins   = _pd_logins[_pd_logins["timestamp"].str[:10] == _pd_today_str] if not _pd_logins.empty else _pd_logins
@@ -11297,7 +11317,7 @@ elif module == "Pilot Dashboard":
     _total_users    = len(_pd_users)
     _errors_7d      = 0
     if not _pd_errors.empty:
-        _cutoff = (datetime.datetime.now() - datetime.timedelta(days=7)).isoformat(timespec="seconds")
+        _cutoff = (now_ist() - datetime.timedelta(days=7)).isoformat(timespec="seconds")
         _errors_7d = len(_pd_errors[_pd_errors["timestamp"] >= _cutoff])
     _pending_fb     = len(_pd_feedback[_pd_feedback["status"] == "pending"]) if not _pd_feedback.empty else 0
 
@@ -11560,6 +11580,6 @@ elif module == "Audit Trail":
         st.download_button(
             label="📥 Export Audit Log (Excel)",
             data=audit_buf,
-            file_name=f"FCSC_AuditLog_{datetime.date.today()}.xlsx",
+            file_name=f"FCSC_AuditLog_{today_ist()}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
