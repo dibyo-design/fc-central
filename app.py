@@ -318,17 +318,75 @@ hr { border-top: 1px solid var(--fc-border); margin: 1.1rem 0; }
 # subclassing is the correct fix.)
 _data_version = {"v": 0}
 
+# FIX: root cause of the "SystemError: ... returned NULL without setting an
+# exception" crashes (and the sqlite3.InterfaceError "bad parameter or other
+# API misuse" that follows a few statements later in the same session).
+# check_same_thread=False lets every Streamlit session's OS thread call into
+# the *same* sqlite3.Connection object concurrently. SQLite's own file lock
+# (busy_timeout, WAL, etc.) only serializes actual disk writes — it does NOT
+# protect the C-level connection/statement handles inside the Python sqlite3
+# module itself from being entered by two threads at the same instant. Two
+# threads racing into sqlite3_prepare/step on the same handle (most likely
+# at app startup, when every session's rerun executes the same top-level
+# ALTER TABLE / CREATE TABLE / migration statements below) corrupts that
+# shared internal state — hence the C-level NULL-without-exception crash,
+# and every subsequent, otherwise-unrelated query on that same connection
+# behaving erratically afterwards. A single process-wide lock around every
+# raw execute()/commit()/rollback() forces all threads to take turns at the
+# C-API boundary, which is cheap (each hold is just one statement) and
+# removes the race entirely.
+_db_lock = threading.Lock()
+
 class _TrackingConnection(sqlite3.Connection):
+    def execute(self, *args, **kwargs):
+        with _db_lock:
+            return super().execute(*args, **kwargs)
+
     def commit(self) -> None:
-        super().commit()
+        with _db_lock:
+            super().commit()
         _data_version["v"] += 1
+
+    def rollback(self) -> None:
+        with _db_lock:
+            super().rollback()
 
 # FIX: Connection now created before auth (previously it was created *after*
 # login), because credentials and brute-force lockouts are now persisted in
 # the database instead of living only in memory / hardcoded in source.
+def _get_db_path() -> str:
+    # FIX: was a bare relative path ("fcsc.db"), which resolves to wherever
+    # the script happens to be launched from. On this deployment that's a
+    # OneDrive-synced folder — OneDrive's background file sync races with
+    # SQLite's own file locking (especially with WAL mode's -wal/-shm
+    # sidecar files below), which corrupts the connection's internal
+    # statement cache and surfaces as a low-level "SystemError: ... returned
+    # NULL without setting an exception" on an otherwise-unrelated query.
+    # Pinning the DB to a fixed, non-synced local directory avoids that
+    # entirely, regardless of where app.py itself lives.
+    # Pulled out into its own helper (rather than inlined in get_connection)
+    # so the backup code below resolves the SAME path instead of each
+    # keeping its own copy of this logic — see FIX note at the backup sites.
+    _db_dir = os.path.join(os.path.expanduser("~"), ".fcsc_app_data")
+    os.makedirs(_db_dir, exist_ok=True)
+    return os.path.join(_db_dir, "fcsc.db")
+
 @st.cache_resource
 def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect("fcsc.db", check_same_thread=False, factory=_TrackingConnection)
+    _db_path = _get_db_path()
+    # One-time migration: if this is the first run against the new location
+    # and an old fcsc.db (and its WAL/SHM sidecars) exist next to the script
+    # — e.g. inside the OneDrive folder from before this fix — copy them
+    # over so existing data isn't lost. Never overwrites an existing DB at
+    # the new location.
+    if not os.path.exists(_db_path):
+        _old_db = os.path.join(os.getcwd(), "fcsc.db")
+        if os.path.exists(_old_db):
+            for _suffix in ("", "-wal", "-shm"):
+                _src = _old_db + _suffix
+                if os.path.exists(_src):
+                    shutil.copy2(_src, _db_path + _suffix)
+    conn = sqlite3.connect(_db_path, check_same_thread=False, factory=_TrackingConnection)
     # FIX: WAL mode lets reads and writes proceed concurrently instead of
     # blocking each other — matters once several supervisors hit the same
     # SQLite file at once. Cheap to enable, meaningfully reduces
@@ -368,7 +426,16 @@ class _ThreadLocalCursor:
         return c
 
     def __getattr__(self, name):
-        return getattr(self._get(), name)
+        attr = getattr(self._get(), name)
+        # FIX: see _db_lock note above — serialize the actual C-API calls
+        # (not just fetchone()/lastrowid/etc., which only touch this
+        # thread's own already-prepared cursor and are safe as-is).
+        if name in ("execute", "executemany", "executescript"):
+            def _locked_call(*args, **kwargs):
+                with _db_lock:
+                    return attr(*args, **kwargs)
+            return _locked_call
+        return attr
 
 cur = _ThreadLocalCursor(conn)
 
@@ -465,6 +532,37 @@ CREATE TABLE IF NOT EXISTS app_errors (
 """)
 conn.commit()
 
+# -- ADDITIVE MIGRATION: departmental ownership (R&D / QC / Production /
+# Stores / Sales / Dispatch) alongside the existing admin/supervisor role.
+# Runs here, right after `users` is created, because it must complete before
+# get_user()/login below can SELECT the column. Never touches existing rows'
+# other fields -- only backfills department where it's still empty, so it's
+# safe to run on every startup. 'All' preserves today's behaviour exactly for
+# existing factory-supervisor accounts (full access within their own
+# factory) -- nobody's access silently narrows because of this migration;
+# only newly-created accounts get scoped to a single department.
+try:
+    cur.execute("ALTER TABLE users ADD COLUMN department TEXT")
+    conn.commit()
+except sqlite3.OperationalError as _e:
+    if "duplicate column name" not in str(_e).lower():
+        raise
+cur.execute("UPDATE users SET department='Admin' WHERE role='admin' AND (department IS NULL OR department='')")
+cur.execute("UPDATE users SET department='All'   WHERE role='supervisor' AND (department IS NULL OR department='')")
+conn.commit()
+
+DEPARTMENTS = ["All", "RD", "QC", "Production", "Stores", "Sales", "Dispatch", "Admin"]
+DEPARTMENT_LABELS = {
+    "All":        "All Departments (full access within factory)",
+    "RD":         "R&D / Formulation",
+    "QC":         "Quality Control",
+    "Production": "Production",
+    "Stores":     "Stores",
+    "Sales":      "Sales",
+    "Dispatch":   "Dispatch",
+    "Admin":      "Administrator",
+}
+
 # ================= PILOT DASHBOARD: instrumentation =================
 # NEW: lightweight usage tracking that feeds the admin-only "Pilot Dashboard"
 # module further down. Every insert here is wrapped so a tracking failure
@@ -533,19 +631,20 @@ _DEFAULT_USERS = [
 ]
 if cur.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
     for _uname, _pw, _role, _fac, _disp in _DEFAULT_USERS:
-        cur.execute("INSERT INTO users VALUES (?,?,?,?,?)",
-                     (_uname, _hash_password(_pw), _role, _fac, _disp))
+        _dept = "Admin" if _role == "admin" else "All"
+        cur.execute("INSERT INTO users (username,password,role,factory,display,department) VALUES (?,?,?,?,?,?)",
+                     (_uname, _hash_password(_pw), _role, _fac, _disp, _dept))
     conn.commit()
 
 def get_user(username: str) -> dict | None:
     row = cur.execute(
-        "SELECT username, password, role, factory, display FROM users WHERE username = ?",
+        "SELECT username, password, role, factory, display, department FROM users WHERE username = ?",
         (username,)
     ).fetchone()
     if row is None:
         return None
     return {"username": row[0], "password": row[1], "role": row[2],
-            "factory": row[3], "display": row[4]}
+            "factory": row[3], "display": row[4], "department": row[5]}
 
 # ── Server-side brute-force protection ─────────────────────────────────────────
 # FIX: Previously tracked in st.session_state, which is scoped to a single
@@ -1616,6 +1715,7 @@ def show_login_page() -> None:
                     st.session_state.role         = user["role"]
                     st.session_state.user_factory = user["factory"]
                     st.session_state.display_name = user["display"]
+                    st.session_state.department   = user.get("department") or ("Admin" if user["role"] == "admin" else "All")
                     log_login(uname, user["factory"], user["role"])
                     st.rerun()
                 else:
@@ -1648,6 +1748,7 @@ if "logged_in" not in st.session_state:
     st.session_state.role         = ""
     st.session_state.user_factory = None
     st.session_state.display_name = ""
+    st.session_state.department   = ""
 
 if not st.session_state.logged_in:
     show_login_page()
@@ -1670,6 +1771,22 @@ _role         = st.session_state.role           # "admin" | "supervisor"
 _user_factory = st.session_state.user_factory   # e.g. "Belda" | None
 _is_admin     = _role == "admin"
 _is_supervisor = _role == "supervisor"
+
+# ── Departmental ownership shortcut ─────────────────────────────────────────
+# _user_dept is "Admin" for the admin account, "All" for any pre-existing
+# factory-supervisor account (preserves their current full access exactly),
+# or one of RD/QC/Production/Stores/Sales/Dispatch for a newly-created
+# department-scoped account. _dept_allows(...) is the single gate used
+# throughout the app for write actions that Section 6 of the architecture
+# spec restricts to a specific department -- admins and 'All' accounts
+# always pass; a department-scoped account only passes for its own
+# department(s). This never restricts *reading/viewing* data, only the
+# specific save/approve/issue actions that are explicitly gated with it.
+_user_dept = st.session_state.get("department") or ("Admin" if _is_admin else "All")
+def _dept_allows(*allowed_depts: str) -> bool:
+    if _is_admin or _user_dept == "All":
+        return True
+    return _user_dept in allowed_depts
 
 # ================= TABLES =================
 cur.executescript("""
@@ -2092,6 +2209,18 @@ _safe_add_column("fg_stock", "movement_type TEXT DEFAULT 'Entry'")
 _safe_add_column("production_batches", "quantity REAL")
 _safe_add_column("production_batches", "quantity_unit TEXT DEFAULT ''")
 
+# -- ADDITIVE MIGRATION (Production/Formulation/Quality traceability link) ---
+# production_batches.bom_id: snapshots which bom_headers.id was the ACTIVE
+# formulation at the moment this batch was created. This is what makes the
+# formulation link historical/reliable — the batch keeps pointing at the
+# exact BOM version used, even if the product's active formula changes or a
+# newer version is activated afterward. NULL on historical batches created
+# before this column existed, and on any batch whose product had no active
+# BOM at creation time — both cases are shown explicitly in the UI as
+# "Historical formulation link unavailable." / "No active formulation was
+# on file when this batch was created.", never guessed or backfilled.
+_safe_add_column("production_batches", "bom_id INTEGER")
+
 cur.executescript("""
 CREATE TABLE IF NOT EXISTS fg_product_unit (
     product         TEXT PRIMARY KEY,
@@ -2102,6 +2231,133 @@ CREATE TABLE IF NOT EXISTS fg_product_unit (
 );
 """)
 conn.commit()
+
+# ── Raw-material unit conversion (Phase 1 of the gap-fix plan) ─────────────
+# Mirrors fg_product_unit above, one level up: RM materials are logged in
+# whatever unit the person filling the form picks (KG, MT, Bags, Litres,
+# Drums, ...) — see the `unit`/`Unit` selectboxes across Stock, RM Receipt,
+# and Procurement. Nothing in the app has ever reconciled those against each
+# other; recompute_stock_chain() and every RM total sum "received"/"used"
+# as raw numbers regardless of unit, so a factory that logs partly in Bags
+# and partly in KG silently gets a meaningless running total.
+#
+# material_stock_unit / material_unit_factors are the single place a real
+# conversion factor lives per material (bag weight varies by material, so
+# this can't be one global constant like UNIT_MAP). Additive-only: nothing
+# elsewhere in the app reads these tables yet, so this migration cannot
+# change any existing number or behaviour. Wiring recompute_stock_chain()
+# and RM totals to actually use it is the next phase, once real factors are
+# on file for the materials in active use — see materials_missing_unit_factors()
+# below, which reports exactly that gap so real factors can be filled in
+# before anything starts relying on them.
+cur.executescript("""
+CREATE TABLE IF NOT EXISTS material_stock_unit (
+    material        TEXT PRIMARY KEY,
+    base_unit       TEXT DEFAULT 'KG',
+    updated_by      TEXT,
+    updated_at      TEXT
+);
+CREATE TABLE IF NOT EXISTS material_unit_factors (
+    material        TEXT NOT NULL,
+    unit            TEXT NOT NULL,
+    factor_to_base  REAL NOT NULL,
+    updated_by      TEXT,
+    updated_at      TEXT,
+    PRIMARY KEY (material, unit)
+);
+""")
+conn.commit()
+
+DEFAULT_MATERIAL_BASE_UNIT = "KG"
+
+def get_material_base_unit(material: str) -> str:
+    row = cur.execute(
+        "SELECT base_unit FROM material_stock_unit WHERE material=?", (material,)
+    ).fetchone()
+    return (row[0] or DEFAULT_MATERIAL_BASE_UNIT) if row else DEFAULT_MATERIAL_BASE_UNIT
+
+def set_material_base_unit(material: str, base_unit: str, updated_by: str) -> None:
+    cur.execute(
+        "INSERT INTO material_stock_unit (material,base_unit,updated_by,updated_at) "
+        "VALUES (?,?,?,?) ON CONFLICT(material) DO UPDATE SET "
+        "base_unit=excluded.base_unit, updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+        (material, (base_unit or "").strip() or DEFAULT_MATERIAL_BASE_UNIT, updated_by, _now_iso())
+    )
+    conn.commit()
+    log_audit("UPDATE", "material_stock_unit", material, f"base_unit={base_unit}")
+
+def get_material_unit_factor(material: str, unit: str) -> float | None:
+    """Multiplier to convert a quantity in `unit` into the material's base
+    unit, or None if no factor is on file yet. Never guessed or defaulted —
+    a missing factor must surface to the caller, not silently become 1.0."""
+    su = (unit or "").strip().lower()
+    if not su:
+        return None
+    if su == get_material_base_unit(material).strip().lower():
+        return 1.0
+    row = cur.execute(
+        "SELECT factor_to_base FROM material_unit_factors WHERE material=? AND lower(unit)=?",
+        (material, su)
+    ).fetchone()
+    return row[0] if row else None
+
+def set_material_unit_factor(material: str, unit: str, factor_to_base: float, updated_by: str) -> None:
+    cur.execute(
+        "INSERT INTO material_unit_factors (material,unit,factor_to_base,updated_by,updated_at) "
+        "VALUES (?,?,?,?,?) ON CONFLICT(material,unit) DO UPDATE SET "
+        "factor_to_base=excluded.factor_to_base, updated_by=excluded.updated_by, "
+        "updated_at=excluded.updated_at",
+        (material, (unit or "").strip(), factor_to_base, updated_by, _now_iso())
+    )
+    conn.commit()
+    log_audit("UPDATE", "material_unit_factors", material, f"unit={unit} factor_to_base={factor_to_base}")
+
+def remove_material_unit_factor(material: str, unit: str) -> None:
+    cur.execute(
+        "DELETE FROM material_unit_factors WHERE material=? AND unit=?", (material, unit)
+    )
+    conn.commit()
+    log_audit("DELETE", "material_unit_factors", material, f"unit={unit}")
+
+def convert_material_qty_to_base(material: str, qty: float, unit: str) -> tuple[float, bool, str]:
+    """Converts a raw-material quantity from `unit` into the material's base
+    unit. Returns (converted_qty, is_exact, note) — same contract as
+    convert_production_qty_to_fg_unit(): is_exact=False means no reliable
+    factor is on file, and the caller must surface `note` rather than
+    silently trusting the (unconverted) number returned alongside it."""
+    factor = get_material_unit_factor(material, unit)
+    if factor is not None:
+        return qty * factor, True, ""
+    base = get_material_base_unit(material)
+    return qty, False, (
+        f"No conversion factor on file for '{material}' from {unit or '(no unit)'} to its "
+        f"base unit ({base}). Value shown as entered — set the factor in "
+        f"Stock → 📇 Material Master → ⚖️ Unit Conversion Factors."
+    )
+
+def materials_missing_unit_factors() -> pd.DataFrame:
+    """Data-quality report: every (material, unit) combination actually
+    logged in rm_batches or stock that has no conversion factor on file and
+    isn't already the material's base unit — i.e. quantities that currently
+    can't be safely compared or summed against the rest of that material's
+    history. Read-only; changes nothing."""
+    _q = """
+        SELECT material, unit, COUNT(*) AS n_rows FROM (
+            SELECT material, unit FROM rm_batches WHERE material IS NOT NULL AND TRIM(IFNULL(unit,'')) != ''
+            UNION ALL
+            SELECT material, unit FROM stock WHERE material IS NOT NULL AND TRIM(IFNULL(unit,'')) != ''
+        )
+        GROUP BY material, unit
+        ORDER BY material, unit
+    """
+    _all = pd.read_sql_query(_q, conn)
+    if _all.empty:
+        return _all
+    _all["base_unit"] = _all["material"].apply(get_material_base_unit)
+    _all["has_factor"] = _all.apply(
+        lambda r: get_material_unit_factor(r["material"], r["unit"]) is not None, axis=1
+    )
+    return _all[~_all["has_factor"]].drop(columns=["has_factor"]).reset_index(drop=True)
 
 # -- NEW: Official Finished Goods Master (single source of truth) ---------
 # Mirrors materials_master/material_aliases below but for finished products.
@@ -2125,6 +2381,226 @@ CREATE TABLE IF NOT EXISTS fg_aliases (
 );
 """)
 conn.commit()
+
+# -- NEW: Production Instruction workflow (R&D -> Production connective layer) --
+# Redesign per business requirement: R&D defines WHAT should be
+# manufactured (product + qty + factory + exact approved formula/version);
+# Production then EXECUTES that instruction by creating a Production Batch.
+# QC's role stays raw-material/finished-product testing and quality records,
+# plus approving the formulation itself where that workflow already applies
+# (see the Formulation module's Version History) -- QC does not decide what
+# product/quantity Production is supposed to manufacture.
+#
+# Design notes:
+#  - bom_id/formula_version/formula_code are captured on the instruction at
+#    creation time (not looked up live later) -- same historical-integrity
+#    pattern as production_batches.bom_id above. If the product's active
+#    formula changes after this instruction is created, this instruction
+#    keeps pointing at the exact version it was issued against.
+#  - This table is purely a planning/execution-control layer. Creating or
+#    releasing an instruction never touches fg_stock or any other ledger --
+#    only actually starting production (creating a production_batches row)
+#    does that, exactly as before (Section 20 of the design spec).
+#  - status lifecycle: Draft -> Released to Production -> Acknowledged ->
+#    In Production -> Completed, with Cancelled / On Hold as exception
+#    states. Kept as free-text TEXT (not an enum) to match the rest of this
+#    schema's conventions (e.g. production_batches.status, rm_batches.status).
+cur.executescript("""
+CREATE TABLE IF NOT EXISTS production_instructions (
+    id                      INTEGER PRIMARY KEY,
+    instruction_no          TEXT UNIQUE,
+    product                 TEXT NOT NULL,
+    bom_id                  INTEGER NOT NULL,
+    formula_version         TEXT DEFAULT '',
+    formula_code            TEXT DEFAULT '',
+    quantity                REAL NOT NULL,
+    quantity_unit           TEXT DEFAULT 'KG',
+    factory                 TEXT NOT NULL,
+    planned_date            TEXT,
+    priority                TEXT DEFAULT 'Normal',
+    notes                   TEXT DEFAULT '',
+    status                  TEXT DEFAULT 'Draft',
+    created_by              TEXT,
+    created_at              TEXT,
+    released_by             TEXT,
+    released_at             TEXT,
+    production_batch_id     INTEGER,
+    updated_at              TEXT
+);
+""")
+conn.commit()
+
+# -- ADDITIVE MIGRATION (formulation lifecycle + instruction/batch linkage) --
+#  1) bom_headers.status -- Draft / Approved / Superseded. Only an Approved
+#     formulation can be selected for a new Production Instruction (Section
+#     3). Existing rows (created before this column existed) are backfilled
+#     to 'Approved' below so nothing that already relied on an existing
+#     active formula silently breaks -- historical formulas were the
+#     de-facto approved ones in daily use.
+#  2) production_batches.production_instruction_id -- links a batch back to
+#     the instruction that triggered it, when Production started the batch
+#     via an instruction rather than the old free-form Create Batch path.
+#     NULL for every batch created the old way, and for all historical
+#     batches -- shown explicitly in the UI as "Legacy production record --
+#     no Production Instruction available." (Section 21), never guessed.
+_safe_add_column("bom_headers", "status TEXT DEFAULT 'Draft'")
+_safe_add_column("production_batches", "production_instruction_id INTEGER")
+cur.execute("UPDATE bom_headers SET status='Approved' WHERE status IS NULL OR status=''")
+conn.commit()
+
+# -- ADDITIVE MIGRATION (Phase A — PI -> Batch is 1:MANY, not 1:1) ----------
+# The old model stored a single production_instructions.production_batch_id
+# and marked the whole instruction Completed the moment that one batch
+# reached Dispatched -- wrong for real factory operation, where a 10 MT
+# customer requirement is physically made as several independent blender
+# loads (e.g. 5 x 2 MT), each with its own QC/PDI/FG-stock/dispatch life.
+#
+# The batch side of this relationship (production_batches.production_
+# instruction_id, added above) already supports many batches pointing at
+# one instruction -- a plain FK column is the correct, simplest structure
+# for a strict many-batches-to-one-instruction relationship (no junction
+# table needed, since a batch never belongs to more than one instruction).
+# What was actually broken was the completion logic and the missing
+# planned/actual + capacity/progress layer built on top of it. Fixed below.
+#
+#  - production_batches.planned_qty: the PLANNED load size for this batch
+#    (e.g. 2.00 MT), distinct from the existing `quantity` column which is
+#    now documented as the ACTUAL recorded output (e.g. 1.96 MT). Historical
+#    batches have planned_qty = NULL (no planned/actual distinction existed
+#    when they were created) and are shown as such, never backfilled with a
+#    guess.
+#  - production_capacity: the configured maximum physical load size per
+#    product (e.g. Tileglue -> 2 MT/blender load). Admin-maintained. Absent
+#    for a product until an admin sets it -- "Create Next Load" falls back
+#    to planning the full remaining quantity as one load until a capacity
+#    is configured, which matches today's existing (pre-Phase-A) behaviour
+#    exactly, so no in-progress instruction's UX changes until an admin
+#    opts in by setting a capacity.
+#  - production_instructions.short_closed / short_close_reason /
+#    short_closed_by / short_closed_at: the explicit authorized-close
+#    mechanism required so a PI is never silently abandoned or silently
+#    marked Completed with Produced < Required.
+_safe_add_column("production_batches", "planned_qty REAL")
+_safe_add_column("production_instructions", "short_closed INTEGER DEFAULT 0")
+_safe_add_column("production_instructions", "short_close_reason TEXT DEFAULT ''")
+_safe_add_column("production_instructions", "short_closed_by TEXT")
+_safe_add_column("production_instructions", "short_closed_at TEXT")
+
+cur.executescript("""
+CREATE TABLE IF NOT EXISTS production_capacity (
+    product        TEXT PRIMARY KEY,
+    capacity       REAL NOT NULL,
+    capacity_unit  TEXT DEFAULT 'MT',
+    updated_by     TEXT,
+    updated_at     TEXT
+);
+""")
+conn.commit()
+
+# -- ADDITIVE MIGRATION: Sales Order → Production handoff chain ------------
+# Closes the loop the QC head asked for: a Sales Order should be able to
+# trigger Production, which hands to R&D (Production Instruction / formula),
+# which hands to QC (RM approval, already existed), which hands back to
+# Stores for an explicit material-release checkpoint before Production may
+# start the batch. Nothing here changes any existing table's meaning --
+# these are purely additive columns, default-NULL/0, so every historical
+# sales order and instruction keeps working exactly as before.
+_safe_add_column("sales_orders", "wo_status TEXT DEFAULT 'New'")
+_safe_add_column("sales_orders", "instruction_id INTEGER")
+_safe_add_column("production_instructions", "sales_order_id INTEGER")
+_safe_add_column("production_instructions", "stores_released INTEGER DEFAULT 0")
+_safe_add_column("production_instructions", "stores_released_by TEXT")
+_safe_add_column("production_instructions", "stores_released_at TEXT")
+# Backfill: pre-existing sales orders had no concept of wo_status -- treat
+# them as already 'New' (the default), nothing further to do; explicit
+# UPDATE kept here only for clarity/symmetry with other migrations.
+cur.execute("UPDATE sales_orders SET wo_status='New' WHERE wo_status IS NULL OR wo_status=''")
+conn.commit()
+
+# -- ADDITIVE MIGRATION: percentage-based formulation lines ----------------
+# Formulation Architecture Correction: a bom_line's composition is now
+# entered as a PERCENTAGE of the formula's batch_size (e.g. Cement 60% of a
+# 100 KG formulation = 60 KG), with qty_per_batch kept in sync as a derived
+# column so every existing reader of qty_per_batch (scale_bom_lines,
+# calculate_material_requirement, bom_standard_cost, Batch 360°, Production
+# Instruction previews, etc.) keeps working unchanged. `percent` is purely
+# additive — historical lines are backfilled from their existing
+# qty_per_batch / batch_size so old formulas immediately show a sensible
+# percentage instead of 0, without altering their stored quantities.
+_safe_add_column("bom_lines", "percent REAL DEFAULT 0")
+cur.execute("""
+    UPDATE bom_lines
+    SET percent = ROUND(
+        qty_per_batch * 100.0 /
+        (SELECT batch_size FROM bom_headers WHERE bom_headers.id = bom_lines.bom_id), 4
+    )
+    WHERE (percent IS NULL OR percent = 0)
+      AND qty_per_batch > 0
+      AND (SELECT batch_size FROM bom_headers WHERE bom_headers.id = bom_lines.bom_id) > 0
+""")
+conn.commit()
+# -- ADDITIVE MIGRATION (Phase B -- RM Reservation Ledger + batch-linked FG) --
+# Fixes two remaining architectural gaps left after Phase A:
+#
+#  1) RM Stores release was a single production_instructions.stores_released
+#     boolean -- Stores clicking "Release" made no actual claim on which
+#     physical rm_batches a PI's materials would come from. Two PIs could
+#     both show "sufficient QC-Approved stock" against the same batches and
+#     both get released, double-counting the same physical material. This
+#     table is a real reservation ledger: release_stores_materials() now
+#     walks each PI's BOM-scaled requirement and reserves specific
+#     rm_batches rows in strict FIFO order (oldest received_date first),
+#     and every other read of "how much is available" (the release-check
+#     screen, the Production RM picker) is computed net of what's already
+#     reserved here -- never just rm_batches.quantity in isolation.
+#     rm_batches.quantity itself is never rewritten by this -- it stays the
+#     as-received quantity, exactly like before; reservation/consumption is
+#     tracked entirely as a ledger on top, same pattern as fg_stock.
+#     consumed_qty tracks how much of a given reservation has actually been
+#     drawn down into a production_batch_materials row (a PI can span many
+#     physical batches/loads under Phase A); status flips to 'Consumed' only
+#     once the full reserved_qty has been drawn.
+#  2) fg_stock.production_batch_id -- the pre-existing FG Stock ledger was
+#     keyed only on (factory, product, date), with no link back to the exact
+#     QC-traced batch that produced it. record_fg_stock_for_batch() (defined
+#     below, alongside the QC engine) auto-posts one additional, clearly-
+#     tagged (source_module='Packing QC') FG Stock IN row the moment a batch
+#     passes Packing QC, carrying this column -- this is additive to, not a
+#     replacement for, the existing free-form Production-log posting.
+cur.executescript("""
+CREATE TABLE IF NOT EXISTS rm_reservations (
+    id                        INTEGER PRIMARY KEY,
+    production_instruction_id INTEGER NOT NULL,
+    rm_batch_id               INTEGER NOT NULL,
+    material                  TEXT,
+    factory                   TEXT,
+    reserved_qty              REAL DEFAULT 0,
+    unit                      TEXT DEFAULT '',
+    consumed_qty              REAL DEFAULT 0,
+    status                    TEXT DEFAULT 'Reserved',   -- Reserved | Consumed | Cancelled
+    created_by                TEXT,
+    created_at                TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_rm_res_pi    ON rm_reservations(production_instruction_id);
+CREATE INDEX IF NOT EXISTS idx_rm_res_batch ON rm_reservations(rm_batch_id);
+""")
+conn.commit()
+_safe_add_column("fg_stock", "production_batch_id INTEGER")
+
+# -- ADDITIVE MIGRATION (Gap G-02 fix: RM reservation release lifecycle) ----
+# Audit finding: rm_reservations.status was defined with 'Cancelled' in its
+# comment from day one, but no code path ever actually set it -- cancelling
+# or short-closing a Production Instruction after Stores had already run
+# FIFO release() left its reservation rows permanently 'Reserved', so that
+# RM was locked out of release_stores_materials()'s FIFO pool forever, even
+# though the PI that held it would never consume it. These three columns
+# carry the audit trail for the fix below (release_rm_reservations()): who
+# released the reservation, when, and why -- the row itself is NEVER
+# deleted, only its status/these columns change, so full history survives.
+_safe_add_column("rm_reservations", "released_by TEXT")
+_safe_add_column("rm_reservations", "released_at TEXT")
+_safe_add_column("rm_reservations", "released_reason TEXT")
+
 
 def get_user_prefs(username: str) -> dict | None:
     row = cur.execute(
@@ -3942,13 +4418,25 @@ def progress_bar(label: str, value: float, max_value: float,
 # call it after any INSERT, UPDATE, or DELETE that touches a stock row.
 def recompute_stock_chain(factory: str, material: str) -> None:
     """Recomputes closing_stock for every row of this (factory, material)
-    pair, walking id ASC and chaining received/used forward. Idempotent —
+    pair, walking in TRANSACTION-DATE order (date, then id as a tiebreaker
+    for same-day entries) and chaining received/used forward. Idempotent —
     safe to call after an insert even though that row's closing was already
-    correct, and safe to call twice for the same pair."""
+    correct, and safe to call twice for the same pair.
+
+    FIX: previously walked `ORDER BY id ASC` — i.e. insertion order, not
+    transaction order. A backdated entry (added today for last Tuesday) was
+    appended to the END of the chain instead of being inserted at its actual
+    date, so every closing balance from that date forward was wrong until
+    someone happened to notice and it got silently "fixed" by more edits
+    landing on top of it. Ordering by `date` first makes a backdated entry
+    correctly re-derive every closing_stock after its own date, same as it
+    would if it had been entered on time.
+    """
     if not factory or not material:
         return
     rows = cur.execute(
-        "SELECT id, received, used FROM stock WHERE factory=? AND material=? ORDER BY id ASC",
+        "SELECT id, received, used FROM stock WHERE factory=? AND material=? "
+        "ORDER BY date ASC, id ASC",
         (factory, material)
     ).fetchall()
     running = 0
@@ -4641,30 +5129,233 @@ def _activate_bom(bom_id: int, product: str) -> None:
     cur.execute("UPDATE bom_headers SET is_active=1 WHERE id = ?", (bom_id,))
     conn.commit()
 
-def create_bom(product: str, version: str, formula_code: str, batch_size: float,
-               batch_unit: str, notes: str, lines: list[dict]) -> tuple[bool, str, int | None]:
-    """`lines`: list of {'material','qty_per_batch','unit','notes'} dicts."""
+def create_bom_header(product: str, version: str, formula_code: str, batch_size: float,
+                       batch_unit: str, notes: str) -> tuple[bool, str, int | None]:
+    """Creates a new formulation VERSION as a **Draft header with no material
+    lines yet** — material lines are added one at a time afterwards via
+    add_bom_line() (Formulation Architecture Correction, Sections 2-6), each
+    independently editable/deletable rather than re-entered as a block.
+    Saves as Draft — it does NOT become the active/approved formula for the
+    product until approve_bom() is called on it, and approve_bom() now
+    refuses unless the formulation passes validation (Section 6). Existing
+    older versions are left completely untouched by this call."""
     if not product:
         return False, "Select a product.", None
-    if not lines:
-        return False, "Add at least one material line (quantity must be > 0).", None
+    if not batch_size or batch_size <= 0:
+        return False, "Formulation Size must be greater than 0.", None
     try:
         cur.execute(
-            "INSERT INTO bom_headers VALUES (NULL,?,?,?,?,?,0,?,?,?)",
+            "INSERT INTO bom_headers "
+            "(product,version,formula_code,batch_size,batch_unit,is_active,notes,"
+            "created_by,created_at,status) VALUES (?,?,?,?,?,0,?,?,?,'Draft')",
             (product, version.strip() or "v1", formula_code.strip(), batch_size, batch_unit,
              notes.strip(), st.session_state.get("username", "system"), _now_iso())
         )
         bom_id = cur.lastrowid
-        for i, ln in enumerate(lines):
-            cur.execute(
-                "INSERT INTO bom_lines VALUES (NULL,?,?,?,?,?,?)",
-                (bom_id, ln["material"], ln["qty_per_batch"], ln["unit"], i, ln.get("notes", ""))
-            )
         conn.commit()
-        log_audit("INSERT", "bom_headers", bom_id, f"{product} | {version} | {len(lines)} materials")
-        return True, f"Saved formula {version} for {product} ({len(lines)} materials).", bom_id
+        log_audit("INSERT", "bom_headers", bom_id, f"{product} | {version} | Draft (no material lines yet)")
+        return True, f"Created formula {version} for {product} as **Draft**. Add material lines below.", bom_id
     except sqlite3.Error as e:
         return False, f"Database error: {e}", None
+
+def add_bom_line(bom_id: int, material: str, percent: float, unit: str,
+                  notes: str = "") -> tuple[bool, str, int | None]:
+    """Adds ONE material line to an existing formulation header. The line's
+    identity is its own bom_lines.id — never the material name — so it can
+    later be edited/deleted without touching any other line (Sections 3/4).
+    percent is of the header's Formulation Size (batch_size); qty_per_batch
+    is derived and kept in sync so every existing reader of qty_per_batch
+    keeps working unchanged."""
+    bom = get_bom(bom_id)
+    if bom is None:
+        return False, "Formulation not found.", None
+    if bom.get("status") == "Approved":
+        return False, "This formulation is Approved and read-only — create a new version to change it.", None
+    if not material:
+        return False, "Select a material.", None
+    if percent is None or percent <= 0:
+        return False, "Percentage must be greater than 0.", None
+    if not get_lab_code(material):
+        return False, ("This material has no Lab Code on file in the Material Master — "
+                       "add its Lab Code there first (Stock → Material Master)."), None
+    try:
+        qty = round(bom["batch_size"] * percent / 100.0, 4)
+        _next_seq = cur.execute(
+            "SELECT COALESCE(MAX(sequence), -1) + 1 FROM bom_lines WHERE bom_id=?", (bom_id,)
+        ).fetchone()[0]
+        cur.execute(
+            "INSERT INTO bom_lines (bom_id,material,qty_per_batch,unit,sequence,notes,percent) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (bom_id, material, qty, unit, _next_seq, notes.strip(), percent)
+        )
+        conn.commit()
+        line_id = cur.lastrowid
+        log_audit("INSERT", "bom_lines", line_id,
+                  f"bom {bom_id} | {material} | {percent:g}% ({qty:g} {unit})")
+        return True, f"Added {material_label(material)} — {percent:g}% ({qty:g} {unit}).", line_id
+    except sqlite3.Error as e:
+        return False, f"Database error: {e}", None
+
+def get_bom_line(line_id: int) -> dict | None:
+    row = cur.execute("SELECT * FROM bom_lines WHERE id=?", (line_id,)).fetchone()
+    if row is None:
+        return None
+    cols = [d[0] for d in cur.description]
+    return dict(zip(cols, row, strict=True))
+
+def update_bom_line(line_id: int, material: str, percent: float, unit: str,
+                     notes: str = "") -> tuple[bool, str]:
+    """Updates an existing material line IN PLACE, identified by its own
+    bom_lines.id — this is the ✏️ Edit action (Section 3): e.g. correcting
+    Cement from 25% to 22% updates that one row rather than creating a
+    duplicate line or requiring the whole formulation to be redone."""
+    line = get_bom_line(line_id)
+    if line is None:
+        return False, "Material line not found."
+    bom = get_bom(line["bom_id"])
+    if bom is None:
+        return False, "Formulation not found."
+    if bom.get("status") == "Approved":
+        return False, "This formulation is Approved and read-only — create a new version to change it."
+    if not material:
+        return False, "Select a material."
+    if percent is None or percent <= 0:
+        return False, "Percentage must be greater than 0."
+    if not get_lab_code(material):
+        return False, ("This material has no Lab Code on file in the Material Master — "
+                       "add its Lab Code there first (Stock → Material Master).")
+    try:
+        qty = round(bom["batch_size"] * percent / 100.0, 4)
+        cur.execute(
+            "UPDATE bom_lines SET material=?, qty_per_batch=?, unit=?, notes=?, percent=? WHERE id=?",
+            (material, qty, unit, notes.strip(), percent, line_id)
+        )
+        conn.commit()
+        log_audit("UPDATE", "bom_lines", line_id,
+                  f"bom {line['bom_id']} | {material} | {percent:g}% ({qty:g} {unit})")
+        return True, f"Updated {material_label(material)} — {percent:g}% ({qty:g} {unit})."
+    except sqlite3.Error as e:
+        return False, f"Database error: {e}"
+
+def delete_bom_line(line_id: int) -> tuple[bool, str]:
+    """Deletes ONLY this one material line (Section 4) — never the
+    formulation header, never the Material Master entry, never Stock, never
+    historical production batches (which snapshot their own bom_id and are
+    untouched by later edits to that bom's lines)."""
+    line = get_bom_line(line_id)
+    if line is None:
+        return False, "Material line not found."
+    bom = get_bom(line["bom_id"])
+    if bom is not None and bom.get("status") == "Approved":
+        return False, "This formulation is Approved and read-only — create a new version to change it."
+    try:
+        cur.execute("DELETE FROM bom_lines WHERE id=?", (line_id,))
+        conn.commit()
+        log_audit("DELETE", "bom_lines", line_id, f"bom {line['bom_id']} | {line['material']} removed")
+        return True, f"Removed {material_label(line['material'])} from the formulation."
+    except sqlite3.Error as e:
+        return False, f"Database error: {e}"
+
+def bom_validation(bom_id: int, tol: float = 0.05) -> dict:
+    """Live validation for the Formulation material section (Section 6).
+    Checks — with a small floating-point tolerance rather than exact
+    equality — that: at least one material line exists, every line has a
+    Lab Code and a positive quantity, total % = 100%, and total material
+    weight = the formulation size. Returns a dict the UI renders directly
+    and that approve_bom() also enforces server-side, not just in the UI."""
+    bom = get_bom(bom_id)
+    if bom is None:
+        return {"is_valid": False, "issues": ["Formulation not found."], "total_percent": 0,
+                "total_qty": 0, "batch_size": 0, "batch_unit": "", "line_count": 0}
+    lines = get_bom_lines(bom_id)
+    issues: list[str] = []
+    total_percent = round(float(lines["percent"].sum()), 3) if not lines.empty else 0.0
+    total_qty     = round(float(lines["qty_per_batch"].sum()), 3) if not lines.empty else 0.0
+    batch_size    = bom["batch_size"] or 0
+
+    if lines.empty:
+        issues.append("Add at least one material line.")
+    else:
+        for _, ln in lines.iterrows():
+            if not get_lab_code(ln["material"]):
+                issues.append(f"**{material_label(ln['material'])}** has no Lab Code on file.")
+            if not ln["qty_per_batch"] or ln["qty_per_batch"] <= 0 or not ln["percent"] or ln["percent"] <= 0:
+                issues.append(f"**{material_label(ln['material'])}** has an invalid quantity/percentage.")
+
+    if abs(total_percent - 100.0) > tol:
+        issues.append(f"⚠️ Formulation percentages total {total_percent:g}%. Total must equal 100%.")
+    if batch_size and abs(total_qty - batch_size) > tol:
+        issues.append(
+            f"🔴 Material weight mismatch: Formula contains {total_qty:g} {bom['batch_unit']} "
+            f"against a {batch_size:g} {bom['batch_unit']} formulation size."
+        )
+
+    return {
+        "is_valid": not issues, "issues": issues, "total_percent": total_percent,
+        "total_qty": total_qty, "batch_size": batch_size, "batch_unit": bom["batch_unit"],
+        "line_count": len(lines),
+    }
+
+def approve_bom(bom_id: int, product: str) -> tuple[bool, str]:
+    """Approves and activates one formula version: marks it Approved +
+    active, and marks whatever was previously Approved for this product as
+    Superseded (its rows are kept, never deleted, for historical batches /
+    instructions that already reference them — Section 3/21).
+
+    Section 6 gate: a formulation may NOT become Approved unless it passes
+    bom_validation() — at least one material line, every line has a Lab
+    Code and a valid quantity, total % = 100%, and total weight = the
+    formulation size. Enforced here (not just disabling the UI button) so
+    it can't be bypassed, since an Approved formulation becomes the basis
+    for Production Instructions."""
+    _v = bom_validation(bom_id)
+    if not _v["is_valid"]:
+        return False, ("🔴 Formulation is not valid and cannot be approved:\n- " +
+                        "\n- ".join(_v["issues"]))
+    cur.execute(
+        "UPDATE bom_headers SET status='Superseded' WHERE product=? AND status='Approved' AND id != ?",
+        (product, bom_id)
+    )
+    cur.execute("UPDATE bom_headers SET status='Approved' WHERE id=?", (bom_id,))
+    conn.commit()
+    _activate_bom(bom_id, product)
+    log_audit("UPDATE", "bom_headers", bom_id, f"Approved & activated for {product}")
+    return True, f"Formula {bom_id} approved and activated for {product}."
+
+def get_bom(bom_id: int) -> dict | None:
+    row = cur.execute("SELECT * FROM bom_headers WHERE id=?", (bom_id,)).fetchone()
+    if row is None:
+        return None
+    cols = [d[0] for d in cur.description]
+    return dict(zip(cols, row, strict=True))
+
+def get_approved_boms(product: str) -> pd.DataFrame:
+    """All Approved (not Draft/Superseded) formula versions on file for a
+    product — this is the pick-list for creating a new Production
+    Instruction, since only an approved/released formulation may be used
+    (Section 3)."""
+    return pd.read_sql_query(
+        "SELECT * FROM bom_headers WHERE product=? AND status='Approved' ORDER BY id DESC",
+        conn, params=(product,)
+    )
+
+def scale_bom_lines(bom_id: int, target_qty: float) -> pd.DataFrame:
+    """Scales one BOM's per-reference-batch quantities to an arbitrary
+    target production quantity (Section 7: scale factor = target / reference
+    batch size). Returns columns: material, unit, qty_per_batch,
+    required_qty. Empty DataFrame if the BOM has no lines or batch_size is 0
+    (never divides by zero / fabricates a scale)."""
+    bom = get_bom(bom_id)
+    if bom is None or not bom.get("batch_size"):
+        return pd.DataFrame()
+    lines = get_bom_lines(bom_id)
+    if lines.empty:
+        return pd.DataFrame()
+    scale = target_qty / bom["batch_size"]
+    out = lines.copy()
+    out["required_qty"] = (out["qty_per_batch"] * scale).round(3)
+    out["lab_code"] = out["material"].apply(get_lab_code)
+    return out[["material", "lab_code", "unit", "qty_per_batch", "required_qty", "notes"]]
 
 def calculate_material_requirement(product: str, qty_to_produce: float,
                                     factory: str | None = None) -> pd.DataFrame:
@@ -4720,6 +5411,578 @@ def bom_standard_cost(product: str) -> float | None:
                            (ln["material"],)).fetchone()
         total += ln["qty_per_batch"] * (row[0] if row and row[0] else 0)
     return round(total, 2)
+
+def get_batch_formulation(batch_id: int) -> dict | None:
+    """Returns the formulation that was actually in force when this specific
+    production batch was created — via production_batches.bom_id, NOT
+    whatever the product's currently-active BOM happens to be. Returns None
+    if the batch has no bom_id on file (historical batch predating this
+    link, or the product had no active formula at the time of creation) —
+    callers must show this as an explicit "unavailable" state, never guess
+    or fall back to today's active BOM."""
+    pb = cur.execute("SELECT bom_id FROM production_batches WHERE id=?", (batch_id,)).fetchone()
+    if pb is None or pb[0] is None:
+        return None
+    bom_row = cur.execute("SELECT * FROM bom_headers WHERE id=?", (pb[0],)).fetchone()
+    if bom_row is None:
+        return None  # bom_id pointed at a header that no longer exists — treat as unavailable
+    cols = [d[0] for d in cur.description]
+    bom = dict(zip(cols, bom_row, strict=True))
+    bom["lines"] = get_bom_lines(bom["id"])
+    return bom
+
+def compare_formula_vs_actual(batch_id: int) -> tuple[pd.DataFrame, str | None]:
+    """Compares the batch's formulation (get_batch_formulation) against what
+    production_batch_materials actually recorded as used, matched by
+    material name. Returns (dataframe, note) — note is None when a normal
+    comparison was produced, otherwise it explains why materials line up
+    only partially (or not at all), which the caller must display instead of
+    a misleading table. Scales standard qty_per_batch by the batch's actual
+    output quantity vs the formula's reference batch size when both are on
+    file; otherwise compares raw per-batch standard quantities as-is."""
+    formulation = get_batch_formulation(batch_id)
+    if formulation is None:
+        return pd.DataFrame(), (
+            "Historical formulation link unavailable — this batch has no "
+            "formulation on file (either it predates formulation tracking, "
+            "or no active formula existed for this product when the batch "
+            "was created)."
+        )
+    if formulation["lines"].empty:
+        return pd.DataFrame(), "The linked formula has no material lines on file."
+
+    actual = pd.read_sql_query("""
+        SELECT r.material, SUM(pbm.qty_used) AS actual_qty, MAX(r.unit) AS actual_unit
+        FROM production_batch_materials pbm
+        JOIN rm_batches r ON r.id = pbm.rm_batch_id
+        WHERE pbm.production_batch_id = ?
+        GROUP BY r.material
+    """, conn, params=(batch_id,))
+
+    pb = cur.execute(
+        "SELECT quantity, quantity_unit FROM production_batches WHERE id=?", (batch_id,)
+    ).fetchone()
+    out_qty, out_unit = (pb[0], pb[1]) if pb else (None, "")
+    scale = None
+    if out_qty and formulation["batch_size"] and out_unit and \
+       out_unit.strip().upper() == (formulation["batch_unit"] or "").strip().upper():
+        scale = out_qty / formulation["batch_size"]
+
+    rows, unmatched_note = [], False
+    for _, ln in formulation["lines"].iterrows():
+        std_qty = ln["qty_per_batch"] * scale if scale else ln["qty_per_batch"]
+        _match = actual[actual["material"] == ln["material"]]
+        if _match.empty:
+            rows.append({"Material": ln["material"], "Standard Qty": round(std_qty, 3),
+                         "Standard Unit": ln["unit"], "Actual Qty": None, "Actual Unit": "—",
+                         "Variance": None, "Variance %": None})
+            continue
+        act_qty = float(_match.iloc[0]["actual_qty"])
+        act_unit = _match.iloc[0]["actual_unit"]
+        if act_unit and ln["unit"] and act_unit.strip().upper() != ln["unit"].strip().upper():
+            # Units don't match — a numeric variance would be misleading, so
+            # flag it instead of silently subtracting incompatible units.
+            rows.append({"Material": ln["material"], "Standard Qty": round(std_qty, 3),
+                         "Standard Unit": ln["unit"], "Actual Qty": round(act_qty, 3),
+                         "Actual Unit": act_unit, "Variance": "Unit mismatch",
+                         "Variance %": None})
+            unmatched_note = True
+            continue
+        variance = act_qty - std_qty
+        variance_pct = (variance / std_qty * 100) if std_qty else None
+        rows.append({"Material": ln["material"], "Standard Qty": round(std_qty, 3),
+                     "Standard Unit": ln["unit"], "Actual Qty": round(act_qty, 3),
+                     "Actual Unit": act_unit, "Variance": round(variance, 3),
+                     "Variance %": round(variance_pct, 1) if variance_pct is not None else None})
+
+    df = pd.DataFrame(rows)
+    note = None
+    if scale is None:
+        note = ("Standard quantities shown are per the formula's reference batch size "
+                 "(batch output quantity/unit not on file, or unit doesn't match the "
+                 "formula's batch unit) — not scaled to this batch's actual output.")
+    if unmatched_note:
+        _extra = "Some materials have mismatched units between formula and actual — flagged, not calculated."
+        note = f"{note} {_extra}" if note else _extra
+    return df, note
+
+# ================= PRODUCTION INSTRUCTION ENGINE =================
+# NEW: the R&D -> Production connective layer. R&D-authorized users create
+# and release a Production Instruction referencing one exact Approved
+# formula version (approved by QC beforehand); Production then executes
+# it by starting a Production Batch from it. This table is planning/execution-control only
+# — see the migration comment above for why it never touches stock.
+
+PI_STATUSES = ["Draft", "Released to Production", "Acknowledged",
+               "In Production", "Completed", "On Hold", "Cancelled"]
+
+def generate_instruction_no() -> str:
+    _prefix = f"PI-{today_ist().strftime('%Y')}-"
+    _count = cur.execute(
+        "SELECT COUNT(*) FROM production_instructions WHERE instruction_no LIKE ?", (f"{_prefix}%",)
+    ).fetchone()[0]
+    return f"{_prefix}{_count + 1:05d}"
+
+def create_production_instruction(product: str, bom_id: int, quantity: float,
+                                   quantity_unit: str, factory: str, planned_date,
+                                   priority: str, notes: str,
+                                   sales_order_id: int | None = None) -> tuple[int | None, str]:
+    """Creates a Draft Production Instruction against one specific Approved
+    formula version — the formula link (bom_id + version + code) is
+    snapshotted here at creation time and never re-resolved later, so this
+    instruction (and anything created from it) keeps pointing at the exact
+    formula it was issued against even if a newer version is approved
+    afterwards (Section 4).
+
+    sales_order_id: optional — set when this instruction is being created to
+    fulfil a specific Sales Order that was forwarded to Production (see
+    send_sales_order_to_production()). When set, the linked sales order is
+    stamped 'Instruction Created' so Sales can see it's moving."""
+    bom = get_bom(bom_id)
+    if bom is None:
+        return None, "Selected formula could not be found."
+    if bom["status"] != "Approved":
+        return None, "Only an Approved formulation can be used for a Production Instruction."
+    if bom["product"] != product:
+        return None, "Selected formula does not belong to the selected product."
+    if not quantity or quantity <= 0:
+        return None, "Quantity to produce must be greater than zero."
+    instruction_no = generate_instruction_no()
+    cur.execute(
+        "INSERT INTO production_instructions "
+        "(instruction_no,product,bom_id,formula_version,formula_code,quantity,quantity_unit,"
+        "factory,planned_date,priority,notes,status,created_by,created_at,updated_at,"
+        "sales_order_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,'Draft',?,?,?,?)",
+        (instruction_no, product, bom_id, bom["version"], bom["formula_code"], quantity,
+         quantity_unit, factory, str(planned_date), priority, notes.strip(),
+         st.session_state.get("username", "system"), _now_iso(), _now_iso(), sales_order_id)
+    )
+    pi_id = cur.lastrowid
+    conn.commit()
+    log_audit("INSERT", "production_instructions", pi_id,
+              f"{instruction_no} | {product} | {quantity:g}{quantity_unit} @ {factory}")
+    if sales_order_id:
+        cur.execute(
+            "UPDATE sales_orders SET wo_status='Instruction Created', instruction_id=? WHERE id=?",
+            (pi_id, sales_order_id)
+        )
+        conn.commit()
+        log_audit("UPDATE", "sales_orders", sales_order_id,
+                  f"Instruction Created — {instruction_no}")
+    return pi_id, instruction_no
+
+def release_production_instruction(pi_id: int) -> None:
+    cur.execute(
+        "UPDATE production_instructions SET status='Released to Production', released_by=?,"
+        " released_at=?, updated_at=? WHERE id=?",
+        (st.session_state.get("username", "system"), _now_iso(), _now_iso(), pi_id)
+    )
+    conn.commit()
+    log_audit("UPDATE", "production_instructions", pi_id, "Released to Production")
+
+def acknowledge_production_instruction(pi_id: int) -> None:
+    cur.execute(
+        "UPDATE production_instructions SET status='Acknowledged', updated_at=? "
+        "WHERE id=? AND status='Released to Production'",
+        (_now_iso(), pi_id)
+    )
+    conn.commit()
+    log_audit("UPDATE", "production_instructions", pi_id, "Acknowledged by Production")
+
+def cancel_production_instruction(pi_id: int, reason: str = "") -> None:
+    cur.execute(
+        "UPDATE production_instructions SET status='Cancelled', updated_at=? "
+        "WHERE id=? AND status NOT IN ('In Production','Completed','Short Closed')",
+        (_now_iso(), pi_id)
+    )
+    _did_cancel = cur.rowcount > 0
+    conn.commit()
+    log_audit("UPDATE", "production_instructions", pi_id, f"Cancelled. {reason}".strip())
+    # Gap G-02 fix: a cancelled instruction must give back any RM Stores
+    # already reserved for it — otherwise that material is locked out of
+    # every other instruction's FIFO pool forever, even though this one
+    # will never consume it.
+    if _did_cancel:
+        release_rm_reservations(
+            pi_id, st.session_state.get("username", "system"),
+            f"Instruction cancelled. {reason}".strip()
+        )
+
+def _mark_instruction_in_production(pi_id: int, production_batch_id: int) -> None:
+    """Records that at least one Production Batch now exists for this PI.
+    `production_batch_id` here is kept only as an informational "most
+    recently created batch" pointer (existing UI code reads it to offer a
+    quick link) -- it is NEVER used to decide PI completion; that's
+    recompute_pi_progress()'s job, based on ALL linked batches
+    (production_batches.production_instruction_id), not just this one.
+    Only advances status the first time — a 2nd/3rd/... load being created
+    must not reset an instruction that's already further along."""
+    cur.execute(
+        "UPDATE production_instructions SET production_batch_id=?, updated_at=? WHERE id=?",
+        (production_batch_id, _now_iso(), pi_id)
+    )
+    cur.execute(
+        "UPDATE production_instructions SET status='In Production' "
+        "WHERE id=? AND status IN ('Released to Production','Acknowledged')",
+        (pi_id,)
+    )
+    conn.commit()
+    log_audit("UPDATE", "production_instructions", pi_id,
+              f"Batch id {production_batch_id} created against this instruction")
+    _pi_row = cur.execute(
+        "SELECT sales_order_id FROM production_instructions WHERE id=?", (pi_id,)
+    ).fetchone()
+    if _pi_row and _pi_row[0]:
+        cur.execute(
+            "UPDATE sales_orders SET wo_status='In Production' WHERE id=? AND wo_status != 'Completed'",
+            (_pi_row[0],)
+        )
+        conn.commit()
+
+def get_pi_progress(pi_id: int) -> dict | None:
+    """The aggregate view of a Production Instruction: Required vs Produced
+    (= SUM of ACTUAL output across every Production Batch linked to this PI
+    via production_batches.production_instruction_id — never planned qty)
+    vs Remaining, plus the list of individual batches. This is what makes
+    'one Production Instruction -> many Production Batches' real instead of
+    just a schema note: nothing here assumes there's only one batch."""
+    pi = get_production_instruction(pi_id)
+    if pi is None:
+        return None
+    batches = pd.read_sql_query(
+        "SELECT id, batch_no, status, planned_qty, quantity AS actual_qty, quantity_unit, "
+        "created_at FROM production_batches WHERE production_instruction_id=? ORDER BY id",
+        conn, params=(pi_id,)
+    )
+    produced = float(batches["actual_qty"].fillna(0).sum()) if not batches.empty else 0.0
+    required = float(pi["quantity"] or 0)
+    remaining = max(0.0, required - produced)
+    cap = get_production_capacity(pi["product"])
+    return {
+        "pi": pi,
+        "batches": batches,
+        "batch_count": len(batches),
+        "required": required,
+        "produced": produced,
+        "remaining": remaining,
+        "unit": pi["quantity_unit"],
+        "capacity": cap,
+        "next_planned_load": min(cap["capacity"], remaining) if cap and remaining > 0 else remaining,
+    }
+
+def recompute_pi_completion(pi_id: int) -> bool:
+    """Marks a PI Completed only when Produced >= Required across ALL its
+    linked batches — never from a single batch's status. No-op (returns
+    False) for instructions that are Draft, Cancelled, already Completed, or
+    Short Closed. This replaces the old complete_production_instruction_for_
+    batch(), which incorrectly completed the whole instruction from one
+    batch reaching 'Dispatched'."""
+    progress = get_pi_progress(pi_id)
+    if progress is None:
+        return False
+    pi = progress["pi"]
+    if pi["status"] in ("Draft", "Cancelled", "Completed") or pi["short_closed"]:
+        return False
+    if progress["produced"] + 1e-9 < progress["required"]:
+        return False
+    cur.execute(
+        "UPDATE production_instructions SET status='Completed', updated_at=? WHERE id=?",
+        (_now_iso(), pi_id)
+    )
+    conn.commit()
+    log_audit("UPDATE", "production_instructions", pi_id,
+              f"Completed — Produced {progress['produced']:g} >= Required {progress['required']:g} "
+              f"{progress['unit']} across {progress['batch_count']} batch(es)")
+    if pi["sales_order_id"]:
+        cur.execute(
+            "UPDATE sales_orders SET wo_status='Completed' WHERE id=?", (pi["sales_order_id"],)
+        )
+        conn.commit()
+    # Gap G-02 fix: a PI can legitimately complete (Produced >= Required)
+    # while still holding an unconsumed remainder on one or more of its RM
+    # reservations -- e.g. Stores reserved slightly more than the batches
+    # actually ended up using. That remainder must go back to the FIFO pool
+    # now, the same as on Cancel/Short-Close, rather than sitting 'Reserved'
+    # against an instruction that will never draw on it again.
+    release_rm_reservations(
+        pi_id, "system",
+        f"Instruction completed — releasing unconsumed reservation remainder "
+        f"(Produced {progress['produced']:g} >= Required {progress['required']:g} {progress['unit']})"
+    )
+    return True
+
+def short_close_production_instruction(pi_id: int, reason: str, user: str) -> tuple[bool, str]:
+    """Explicit authorized close for a PI that will never reach Produced >=
+    Required (e.g. a persistent shortage, a discontinued run). Distinct from
+    Cancel (used pre-production) and from the automatic Completed path
+    (Produced >= Required) — this always requires a reason and always
+    records who closed it. Does not touch already-created batches or FG
+    stock; it only stops the instruction from continuing to solicit more
+    production loads. Gap G-02 fix: it now ALSO releases any RM Stores
+    reserved for this instruction that was never consumed — a persistent
+    shortage or a discontinued run is exactly the case where a real chunk
+    of reserved-but-unused material would otherwise stay locked out of
+    every other instruction's FIFO pool forever."""
+    if not reason.strip():
+        return False, "A reason is required to short-close a Production Instruction."
+    pi = get_production_instruction(pi_id)
+    if pi is None:
+        return False, "Production Instruction not found."
+    if pi["status"] in ("Draft", "Cancelled", "Completed", "Short Closed"):
+        return False, f"Cannot short-close an instruction that is already {pi['status']}."
+    cur.execute(
+        "UPDATE production_instructions SET status='Short Closed', short_closed=1, "
+        "short_close_reason=?, short_closed_by=?, short_closed_at=?, updated_at=? WHERE id=?",
+        (reason.strip(), user, _now_iso(), _now_iso(), pi_id)
+    )
+    conn.commit()
+    log_audit("UPDATE", "production_instructions", pi_id, f"Short Closed by {user}: {reason.strip()}")
+    _ok, _rel_msg = release_rm_reservations(pi_id, user, f"Instruction short-closed: {reason.strip()}")
+    return True, f"Production Instruction short-closed. {_rel_msg}"
+
+def get_production_capacity(product: str) -> dict | None:
+    row = cur.execute(
+        "SELECT capacity, capacity_unit, updated_by, updated_at FROM production_capacity WHERE product=?",
+        (product,)
+    ).fetchone()
+    if row is None:
+        return None
+    return {"capacity": row[0], "capacity_unit": row[1], "updated_by": row[2], "updated_at": row[3]}
+
+def set_production_capacity(product: str, capacity: float, capacity_unit: str, user: str) -> tuple[bool, str]:
+    if capacity <= 0:
+        return False, "Capacity must be greater than zero."
+    cur.execute(
+        "INSERT INTO production_capacity(product,capacity,capacity_unit,updated_by,updated_at) "
+        "VALUES (?,?,?,?,?) ON CONFLICT(product) DO UPDATE SET capacity=excluded.capacity, "
+        "capacity_unit=excluded.capacity_unit, updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+        (product, capacity, capacity_unit, user, _now_iso())
+    )
+    conn.commit()
+    log_audit("UPSERT", "production_capacity", product, f"{capacity:g} {capacity_unit} by {user}")
+    return True, f"Blender/load capacity for {product} set to {capacity:g} {capacity_unit}."
+
+# ── Sales Order → Production handoff ───────────────────────────────────────
+# NEW: implements "sales generates a PO, passes it to Production" from the
+# QC head's discussion. A Sales Order starts life as 'New'; Sales forwards
+# it to Production ('Sent to Production'); R&D then picks it up from the
+# queue and issues a Production Instruction against it (which stamps it
+# 'Instruction Created' via create_production_instruction above); the rest
+# of the chain (In Production / Completed) is propagated automatically by
+# the functions above as the linked batch progresses.
+def send_sales_order_to_production(so_id: int) -> None:
+    cur.execute(
+        "UPDATE sales_orders SET wo_status='Sent to Production' WHERE id=? AND wo_status='New'",
+        (so_id,)
+    )
+    conn.commit()
+    log_audit("UPDATE", "sales_orders", so_id, "Sent to Production")
+
+def get_sales_orders_pending_production() -> pd.DataFrame:
+    """Sales Orders that have been forwarded to Production but don't yet
+    have a Production Instruction issued against them."""
+    return pd.read_sql_query(
+        "SELECT * FROM sales_orders WHERE wo_status='Sent to Production' ORDER BY id DESC", conn
+    )
+
+# ── Stores material-release checkpoint ─────────────────────────────────────
+# NEW: "production checks with store for availability of raw material and
+# packaging material which got approved after QC check — store releases the
+# raw material for production." Production may not start a batch from an
+# instruction until Stores has explicitly released materials for it — see
+# the gate in the Production module's "Start Production" section.
+def release_stores_materials(pi_id: int) -> tuple[bool, str]:
+    """Phase B: real FIFO Raw-Material Reservation, replacing the old
+    boolean-only release. Walks this PI's Approved-formula requirement
+    (scaled from its BOM) and, for each material, reserves specific
+    QC-Approved rm_batches rows for this PI's factory in strict FIFO order
+    (oldest received_date, then lowest id) until the requirement is met or
+    approved stock runs out. Reservations are additive rows in
+    rm_reservations — rm_batches.quantity itself is never rewritten here,
+    only earmarked via SUM(reserved_qty). Idempotent per material: won't
+    double-reserve a material this PI already holds a reservation for (so
+    re-clicking Release, or a retry, is safe). Returns (ok, message); a
+    partial reservation still returns ok=True with a shortfall message —
+    Stores can see and act on what's short rather than the release silently
+    doing nothing."""
+    pi = get_production_instruction(pi_id)
+    if pi is None:
+        return False, f"Production Instruction id {pi_id} not found."
+
+    req = scale_bom_lines(pi["bom_id"], pi["quantity"])
+    shortfalls: list[str] = []
+
+    if not req.empty:
+        for _, line in req.iterrows():
+            material = line["material"]
+            required_qty = float(line["required_qty"] or 0)
+            _already = cur.execute(
+                "SELECT COALESCE(SUM(reserved_qty),0) FROM rm_reservations "
+                "WHERE production_instruction_id=? AND material=? AND status NOT IN ('Cancelled','Released')",
+                (pi_id, material)
+            ).fetchone()[0]
+            still_needed = required_qty - (_already or 0)
+            if still_needed <= 1e-9:
+                continue
+            _batches = cur.execute(
+                "SELECT id, quantity FROM rm_batches WHERE material=? AND factory=? "
+                "AND status='Approved' ORDER BY received_date ASC, id ASC",
+                (material, pi["factory"])
+            ).fetchall()
+            for rb_id, rb_qty in _batches:
+                if still_needed <= 1e-9:
+                    break
+                _held = cur.execute(
+                    f"SELECT COALESCE(SUM({_RM_RES_HELD_EXPR}),0) FROM rm_reservations "
+                    "WHERE rm_batch_id=? AND status!='Cancelled'", (rb_id,)
+                ).fetchone()[0]
+                _avail = (rb_qty or 0) - (_held or 0)
+                if _avail <= 1e-9:
+                    continue
+                _take = min(_avail, still_needed)
+                cur.execute(
+                    "INSERT INTO rm_reservations (production_instruction_id,rm_batch_id,material,"
+                    "factory,reserved_qty,unit,consumed_qty,status,created_by,created_at) "
+                    "VALUES (?,?,?,?,?,?,0,'Reserved',?,?)",
+                    (pi_id, rb_id, material, pi["factory"], round(_take, 4), line["unit"],
+                     st.session_state.get("username", "system"), _now_iso())
+                )
+                still_needed -= _take
+            if still_needed > 1e-9:
+                shortfalls.append(f"{material}: short by {still_needed:.3f} {line['unit']}")
+        conn.commit()
+
+    cur.execute(
+        "UPDATE production_instructions SET stores_released=1, stores_released_by=?,"
+        " stores_released_at=?, updated_at=? WHERE id=?",
+        (st.session_state.get("username", "system"), _now_iso(), _now_iso(), pi_id)
+    )
+    conn.commit()
+
+    if req.empty:
+        log_audit("UPDATE", "production_instructions", pi_id,
+                  "Materials released by Stores (no BOM lines to reserve)")
+        return True, "Released — this formula has no material lines on file, nothing to reserve."
+
+    log_audit("UPDATE", "production_instructions", pi_id,
+              f"Materials released by Stores — FIFO reserved against {len(req)} material line(s)"
+              + (f"; SHORTFALLS: {'; '.join(shortfalls)}" if shortfalls else ""))
+    if shortfalls:
+        return True, ("⚠️ Released with shortfalls — QC-Approved stock ran out before the full "
+                       "requirement could be reserved: " + "; ".join(shortfalls))
+    return True, "✅ Materials released — full requirement reserved via FIFO against QC-Approved batches."
+
+def _consume_rm_reservations(pi_id: int, rm_batch_id: int, qty_used: float) -> None:
+    """Draws down qty_used from this PI's active reservation(s) against a
+    specific rm_batch (FIFO across reservation rows, in the rare case more
+    than one exists for the same PI+batch). Flips a reservation to
+    'Consumed' once its full reserved_qty has been drawn. Silently no-ops
+    if there's no matching reservation — legacy/manual batches created
+    without going through a Production Instruction never have one, and this
+    must never block or corrupt their material recording."""
+    if qty_used <= 0:
+        return
+    remaining = qty_used
+    _rows = cur.execute(
+        "SELECT id, reserved_qty, consumed_qty FROM rm_reservations "
+        "WHERE production_instruction_id=? AND rm_batch_id=? AND status='Reserved' ORDER BY id",
+        (pi_id, rm_batch_id)
+    ).fetchall()
+    for res_id, reserved_qty, consumed_qty in _rows:
+        if remaining <= 1e-9:
+            break
+        _room = (reserved_qty or 0) - (consumed_qty or 0)
+        if _room <= 1e-9:
+            continue
+        _draw = min(_room, remaining)
+        _new_consumed = round((consumed_qty or 0) + _draw, 4)
+        _new_status = "Consumed" if _new_consumed >= (reserved_qty or 0) - 1e-9 else "Reserved"
+        cur.execute("UPDATE rm_reservations SET consumed_qty=?, status=? WHERE id=?",
+                     (_new_consumed, _new_status, res_id))
+        remaining -= _draw
+    conn.commit()
+
+# Expression used everywhere a reservation's currently-"held" (unavailable-
+# to-other-PIs) quantity is computed. For an active 'Reserved' or fully
+# 'Consumed' row, the whole reserved_qty stays held (unchanged prior
+# behaviour: as long as a PI holds a reservation, or has fully drawn it,
+# none of it goes back to the pool). For a 'Released' row (Gap G-02 fix,
+# below), only the portion that was ACTUALLY consumed before release stays
+# held — because that material is physically gone — while the unconsumed
+# remainder is exactly what release_rm_reservations() freed, so it must
+# stop counting as held from that point on.
+def _rm_res_held_expr(alias: str = "") -> str:
+    p = f"{alias}." if alias else ""
+    return f"(CASE WHEN {p}status='Released' THEN {p}consumed_qty ELSE {p}reserved_qty END)"
+
+_RM_RES_HELD_EXPR = _rm_res_held_expr()
+
+def release_rm_reservations(pi_id: int, user: str, reason: str) -> tuple[bool, str]:
+    """Gap G-02 fix: releases every still-'Reserved' rm_reservations row for
+    a Production Instruction that is being cancelled or short-closed (or
+    that completed with reservation left over), so the unconsumed portion
+    of that RM becomes available to other PIs again instead of being locked
+    out of release_stores_materials()'s FIFO pool forever.
+
+    Never deletes a row and never touches 'Consumed' or already-'Released'
+    rows — this only flips rows currently sitting at 'Reserved' to
+    'Released', stamping released_by/released_at/released_reason so the
+    full history (what was originally reserved, how much was actually
+    consumed before release, who released the remainder and why) stays on
+    file. Any portion already drawn down (consumed_qty > 0) on a released
+    row remains permanently held via _RM_RES_HELD_EXPR above — only the
+    genuinely unused remainder re-enters the available pool.
+
+    Idempotent: re-calling this for a PI with nothing left in 'Reserved'
+    status (e.g. it was never released by Stores, or was already released)
+    is a safe no-op that returns ok=True with a "nothing to release" note,
+    exactly like release_stores_materials()'s own idempotency guarantee.
+    """
+    _rows = cur.execute(
+        "SELECT id, material, reserved_qty, consumed_qty FROM rm_reservations "
+        "WHERE production_instruction_id=? AND status='Reserved'",
+        (pi_id,)
+    ).fetchall()
+    if not _rows:
+        return True, "No active reservations to release for this instruction."
+    _ts = _now_iso()
+    _freed: list[str] = []
+    for res_id, material, reserved_qty, consumed_qty in _rows:
+        _remainder = round((reserved_qty or 0) - (consumed_qty or 0), 4)
+        cur.execute(
+            "UPDATE rm_reservations SET status='Released', released_by=?, "
+            "released_at=?, released_reason=? WHERE id=?",
+            (user, _ts, reason.strip(), res_id)
+        )
+        if _remainder > 1e-9:
+            _freed.append(f"{material}: {_remainder:g}")
+    conn.commit()
+    log_audit("UPDATE", "rm_reservations", pi_id,
+              f"Released {len(_rows)} reservation row(s) for PI {pi_id} — {reason.strip()}"
+              + (f"; freed back to pool: {'; '.join(_freed)}" if _freed else "; nothing unconsumed to free"))
+    return True, (f"Released {len(_rows)} reservation(s)"
+                   + (f" — freed: {'; '.join(_freed)}" if _freed else " (fully consumed already, nothing freed)"))
+
+def get_production_instruction(pi_id: int) -> dict | None:
+    row = cur.execute("SELECT * FROM production_instructions WHERE id=?", (pi_id,)).fetchone()
+    if row is None:
+        return None
+    cols = [d[0] for d in cur.description]
+    return dict(zip(cols, row, strict=True))
+
+def list_production_instructions(factory: str | None = None,
+                                  statuses: list[str] | None = None) -> pd.DataFrame:
+    q = "SELECT * FROM production_instructions WHERE 1=1"
+    params: list = []
+    if factory:
+        q += " AND factory=?"
+        params.append(factory)
+    if statuses:
+        q += f" AND status IN ({','.join('?' * len(statuses))})"
+        params.extend(statuses)
+    q += " ORDER BY id DESC"
+    return pd.read_sql_query(q, conn, params=params)
 
 # ================= QUALITY / BATCH TRACEABILITY ENGINE =================
 # NEW: RM Receipt → Incoming QC → Production Batch → Process QC → FG QC →
@@ -4793,23 +6056,98 @@ def generate_batch_no(factory: str) -> str:
 def create_production_batch(product: str, formula: str, factory: str, operator: str,
                              machine: str, shift: str, rm_batch_ids: list[int],
                              qty_used_map: dict[int, float], quantity: float | None = None,
-                             quantity_unit: str = "") -> tuple[int | None, str]:
+                             quantity_unit: str = "",
+                             production_instruction_id: int | None = None,
+                             planned_qty: float | None = None) -> tuple[int | None, str]:
     """Creates a production batch. Refuses if any selected RM batch isn't
     Approved — this is the actual enforcement, not just a UI filter.
     `quantity`/`quantity_unit` capture the batch's actual output (Section 11)
     so Dispatch<->Quality reconciliation can compare real quantities instead
-    of a batch count — optional, since historical batches never had it."""
+    of a batch count — optional, since historical batches never had it.
+
+    If `production_instruction_id` is given (Production started the batch
+    from a released Production Instruction), the batch's formula/bom_id is
+    locked to that instruction's exact snapshotted formula version — NOT
+    the product's currently-active BOM, which may have moved on since the
+    instruction was issued (Section 4/11). Otherwise falls back to the old
+    behaviour of snapshotting whatever BOM is active right now."""
     for rid in rm_batch_ids:
         _status = cur.execute("SELECT status FROM rm_batches WHERE id=?", (rid,)).fetchone()
         if not _status or _status[0] != "Approved":
             return None, f"RM batch id {rid} is not QC-Approved — cannot be used in production."
+
+    # Server-side enforcement for PI-driven batches (this was previously only
+    # a UI-level filter, not a real guarantee — an audit correctly flagged
+    # that create_production_batch() itself would accept a batch against a
+    # cancelled/completed/wrong-factory instruction, or one whose RM usage
+    # exceeded what Stores actually reserved, as long as the RM batches
+    # themselves were QC-Approved). None of this applies to legacy free-form
+    # batches (production_instruction_id is None) — those never had a PI or
+    # a reservation to check against.
+    if production_instruction_id is not None:
+        _pi = get_production_instruction(production_instruction_id)
+        if _pi is None:
+            return None, f"Production Instruction id {production_instruction_id} not found."
+        _valid_states = ("Released to Production", "Acknowledged", "In Production")
+        if _pi["status"] not in _valid_states:
+            return None, (
+                f"Instruction {_pi['instruction_no']} is '{_pi['status']}' — a batch can only "
+                f"be created against an instruction that's Released, Acknowledged, or already "
+                f"In Production."
+            )
+        if _pi["product"] != product:
+            return None, (
+                f"Instruction {_pi['instruction_no']} is for '{_pi['product']}', not '{product}' "
+                f"— the batch's product must match the instruction it's created from."
+            )
+        if _pi["factory"] != factory:
+            return None, (
+                f"Instruction {_pi['instruction_no']} is for {_pi['factory']}, not {factory} — "
+                f"the batch's factory must match the instruction it's created from."
+            )
+        if not _pi["stores_released"]:
+            return None, (
+                f"Stores hasn't released materials for {_pi['instruction_no']} yet — there's no "
+                f"RM reservation to draw from. Ask Stores to release it first (Stock → 🚚 "
+                f"Material Release)."
+            )
+        # Reservation-quantity enforcement: reject outright rather than
+        # silently capping — silently capping let recorded physical usage
+        # drift ahead of what was actually reserved, with nothing to catch
+        # the discrepancy.
+        for rid in rm_batch_ids:
+            _used = qty_used_map.get(rid, 0)
+            if _used <= 0:
+                continue
+            _avail = cur.execute(
+                "SELECT COALESCE(SUM(reserved_qty - consumed_qty), 0) FROM rm_reservations "
+                "WHERE production_instruction_id=? AND rm_batch_id=? AND status='Reserved'",
+                (production_instruction_id, rid)
+            ).fetchone()[0]
+            if _used > _avail + 1e-6:
+                _mat_row = cur.execute("SELECT material FROM rm_batches WHERE id=?", (rid,)).fetchone()
+                _mat_name = _mat_row[0] if _mat_row else f"RM batch {rid}"
+                return None, (
+                    f"Cannot use {_used:g} of {_mat_name} (RM-{rid:05d}) — only {_avail:g} is "
+                    f"reserved for {_pi['instruction_no']} against that specific batch. Ask "
+                    f"Stores to release more, or reduce the quantity used."
+                )
+
     batch_no = generate_batch_no(factory)
+    if production_instruction_id is not None:
+        _pi = get_production_instruction(production_instruction_id)
+        _bom_id = _pi["bom_id"] if _pi else None
+    else:
+        _active_bom = get_active_bom(product)
+        _bom_id = _active_bom["id"] if _active_bom else None
     cur.execute(
         "INSERT INTO production_batches "
         "(batch_no,product,formula,factory,operator,machine,shift,status,created_at,"
-        "quantity,quantity_unit) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "quantity,quantity_unit,bom_id,production_instruction_id,planned_qty) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (batch_no, product, formula, factory, operator, machine, shift,
-         "Production Started", _now_iso(), quantity, quantity_unit)
+         "Production Started", _now_iso(), quantity, quantity_unit, _bom_id,
+         production_instruction_id, planned_qty)
     )
     pb_id = cur.lastrowid
     for rid in rm_batch_ids:
@@ -4817,6 +6155,21 @@ def create_production_batch(product: str, formula: str, factory: str, operator: 
                      (pb_id, rid, qty_used_map.get(rid, 0)))
     conn.commit()
     log_audit("INSERT", "production_batches", pb_id, f"{batch_no} | {product} @ {factory}")
+    if production_instruction_id is not None:
+        # Phase B: draw down this PI's RM reservations by exactly what got
+        # used in this specific load — a PI can span several physical
+        # batches/loads (Phase A), so this must decrement the reservation
+        # ledger per-load, not all-at-once, leaving the remainder available
+        # for the next load created against the same instruction.
+        for rid in rm_batch_ids:
+            _consume_rm_reservations(production_instruction_id, rid, qty_used_map.get(rid, 0))
+        _mark_instruction_in_production(production_instruction_id, pb_id)
+        # Produced/Remaining must reflect this batch's ACTUAL output the
+        # moment it's on file — and if it happens to already satisfy the
+        # instruction's Required quantity (e.g. the whole run fit in one
+        # load), the PI should complete now rather than sit "In Production"
+        # forever waiting for a load that will never be created.
+        recompute_pi_completion(production_instruction_id)
     return pb_id, batch_no
 
 # ── Stage 4: Process QC ──────────────────────────────────────────────────────
@@ -4858,7 +6211,7 @@ def record_fg_inspection(pb_id: int, adhesion: str, strength: str, consistency: 
 # ── Stage 6: Packing QC ──────────────────────────────────────────────────────
 def record_packing_inspection(pb_id: int, correct_bag: bool, correct_label: bool,
                                correct_batch: bool, net_weight_ok: bool, seal_quality_ok: bool,
-                               inspector: str) -> int:
+                               inspector: str) -> tuple[int, str | None]:
     decision = "Pass" if all([correct_bag, correct_label, correct_batch,
                                net_weight_ok, seal_quality_ok]) else "Fail"
     cur.execute(
@@ -4871,10 +6224,17 @@ def record_packing_inspection(pb_id: int, correct_bag: bool, correct_label: bool
     cur.execute("UPDATE production_batches SET status=? WHERE id=?", (new_status, pb_id))
     conn.commit()
     log_audit("UPDATE", "production_batches", pb_id, f"Packing QC: {decision}")
+    _fg_msg = None
     if decision == "Fail":
         _bno = cur.execute("SELECT batch_no FROM production_batches WHERE id=?", (pb_id,)).fetchone()
         raise_ncr("Packing", insp_id, _bno[0] if _bno else "", "Packing QC failed one or more checks")
-    return insp_id
+    else:
+        # Phase B: auto-post batch-linked FG Stock IN the moment Packing QC
+        # passes — the batch's downstream identity (Dispatch, reconciliation)
+        # now traces back to this exact physical batch, not just a
+        # factory+product+date bucket.
+        _ok, _fg_msg = record_fg_stock_for_batch(pb_id)
+    return insp_id, _fg_msg
 
 # ── Stage 7: Dispatch QC (PDI) ───────────────────────────────────────────────
 def record_dispatch_approval(pb_id: int, pdi_completed: bool, approved_by: str) -> int:
@@ -4891,9 +6251,22 @@ def record_dispatch_approval(pb_id: int, pdi_completed: bool, approved_by: str) 
     return cur.lastrowid
 
 def mark_batch_dispatched(pb_id: int) -> None:
+    """Not called from any UI as of the Phase-A/containment fix (2026-08) —
+    QC/PDI's "Mark Dispatched" button was removed because it let QC bypass
+    Dispatch/challan/FG-stock entirely (see the QC/PDI module's "Ready for
+    Dispatch" tab). Kept, and kept CORRECT, for Phase C to call once batch-
+    controlled Dispatch actually confirms a real dispatch transaction.
+    Uses recompute_pi_completion() (Produced >= Required across ALL of the
+    instruction's batches), not the old one-batch-completes-everything
+    logic — a batch reaching Dispatched no longer force-completes its PI."""
     cur.execute("UPDATE production_batches SET status='Dispatched' WHERE id=?", (pb_id,))
     conn.commit()
     log_audit("UPDATE", "production_batches", pb_id, "Marked Dispatched")
+    _pb = cur.execute(
+        "SELECT production_instruction_id FROM production_batches WHERE id=?", (pb_id,)
+    ).fetchone()
+    if _pb and _pb[0]:
+        recompute_pi_completion(_pb[0])
 
 # ================= BATCH TRACEABILITY REPORT =================
 # NEW: pulls every stage already captured by the QC engine above (RM receipt →
@@ -4933,13 +6306,21 @@ def get_batch_traceability(batch_no: str) -> dict | None:
         cols = [d[0] for d in cur.description]
         return dict(zip(cols, row, strict=True))
 
+    _formula_vs_actual, _formula_vs_actual_note = compare_formula_vs_actual(pb_id)
+    _pi_id = pb_row.get("production_instruction_id")
+    _instruction = get_production_instruction(_pi_id) if _pi_id else None
+
     return {
         "batch": pb_row,
+        "instruction": _instruction,
+        "formulation": get_batch_formulation(pb_id),
         "materials": materials,
         "process_qc": _one("process_inspection"),
         "fg_qc": _one("fg_inspection"),
         "packing_qc": _one("packing_inspection"),
         "dispatch_qc": _one("dispatch_approval"),
+        "formula_vs_actual": _formula_vs_actual,
+        "formula_vs_actual_note": _formula_vs_actual_note,
         "ncrs": pd.read_sql_query(
             "SELECT * FROM ncr_capa WHERE batch_no = ? ORDER BY id", conn, params=(batch_no,)
         ),
@@ -5115,7 +6496,284 @@ def generate_traceability_pdf(trace: dict) -> bytes | None:
     doc.build(story)
     return buf.getvalue()
 
-# ── Company details used on generated invoices — edit these for your entity ──
+# ── Shared PDF table helper for the three documents below ─────────────────
+def _pdf_kv_table(body, rows: list[tuple[str, str]], col_widths=None) -> "Table":
+    if col_widths is None:
+        col_widths = (45 * mm, 130 * mm)
+    t = Table([[Paragraph(f"<b>{k}</b>", body), Paragraph(str(v), body)] for k, v in rows],
+               colWidths=list(col_widths))
+    t.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#E0D2AE")),
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F3E7D0")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6), ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    return t
+
+def generate_batch_card_pdf(trace: dict) -> bytes | None:
+    """Batch Manufacturing Card — the document that travels with a batch on
+    the floor: what was ordered (formula), what was actually drawn from
+    Stores, who ran it, and the planned-vs-actual output. This is
+    Production/R&D's document, not QC's — QC's own results live in the
+    Test Report (generate_test_report_pdf) and MTC (generate_mtc_pdf)."""
+    if not HAS_REPORTLAB:
+        return None
+    b = trace["batch"]
+    instr = trace.get("instruction")
+    formulation = trace.get("formulation")
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                             topMargin=16 * mm, bottomMargin=16 * mm,
+                             leftMargin=16 * mm, rightMargin=16 * mm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("BCTitle", parent=styles["Title"],
+                                  textColor=colors.HexColor("#2B4C7E"), fontSize=16)
+    h_style = ParagraphStyle("BCH", parent=styles["Heading2"], fontSize=11,
+                              textColor=colors.HexColor("#1C120D"), spaceBefore=10, spaceAfter=4)
+    body = styles["Normal"]
+
+    story = [
+        Paragraph("FCSC — Batch Manufacturing Card", title_style),
+        Paragraph(f"Firstchoice Speciality Chemicals Pvt. Ltd. &nbsp;|&nbsp; "
+                  f"Generated {today_ist().strftime('%d %B %Y')}", body),
+        Spacer(1, 8),
+    ]
+
+    story.append(Paragraph("Batch Details", h_style))
+    story.append(_pdf_kv_table(body, [
+        ("Batch No.", b["batch_no"]), ("Product", fg_label(b["product"])),
+        ("Factory", b["factory"]), ("Status", b["status"]),
+        ("Operator", b["operator"]), ("Machine", b.get("machine") or "—"),
+        ("Shift", b.get("shift") or "—"),
+        ("Started", (b["created_at"] or "")[:16]),
+    ]))
+
+    story.append(Paragraph("Manufacturing Instruction & Formula", h_style))
+    if instr:
+        story.append(_pdf_kv_table(body, [
+            ("Instruction No.", instr["instruction_no"]),
+            ("Planned Quantity", f"{instr['quantity']:g} {instr['quantity_unit']}"),
+            ("Formula Version", f"{instr['formula_version']} ({instr['formula_code'] or 'no code'})"),
+            ("Priority", instr["priority"]),
+            ("Stores Released By",
+             f"{instr.get('stores_released_by') or '—'} "
+             f"({(instr.get('stores_released_at') or '')[:16] or '—'})"),
+        ]))
+    elif formulation:
+        story.append(_pdf_kv_table(body, [
+            ("Formula Version", f"{formulation['version']} ({formulation.get('formula_code') or 'no code'})"),
+            ("Reference Batch Size", f"{formulation['batch_size']:g} {formulation['batch_unit']}"),
+        ]))
+    else:
+        story.append(Paragraph("No linked Production Instruction or formulation on file "
+                                "(legacy / direct-entry batch).", body))
+
+    story.append(Paragraph("Actual Output", h_style))
+    _out_qty = b.get("quantity")
+    story.append(_pdf_kv_table(body, [
+        ("Output Quantity", f"{_out_qty:g} {b.get('quantity_unit') or ''}" if _out_qty else "Not recorded"),
+    ]))
+
+    mdf = trace["materials"]
+    story.append(Paragraph("Raw Materials Drawn from Stores", h_style))
+    if mdf.empty:
+        story.append(Paragraph("No raw materials linked to this batch.", body))
+    else:
+        rows = [["Material", "RM Batch No.", "Supplier", "Qty Used", "Incoming QC"]]
+        for _, r in mdf.iterrows():
+            rows.append([r["material"], r["rm_batch_no"], r["supplier"],
+                         f"{r['qty_used']:g}", r["incoming_decision"] or "—"])
+        mt = Table(rows, colWidths=[38 * mm, 30 * mm, 38 * mm, 22 * mm, 25 * mm])
+        mt.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#E0D2AE")),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2B4C7E")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        story.append(mt)
+
+    story.append(Spacer(1, 14))
+    story.append(Paragraph(
+        "Prepared by Production. This card records what was manufactured and with what "
+        "materials — QC test results are on the separate Test Report / Material Testing "
+        "Certificate for this batch.", body))
+
+    doc.build(story)
+    return buf.getvalue()
+
+def generate_test_report_pdf(trace: dict) -> bytes | None:
+    """QC Test Report — every parameter recorded at every QC checkpoint
+    (incoming RM, in-process, finished good, packing, pre-dispatch) for one
+    batch, with the inspector and decision at each stage. This is the
+    detailed working document QC keeps on file; the MTC (generate_mtc_pdf)
+    is the short customer-facing certificate derived from it."""
+    if not HAS_REPORTLAB:
+        return None
+    b = trace["batch"]
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                             topMargin=16 * mm, bottomMargin=16 * mm,
+                             leftMargin=16 * mm, rightMargin=16 * mm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("TRTitle", parent=styles["Title"],
+                                  textColor=colors.HexColor("#1E6B45"), fontSize=16)
+    h_style = ParagraphStyle("TRH", parent=styles["Heading2"], fontSize=11,
+                              textColor=colors.HexColor("#1C120D"), spaceBefore=10, spaceAfter=4)
+    body = styles["Normal"]
+
+    story = [
+        Paragraph("FCSC — Quality Test Report", title_style),
+        Paragraph(f"Firstchoice Speciality Chemicals Pvt. Ltd. &nbsp;|&nbsp; "
+                  f"Generated {today_ist().strftime('%d %B %Y')}", body),
+        Spacer(1, 8),
+        Paragraph("Batch", h_style),
+        _pdf_kv_table(body, [
+            ("Batch No.", b["batch_no"]), ("Product", fg_label(b["product"])),
+            ("Factory", b["factory"]), ("Status", b["status"]),
+        ]),
+    ]
+
+    mdf = trace["materials"]
+    story.append(Paragraph("Incoming Raw Material Inspection", h_style))
+    if mdf.empty:
+        story.append(Paragraph("No raw materials linked to this batch.", body))
+    else:
+        rows = [["Material", "RM Batch No.", "Supplier", "Received", "Decision"]]
+        for _, r in mdf.iterrows():
+            rows.append([r["material"], r["rm_batch_no"], r["supplier"],
+                         (r["received_date"] or "")[:10], r["incoming_decision"] or "Pending"])
+        it = Table(rows, colWidths=[38 * mm, 30 * mm, 38 * mm, 25 * mm, 22 * mm])
+        it.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#E0D2AE")),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1E6B45")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+        ]))
+        story.append(it)
+
+    stage_specs = [
+        ("Process (In-Process) QC", "process_qc",
+         ["viscosity", "density", "temperature", "appearance", "remarks", "decision", "inspector", "date"]),
+        ("Finished Goods QC", "fg_qc",
+         ["adhesion", "strength", "consistency", "colour", "weight", "decision", "inspector", "date"]),
+        ("Packing QC", "packing_qc",
+         ["correct_bag", "correct_label", "correct_batch", "net_weight_ok", "seal_quality_ok",
+          "decision", "inspector", "date"]),
+        ("Pre-Dispatch Inspection", "dispatch_qc",
+         ["pdi_completed", "approved_by", "date", "status"]),
+    ]
+    for label, key, fields in stage_specs:
+        story.append(Paragraph(label, h_style))
+        rec = trace.get(key)
+        if not rec:
+            story.append(Paragraph("Not yet recorded.", body))
+        else:
+            story.append(_pdf_kv_table(body, [(f.replace("_", " ").title(), rec.get(f, "—")) for f in fields]))
+
+    if not trace["ncrs"].empty:
+        story.append(Paragraph("Non-Conformances Raised During Testing", h_style))
+        rows = [["Stage", "Description", "Status", "Raised"]]
+        for _, n in trace["ncrs"].iterrows():
+            rows.append([n["source_stage"], n["description"][:60], n["status"], (n["raised_at"] or "")[:10]])
+        nt = Table(rows, colWidths=[25 * mm, 90 * mm, 20 * mm, 25 * mm])
+        nt.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#E0D2AE")),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#B3261E")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+        ]))
+        story.append(nt)
+
+    story.append(Spacer(1, 14))
+    story.append(Paragraph(
+        "This report is QC's internal working record of every test performed against this "
+        "batch. For a short customer-facing certificate, see the Material Testing Certificate.",
+        body))
+
+    doc.build(story)
+    return buf.getvalue()
+
+def generate_mtc_pdf(trace: dict) -> bytes | None:
+    """Material Testing Certificate — the short, formal certificate QC signs
+    off for the finished product, suitable to send to a customer alongside
+    dispatch. Summarises the final decision at each QC gate rather than
+    every raw parameter (that detail lives in the Test Report)."""
+    if not HAS_REPORTLAB:
+        return None
+    b = trace["batch"]
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                             topMargin=18 * mm, bottomMargin=18 * mm,
+                             leftMargin=18 * mm, rightMargin=18 * mm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("MTCTitle", parent=styles["Title"],
+                                  textColor=colors.HexColor("#6E1423"), fontSize=18,
+                                  alignment=1)
+    sub_style = ParagraphStyle("MTCSub", parent=styles["Normal"], alignment=1,
+                                textColor=colors.HexColor("#4B5563"))
+    h_style = ParagraphStyle("MTCH", parent=styles["Heading2"], fontSize=11,
+                              textColor=colors.HexColor("#1C120D"), spaceBefore=10, spaceAfter=4)
+    body = styles["Normal"]
+
+    def _stage_decision(key: str) -> str:
+        rec = trace.get(key)
+        if not rec:
+            return "Not yet recorded"
+        return rec.get("decision") or rec.get("status") or "Recorded"
+
+    _overall_ok = all(
+        _stage_decision(k) in ("Pass", "Released", "Recorded")
+        for k in ("process_qc", "fg_qc", "packing_qc")
+        if trace.get(k)
+    ) and bool(trace.get("fg_qc"))
+
+    story = [
+        Paragraph("MATERIAL TESTING CERTIFICATE", title_style),
+        Paragraph("Firstchoice Speciality Chemicals Pvt. Ltd.", sub_style),
+        Paragraph(f"Certificate generated {today_ist().strftime('%d %B %Y')}", sub_style),
+        Spacer(1, 14),
+    ]
+
+    story.append(_pdf_kv_table(body, [
+        ("Batch No.", b["batch_no"]), ("Product", fg_label(b["product"])),
+        ("Factory", b["factory"]), ("Batch Status", b["status"]),
+    ]))
+
+    story.append(Paragraph("Quality Gate Summary", h_style))
+    story.append(_pdf_kv_table(body, [
+        ("Incoming Raw Material QC",
+         "Approved" if not trace["materials"].empty
+         and (trace["materials"]["incoming_decision"] == "Pass").all() else "See Test Report"),
+        ("In-Process QC", _stage_decision("process_qc")),
+        ("Finished Goods QC", _stage_decision("fg_qc")),
+        ("Packing QC", _stage_decision("packing_qc")),
+        ("Pre-Dispatch Inspection", _stage_decision("dispatch_qc")),
+    ]))
+
+    story.append(Spacer(1, 10))
+    if _overall_ok:
+        story.append(Paragraph(
+            "<b>This is to certify that the above batch has been tested at each of the "
+            "quality checkpoints listed above and conforms to the applicable finished-good "
+            "specification.</b>", body))
+    else:
+        story.append(Paragraph(
+            "<b>One or more quality checkpoints for this batch are not yet complete or did "
+            "not pass — see the full Test Report before treating this batch as certified.</b>",
+            body))
+
+    story.append(Spacer(1, 30))
+    sign_row = Table([[
+        Paragraph("_______________________<br/>QC Inspector", body),
+        Paragraph("_______________________<br/>QC Head / Authorised Signatory", body),
+    ]], colWidths=[85 * mm, 85 * mm])
+    sign_row.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")]))
+    story.append(sign_row)
+
+    doc.build(story)
+    return buf.getvalue()
 COMPANY_INFO = {
     "name": "Firstchoice Speciality Chemicals Pvt. Ltd.",
     "address": "Belda, Mogra, Singur & Siliguri, West Bengal, India",
@@ -5409,7 +7067,13 @@ with st.sidebar:
                             _rbk_name = (f"{_rbk_dir}/fcsc_pre_reset_"
                                          f"{now_ist().strftime('%Y%m%d_%H%M%S')}.db")
                             conn.commit()
-                            shutil.copy2("fcsc.db", _rbk_name)
+                            # FIX: was shutil.copy2("fcsc.db", ...) — a relative path
+                            # that no longer points at the live DB (see get_connection /
+                            # _get_db_path). That silently raised FileNotFoundError,
+                            # which — thankfully — was caught below *before* the
+                            # DELETEs ran, so no reset ever completed without a real
+                            # backup; it just always failed with a confusing error.
+                            shutil.copy2(_get_db_path(), _rbk_name)
 
                             # FIX: audit_log is intentionally excluded — wiping the log
                             # in the same action it's supposed to record would erase the
@@ -5490,7 +7154,14 @@ if _is_admin and "db_backed_up" not in st.session_state:
         os.makedirs(_backup_dir, exist_ok=True)
         _backup_name = f"{_backup_dir}/fcsc_{today_ist()}.db"
         if not os.path.exists(_backup_name):
-            shutil.copy2("fcsc.db", _backup_name)
+            # FIX: was shutil.copy2("fcsc.db", ...) — a relative path that no
+            # longer matches where the live DB actually lives (see
+            # get_connection / _get_db_path). Because the failure was only
+            # ever logged via logger.warning below and never surfaced in the
+            # UI, this backup has likely been silently no-oping (or copying
+            # a stale leftover file) since the DB path was moved to
+            # ~/.fcsc_app_data — i.e. no real daily backups were being made.
+            shutil.copy2(_get_db_path(), _backup_name)
             # keep only last 30 daily backups
             _bk_files = sorted([f for f in os.listdir(_backup_dir) if f.endswith(".db")])
             for _old in _bk_files[:-30]:
@@ -5533,22 +7204,31 @@ def get_fg_closing_stock(fac: str, product: str) -> float:
 def record_fg_stock_movement(date_val, fac: str, product: str, *, production_in: float = 0,
                               dispatch_out: float = 0, adjustment: float = 0,
                               source_module: str = "", source_ref_id: int | None = None,
-                              fg_code: str = "", movement_type: str = "Entry") -> float:
+                              fg_code: str = "", movement_type: str = "Entry",
+                              production_batch_id: int | None = None) -> float:
     """Appends one FG stock ledger row and returns the new closing balance.
     Never overwrites a prior row — this is a ledger, not a balance field.
     FIX: read-previous-then-insert now runs inside _write_lock() so two
     concurrent movements for the same factory/product can't both read the
     same previous closing and silently clobber one another (reconciliation
-    review, Section 3)."""
+    review, Section 3).
+    `production_batch_id` (Phase B) is optional and additive: set only when
+    this movement is directly traceable to one QC-tracked production batch
+    (e.g. the Packing-QC-pass auto-post), so Dispatch/reconciliation can
+    trace FG stock back to a specific physical batch rather than just a
+    factory+product+date bucket. NULL for every pre-existing/legacy row and
+    for movements that aren't batch-specific (manual adjustments etc.)."""
     with _write_lock():
         prev = get_fg_closing_stock(fac, product)
         closing = prev + production_in - dispatch_out + adjustment
         cur.execute(
             "INSERT INTO fg_stock (date,factory,product,fg_code,production_in,dispatch_out,"
-            "adjustment,closing_stock,source_module,source_ref_id,created_at,movement_type) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "adjustment,closing_stock,source_module,source_ref_id,created_at,movement_type,"
+            "production_batch_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (str(date_val), fac, product, fg_code, production_in, dispatch_out, adjustment,
-             closing, source_module, source_ref_id, _now_iso(), movement_type)
+             closing, source_module, source_ref_id, _now_iso(), movement_type,
+             production_batch_id)
         )
     return closing
 
@@ -5647,6 +7327,84 @@ def convert_production_qty_to_fg_unit(qty_display: float, product: str) -> tuple
         f"Recorded FG movement in KG as an interim value — set the pack weight in "
         f"Production → ⚙️ FG Stock Unit Settings so this converts correctly."
     )
+
+def convert_batch_qty_to_fg_unit(qty: float, batch_unit: str, product: str) -> tuple[float, bool, str]:
+    """Phase B counterpart to convert_production_qty_to_fg_unit(), for a
+    quantity captured in a production_batches.quantity_unit (one of
+    Bags/Pieces/Drums/KG/MT, chosen by the Production operator at batch
+    creation) rather than the sidebar's global weight-unit selector.
+    Returns (converted_qty, is_exact, note) with the same contract: only
+    weight units (KG/MT) are always safely convertible; a packed unit is
+    only safely posted as-is if it already matches the product's configured
+    FG stock unit, since 'Bags' for one product isn't interchangeable with
+    'Bags' for another without a pack weight — this never guesses."""
+    cfg = get_fg_stock_unit_cfg(product)
+    stock_unit = cfg["stock_unit"]
+    pack_kg = cfg["pack_weight_kg"]
+    bu = (batch_unit or "").strip().lower()
+    su = stock_unit.strip().lower()
+    weight_to_kg = {"kg": 1.0, "kilogram": 1.0, "kilograms": 1.0,
+                     "mt": 1000.0, "tonne": 1000.0, "tonnes": 1000.0, "ton": 1000.0}
+    if bu in weight_to_kg:
+        qty_kg = qty * weight_to_kg[bu]
+        if su in ("kg", "kilogram", "kilograms"):
+            return qty_kg, True, ""
+        if su in ("mt", "metric tonne", "metric tonnes", "tonne", "tonnes", "ton"):
+            return qty_kg / 1000.0, True, ""
+        if pack_kg and pack_kg > 0:
+            return qty_kg / pack_kg, True, ""
+        return qty_kg, False, (
+            f"No pack weight on file for '{product}' (stock unit: {stock_unit}). "
+            f"Recorded batch FG movement in KG as an interim value — set the pack "
+            f"weight in Production → ⚙️ FG Stock Unit Settings."
+        )
+    # Non-weight batch unit (Bags / Pieces / Drums) — only safe to post
+    # directly if it already matches the product's configured stock unit.
+    if bu == su or bu.rstrip("s") == su.rstrip("s"):
+        return qty, True, ""
+    return qty, False, (
+        f"Batch output unit '{batch_unit}' doesn't match {product}'s configured FG "
+        f"stock unit ('{stock_unit}') and isn't a weight unit that auto-converts. "
+        f"Recorded as-is in '{batch_unit}' — verify manually or align the units."
+    )
+
+def record_fg_stock_for_batch(pb_id: int) -> tuple[bool, str]:
+    """Phase B: auto-posts one FG Stock IN ledger row for a QC-traced
+    production batch the moment it passes Packing QC — additive to, not a
+    replacement for, the pre-existing free-form Production-log -> FG Stock
+    posting. Tagged with fg_stock.production_batch_id so Dispatch and
+    reconciliation can trace FG stock back to the exact physical batch it
+    came from, not just a factory+product+date bucket.
+    Idempotent: refuses to double-post if this batch already has an
+    un-reversed FG Stock row under source_module='Packing QC'. Refuses (with
+    a clear message, not a fabricated number) if the batch has no actual
+    output quantity on file — that's operator-entered at batch creation and
+    is never guessed here."""
+    row = cur.execute("SELECT * FROM production_batches WHERE id=?", (pb_id,)).fetchone()
+    if row is None:
+        return False, f"Batch id {pb_id} not found."
+    cols = [d[0] for d in cur.description]
+    pb = dict(zip(cols, row, strict=True))
+    if pb["quantity"] is None or not pb["quantity_unit"]:
+        return False, (
+            f"Batch {pb['batch_no']} has no actual output quantity on file — "
+            f"cannot auto-post FG Stock. Record the batch's output quantity first."
+        )
+    _net = get_fg_source_net("Packing QC", pb_id)
+    if _net["production_in"] or _net["dispatch_out"] or _net["adjustment"]:
+        return False, f"FG Stock already posted for batch {pb['batch_no']} — not posting again."
+    _fg_qty, _exact, _note = convert_batch_qty_to_fg_unit(pb["quantity"], pb["quantity_unit"], pb["product"])
+    _closing = record_fg_stock_movement(
+        today_ist(), pb["factory"], pb["product"],
+        production_in=_fg_qty, source_module="Packing QC", source_ref_id=pb_id,
+        production_batch_id=pb_id
+    )
+    log_audit("INSERT", "fg_stock", pb_id,
+              f"Batch-linked FG Stock IN posted for {pb['batch_no']} ({_fg_qty:g})")
+    _msg = f"✅ FG Stock IN posted for batch {pb['batch_no']}: {_fg_qty:g} (closing {_closing:g})."
+    if not _exact:
+        _msg += f" ⚠️ {_note}"
+    return True, _msg
 
 def log_reconciliation(check_type: str, fac: str, item_code: str, period_start, period_end,
                         qty_a: float, qty_b: float, detail: str = "",
@@ -5831,7 +7589,24 @@ def reconcile_fg_stock(fac_filter: str | None = None) -> list[dict]:
 
 def reconcile_rm_stock(fac_filter: str | None = None) -> list[dict]:
     """Self-check: the latest stock.closing_stock for each factory+material
-    vs an independent re-derivation from the full stock ledger."""
+    vs an independent re-derivation from the full stock ledger, with both
+    sides expressed in the material's base unit.
+
+    FIX (two bugs, both silent):
+    1) "Latest" used to mean `ORDER BY id DESC` — insertion order, not
+       transaction order — same bug as recompute_stock_chain() had. Now
+       matches it: ordered by `date`, then `id` as a same-day tiebreaker.
+    2) This check used to sum `received`/`used` as raw numbers regardless of
+       each row's `unit`, exactly like the thing it's meant to catch — so a
+       factory logging the same material in a mix of KG and Bags would
+       always show "Matched" (both sides wrong the same way), never
+       "Mismatch". Rows are now converted to the material's base unit via
+       convert_material_qty_to_base() before summing. If any row's unit has
+       no conversion factor on file, that material is reported separately
+       as "Unreliable — missing factor" rather than silently folding an
+       unconverted number into the total (which could coincidentally look
+       fine while actually being wrong).
+    """
     results = []
     fac_clause = " AND factory=?" if fac_filter and fac_filter != ALL_FACTORIES else ""
     fac_param  = (fac_filter,) if fac_clause else ()
@@ -5840,18 +7615,41 @@ def reconcile_rm_stock(fac_filter: str | None = None) -> list[dict]:
     ).fetchall()
     for fac, material in pairs:
         recorded_row = cur.execute(
-            "SELECT closing_stock FROM stock WHERE factory=? AND material=? ORDER BY id DESC LIMIT 1",
+            "SELECT closing_stock FROM stock WHERE factory=? AND material=? "
+            "ORDER BY date DESC, id DESC LIMIT 1",
             (fac, material)
         ).fetchone()
         recorded = recorded_row[0] if recorded_row else 0
-        derived_row = cur.execute(
-            "SELECT COALESCE(SUM(received),0) - COALESCE(SUM(used),0) FROM stock "
-            "WHERE factory=? AND material=?", (fac, material)
-        ).fetchone()
-        derived = derived_row[0] if derived_row else 0
+
+        rows = cur.execute(
+            "SELECT received, used, unit FROM stock WHERE factory=? AND material=?",
+            (fac, material)
+        ).fetchall()
+
+        base_unit = get_material_base_unit(material)
+        derived = 0.0
+        unreliable_units = set()
+        for received, used, unit in rows:
+            r_conv, r_ok, _ = convert_material_qty_to_base(material, received or 0, unit)
+            u_conv, u_ok, _ = convert_material_qty_to_base(material, used or 0, unit)
+            if not (r_ok and u_ok):
+                unreliable_units.add(unit or "(no unit)")
+            derived += r_conv - u_conv
+
+        if unreliable_units:
+            detail = (
+                f"UNRELIABLE — no conversion factor on file for unit(s) "
+                f"{', '.join(sorted(unreliable_units))} on material '{material}' "
+                f"(base unit: {base_unit}). Figures below include unconverted "
+                f"values and should not be trusted until factors are set in "
+                f"Stock → 📇 Material Master → ⚖️ Unit Conversion Factors."
+            )
+        else:
+            detail = f"Latest stock.closing_stock vs full-ledger re-derivation, in {base_unit}"
+
         results.append(log_reconciliation(
             "RM_Stock", fac, get_lab_code(material) or material, "-", "-", recorded, derived,
-            "Latest stock.closing_stock vs full-ledger re-derivation"
+            detail
         ))
     return results
 
@@ -5868,8 +7666,7 @@ def run_all_reconciliations(d_start_val, d_end_val, fac_filter: str | None = Non
     }
 
 # ── Customer master ───────────────────────────────────────────────────────
-@st.cache_data(ttl=120)
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def _load_customers_cached(_version: int) -> list[str]:
     df = pd.read_sql_query("SELECT name FROM customers ORDER BY name", conn)
     return df["name"].tolist() if not df.empty else []
@@ -5932,10 +7729,16 @@ def render_batch_detail_page(batch_no: str) -> None:
     b = trace["batch"]
     st.title(f"🧪 Batch {b['batch_no']}")
 
+    _formulation = trace["formulation"]
+
     hc1, hc2, hc3, hc4 = st.columns(4)
     hc1.metric("Product", fg_label(b["product"]))
     hc2.metric("Factory", b["factory"])
-    hc3.metric("Operator", b["operator"] or "—")
+    hc3.metric(
+        "Formula",
+        _formulation["version"] if _formulation else "—",
+        help=f"Formula Code: {_formulation['formula_code'] or '—'}" if _formulation else None,
+    )
     with hc4:
         st.markdown(
             "<div style='font-size:10.5px;color:var(--fc-muted);text-transform:uppercase;"
@@ -5946,13 +7749,82 @@ def render_batch_detail_page(batch_no: str) -> None:
                  "success" if b["status"] == "Dispatched" else "info")
         st.markdown(status_pill(b["status"], _kind), unsafe_allow_html=True)
 
+    if b.get("quantity"):
+        st.caption(f"Output: {b['quantity']:g} {b.get('quantity_unit') or ''}")
+
+    _instruction = trace.get("instruction")
+    if _instruction:
+        st.caption(f"📋 Production Instruction: **{_instruction['instruction_no']}** "
+                   f"— requested {_instruction['quantity']:g} {_instruction['quantity_unit']}")
+    else:
+        st.caption("📋 Legacy production record — no Production Instruction available.")
+
     st.markdown("#### 📍 Timeline")
     render_batch_progress(b["status"])
 
-    tab_rm, tab_prod, tab_qc, tab_disp, tab_cust, tab_docs, tab_audit = st.tabs([
-        "🧱 Raw Materials", "🏭 Production", "✅ QC Report", "🚚 Dispatch History",
-        "🏢 Customer", "📄 Documents", "🕵️ Audit Trail"
+    tab_pi, tab_form, tab_rm, tab_prod, tab_fva, tab_qc, tab_disp, tab_cust, tab_docs, tab_audit = st.tabs([
+        "📋 Production Instruction", "📐 Formulation", "🧱 Raw Materials", "🏭 Production",
+        "⚖️ Formula vs Actual", "✅ QC Report", "🚚 Dispatch History", "🏢 Customer",
+        "📄 Documents", "🕵️ Audit Trail"
     ])
+
+    with tab_pi:
+        if _instruction is None:
+            st.info("Legacy production record — no Production Instruction available. "
+                    "This batch predates the Production Instruction workflow, or was "
+                    "created without one.")
+        else:
+            pic1, pic2, pic3 = st.columns(3)
+            pic1.metric("Instruction No.", _instruction["instruction_no"])
+            pic2.metric("Requested Qty", f"{_instruction['quantity']:g} {_instruction['quantity_unit']}")
+            pic3.metric("Status", _instruction["status"])
+            st.caption(f"Planned Date: {_instruction['planned_date'] or '—'} · "
+                       f"Priority: {_instruction['priority']} · "
+                       f"Created by {_instruction['created_by']} on {(_instruction['created_at'] or '')[:16]}")
+            if _instruction.get("released_by"):
+                st.caption(f"Released by {_instruction['released_by']} on "
+                          f"{(_instruction['released_at'] or '')[:16]}")
+            if _instruction.get("notes"):
+                st.markdown(f"**Notes:** {_instruction['notes']}")
+            _pi_lines = scale_bom_lines(_instruction["bom_id"], _instruction["quantity"])
+            if not _pi_lines.empty:
+                st.markdown("**Approved manufacturing recipe (as instructed):**")
+                st.dataframe(
+                    _pi_lines[["material", "required_qty", "unit"]].rename(
+                        columns={"material": "Material", "required_qty": "Required Qty", "unit": "Unit"}),
+                    width='stretch', hide_index=True
+                )
+
+    with tab_form:
+        if _formulation is None:
+            st.warning(
+                "⚠ Historical formulation link unavailable — this batch has no formula "
+                "on file. This can happen if the batch predates formulation tracking, or "
+                "no active formula existed for this product when it was created."
+            )
+        else:
+            fc1, fc2, fc3 = st.columns(3)
+            fc1.metric("Formula Version", _formulation["version"])
+            fc2.metric("Formula Code", _formulation["formula_code"] or "—")
+            fc3.metric("Reference Batch Size",
+                       f"{_formulation['batch_size']:g} {_formulation['batch_unit']}")
+            if _formulation.get("notes"):
+                st.caption(_formulation["notes"])
+            _flines = _formulation["lines"]
+            if _flines.empty:
+                st.info("This formula has no material lines on file.")
+            else:
+                st.dataframe(
+                    _flines[["material", "qty_per_batch", "unit", "notes"]].rename(columns={
+                        "material": "Material", "qty_per_batch": "Standard Qty",
+                        "unit": "Unit", "notes": "Notes"
+                    }),
+                    width='stretch', hide_index=True
+                )
+            st.caption(
+                "This is the formula that was active when THIS batch was created — it "
+                "will not change even if the product's active formula is updated later."
+            )
 
     with tab_rm:
         if trace["materials"].empty:
@@ -5975,6 +7847,16 @@ def render_batch_detail_page(batch_no: str) -> None:
         with pc2:
             st.markdown(f"**Shift:** {b.get('shift') or '—'}")
             st.markdown(f"**Created:** {(b.get('created_at') or '—')[:16]}")
+
+    with tab_fva:
+        _fva_df = trace["formula_vs_actual"]
+        _fva_note = trace["formula_vs_actual_note"]
+        if _fva_note:
+            st.info(_fva_note)
+        if not _fva_df.empty:
+            st.dataframe(_fva_df, width='stretch', hide_index=True)
+        elif not _fva_note:
+            st.info("No comparison available.")
 
     with tab_qc:
         for _label, _key in [("Process QC", "process_qc"), ("FG QC", "fg_qc"),
@@ -6066,6 +7948,37 @@ def render_batch_detail_page(batch_no: str) -> None:
                 st.image(qr_png, width=140, caption=f"Batch {batch_no}")
             else:
                 st.warning("Install `qrcode` (pip install qrcode[pil]) to enable QR codes.")
+
+        st.markdown("---")
+        st.markdown("#### Batch Card, Test Report & Certificate")
+        if HAS_REPORTLAB:
+            bd1, bd2, bd3 = st.columns(3)
+            with bd1:
+                st.download_button(
+                    "🧾 Batch Card (PDF)",
+                    data=generate_batch_card_pdf(trace),
+                    file_name=f"FCSC_BatchCard_{batch_no}.pdf",
+                    mime="application/pdf", key="batchpage_batchcard_dl",
+                )
+                st.caption("Production's record — formula, operator, materials drawn.")
+            with bd2:
+                st.download_button(
+                    "🧪 Test Report (PDF)",
+                    data=generate_test_report_pdf(trace),
+                    file_name=f"FCSC_TestReport_{batch_no}.pdf",
+                    mime="application/pdf", key="batchpage_testreport_dl",
+                )
+                st.caption("QC's full working record — every parameter, every stage.")
+            with bd3:
+                st.download_button(
+                    "📜 Material Testing Certificate (PDF)",
+                    data=generate_mtc_pdf(trace),
+                    file_name=f"FCSC_MTC_{batch_no}.pdf",
+                    mime="application/pdf", key="batchpage_mtc_dl",
+                )
+                st.caption("Short, signed certificate — suitable for a customer.")
+        else:
+            st.warning("Install `reportlab` (pip install reportlab) to enable PDF export.")
 
     with tab_audit:
         _audit_rows = pd.read_sql_query(
@@ -6878,7 +8791,7 @@ elif module == "Daily Log":
         st.subheader("New Log Entry")
         c1, c2, c3 = st.columns(3)
         with c1:
-            dl_date    = st.date_input("Date", key="dl_d")
+            dl_date    = st.date_input("Date", value=today_ist(), key="dl_d")
             dl_factory = st.selectbox("Factory", FACTORIES, key="dl_f",
                                        index=FACTORIES.index(factory) if factory in FACTORIES else 0)
             dl_cat     = st.selectbox("Category", LOG_CATEGORIES, key="dl_cat")
@@ -7017,22 +8930,341 @@ elif module == "Daily Log":
 elif module == "Production":
 
     st.title("⚙️ Production")
-    _prod_tab_labels = ["➕ Log Production", "📋 Records", "✏️ Edit Record"]
+    _prod_tab_labels = ["🧾 Production Instructions", "📐 Production Metrics",
+                         "⚠️ Legacy Direct Entry", "📋 Records", "✏️ Edit Record"]
     if _is_admin:
         _prod_tab_labels.append("⚙️ FG Stock Unit Settings")
     _prod_tabs = st.tabs(_prod_tab_labels)
-    tab_entry, tab_log, tab_edit_p = _prod_tabs[0], _prod_tabs[1], _prod_tabs[2]
-    tab_fg_units = _prod_tabs[3] if _is_admin else None
+    tab_pi_prod, tab_metrics, tab_entry, tab_log, tab_edit_p = (
+        _prod_tabs[0], _prod_tabs[1], _prod_tabs[2], _prod_tabs[3], _prod_tabs[4]
+    )
+    tab_fg_units = _prod_tabs[5] if _is_admin else None
+
+    # ── PRODUCTION INSTRUCTIONS — "What do I have to make?" ─────────────────
+    # This is the primary UX requirement (Section 8/17/25): Production opens
+    # the app and immediately sees released manufacturing instructions with
+    # product, quantity, factory, formula, and the calculated raw-material
+    # requirement — without ever having to visit the Formulation module.
+    # Production can VIEW the recipe here but never edit it (Section 10) —
+    # there is no editable field on the formula anywhere in this tab.
+    with tab_pi_prod:
+        st.subheader("🧾 What do I have to make?")
+        _pi_prod_factory = None if _is_admin else _user_factory
+        _pi_open = list_production_instructions(
+            factory=_pi_prod_factory,
+            statuses=["Released to Production", "Acknowledged", "In Production"]
+        )
+        if _pi_open.empty:
+            st.success("✅ No Production Instructions currently released and pending execution.")
+        else:
+            for _, _pi_row in _pi_open.iterrows():
+                _pi_id = int(_pi_row["id"])
+                _prog = get_pi_progress(_pi_id)
+                _pi = _prog["pi"]
+                _pi_badge = {"Released to Production": "🟡", "Acknowledged": "🔵",
+                             "In Production": "🟠"}.get(_pi["status"], "")
+                with st.expander(f"{_pi_badge} {_pi['instruction_no']} — {fg_label(_pi['product'])} — "
+                                   f"{_pi['quantity']:g} {_pi['quantity_unit']} @ {_pi['factory']} "
+                                   f"— {_pi['status']}", expanded=(_pi["status"] != "In Production")):
+                    dc1, dc2, dc3, dc4 = st.columns(4)
+                    dc1.metric("Product", fg_label(_pi["product"]))
+                    dc2.metric("Required", f"{_prog['required']:g} {_prog['unit']}")
+                    dc3.metric("Formula", f"{_pi['formula_version']} ({_pi['formula_code'] or 'no code'})")
+                    dc4.metric("Planned Date", _pi["planned_date"] or "—")
+                    st.caption(f"Priority: {_pi['priority']} · Factory: {_pi['factory']}"
+                              + (f" · Notes: {_pi['notes']}" if _pi["notes"] else ""))
+
+                    # ── Aggregate progress (Section 3/32): the PI is the total
+                    # manufacturing requirement, NOT a single physical batch. A
+                    # 10 MT PI can be produced as several independent loads —
+                    # this always reflects ACTUAL output summed across every
+                    # batch linked to this instruction, never planned quantity
+                    # and never just "the last batch created".
+                    pc1, pc2, pc3, pc4 = st.columns(4)
+                    pc1.metric("Produced (actual)", f"{_prog['produced']:g} {_prog['unit']}")
+                    pc2.metric("Remaining", f"{_prog['remaining']:g} {_prog['unit']}")
+                    pc3.metric("Batches so far", _prog["batch_count"])
+                    _cap = _prog["capacity"]
+                    pc4.metric("Load Capacity",
+                               f"{_cap['capacity']:g} {_cap['capacity_unit']}" if _cap else "Not set")
+                    progress_bar("Production progress", _prog["produced"], max(_prog["required"], 1e-9))
+
+                    if not _prog["batches"].empty:
+                        st.markdown("**📦 Production Batches (physical loads) under this instruction:**")
+                        _bshow = _prog["batches"].copy()
+                        _bshow["planned_qty"] = _bshow["planned_qty"].apply(
+                            lambda v: f"{v:g}" if pd.notna(v) else "—")
+                        _bshow["actual_qty"] = _bshow.apply(
+                            lambda r: f"{r['actual_qty']:g} {r['quantity_unit']}" if pd.notna(r["actual_qty"]) else "—",
+                            axis=1)
+                        st.dataframe(
+                            _bshow[["batch_no", "status", "planned_qty", "actual_qty", "created_at"]].rename(
+                                columns={"batch_no": "Batch No.", "status": "Status",
+                                         "planned_qty": "Planned", "actual_qty": "Actual",
+                                         "created_at": "Created"}),
+                            width='stretch', hide_index=True
+                        )
+                        for _, _bb in _prog["batches"].iterrows():
+                            if st.button(f"🔬 Open {_bb['batch_no']} →", key=f"pi_openb_{_pi_id}_{_bb['id']}"):
+                                open_detail_view("batch", _bb["batch_no"])
+
+                    if _is_admin and not _cap:
+                        st.info(f"No blender/load capacity configured for **{fg_label(_pi['product'])}** — "
+                                "Create Next Load will plan the full remaining quantity as one load "
+                                "until a capacity is set below.")
+                        capc1, capc2, capc3 = st.columns([2, 1, 1])
+                        _cap_val = capc1.number_input("Set load capacity", min_value=0.0, step=0.1,
+                                                        key=f"cap_set_{_pi_id}")
+                        _cap_unit = capc2.selectbox("Unit", ["MT", "KG", "L"], key=f"cap_unit_{_pi_id}")
+                        if capc3.button("💾 Save Capacity", key=f"cap_save_{_pi_id}"):
+                            if _cap_val <= 0:
+                                st.warning("Enter a capacity greater than zero.")
+                            else:
+                                _ok, _msg = set_production_capacity(
+                                    _pi["product"], _cap_val, _cap_unit, st.session_state.username)
+                                st.success(_msg) if _ok else st.error(_msg)
+                                st.rerun()
+
+                    st.markdown("**📐 Approved manufacturing recipe (view only):**")
+                    _pi_recipe = scale_bom_lines(_pi["bom_id"], _pi["quantity"])
+                    if _pi_recipe.empty:
+                        st.caption("This formula has no material lines on file.")
+                    else:
+                        st.dataframe(
+                            _pi_recipe[["material", "required_qty", "unit"]].rename(
+                                columns={"material": "Material", "required_qty": "Required Qty", "unit": "Unit"}),
+                            width='stretch', hide_index=True
+                        )
+
+                    if _pi["status"] == "Released to Production":
+                        if st.button("👍 Acknowledge", key=f"pi_ack_{_pi_id}"):
+                            acknowledge_production_instruction(_pi_id)
+                            st.rerun()
+
+                    # ── Create (Next) Production Load (Section 4/30): NOT
+                    # gated to only the instructions that have zero batches so
+                    # far — Production must be able to independently create
+                    # load 2, 3, 4... against the same PI as long as
+                    # Remaining > 0. The old code hid this entirely once
+                    # status flipped to "In Production" after the 1st batch,
+                    # which is exactly the 1:1 bug this phase fixes.
+                    if _pi["status"] in ("Released to Production", "Acknowledged", "In Production") \
+                            and _prog["remaining"] > 1e-9:
+                        st.markdown("---")
+                        _load_label = "🚀 Start Production — Create Batch" if _prog["batch_count"] == 0 \
+                            else "➕ Create Next Production Load"
+                        st.markdown(f"**{_load_label}**")
+                        _stores_ok = bool(int(_pi["stores_released"] or 0))
+                        if not _stores_ok:
+                            st.warning(
+                                "⏳ Waiting on Stores to release raw material/packaging for this "
+                                "instruction (Stock → 🚚 Material Release). Production cannot "
+                                "start a batch until that happens."
+                            )
+                        st.caption("Product, formula and factory are already fixed by this instruction.")
+                        _pif = str(_pi_id)
+                        _planned_next = _prog["next_planned_load"]
+                        st.metric("Planned load for this batch",
+                                  f"{_planned_next:g} {_prog['unit']}",
+                                  help="min(configured load capacity, remaining requirement) — "
+                                       "capped at what's left on this instruction.")
+                        spc1, spc2 = st.columns(2)
+                        with spc1:
+                            sp_operator = st.text_input("Operator", key=f"sp_op_{_pif}")
+                            sp_machine  = st.text_input("Machine", key=f"sp_mc_{_pif}")
+                        with spc2:
+                            sp_shift = st.selectbox("Shift", SHIFTS, key=f"sp_sh_{_pif}")
+                            sp_out_qty = st.number_input(
+                                "Actual Output Quantity", min_value=0.0, step=1.0,
+                                value=0.0, key=f"sp_oq_{_pif}",
+                                help="What this specific load actually produced — may differ from "
+                                     "the planned load above.")
+                        sp_out_unit = st.selectbox("Output Unit", ["Bags", "Pieces", "Drums", "KG", "MT"],
+                                                    key=f"sp_ou_{_pif}")
+
+                        # Phase B: RM picker is scoped to THIS instruction's active
+                        # Stores reservations only — not every QC-Approved batch in
+                        # the factory. Two PIs competing for the same material can no
+                        # longer both draw from the same physical rm_batches row; each
+                        # load can only use what Stores actually reserved against this
+                        # PI, and remaining reserved qty carries over to the next load.
+                        _sp_reserved_rm = pd.read_sql_query(
+                            "SELECT rr.rm_batch_id AS id, rr.material, rb.batch_no, "
+                            "ROUND(rr.reserved_qty - rr.consumed_qty, 4) AS quantity, rr.unit "
+                            "FROM rm_reservations rr JOIN rm_batches rb ON rb.id = rr.rm_batch_id "
+                            "WHERE rr.production_instruction_id=? AND rr.status='Reserved' "
+                            "AND (rr.reserved_qty - rr.consumed_qty) > 0.0001 "
+                            "ORDER BY rr.id",
+                            conn, params=(_pi_id,)
+                        )
+                        if _sp_reserved_rm.empty:
+                            st.warning("No raw material currently reserved against this instruction — "
+                                      "ask Stores to release materials for it (Stock → 🚚 Material "
+                                      "Release), or check whether Stores' release had a shortfall.")
+                            _sp_rm_ids, _sp_qty_map = [], {}
+                        else:
+                            _sp_rm_opts = {
+                                f"RM-{r['id']:05d} — {r['material']} (batch {r['batch_no']}, "
+                                f"{r['quantity']} {r['unit']} reserved.)": r["id"]
+                                for _, r in _sp_reserved_rm.iterrows()
+                            }
+                            _sp_rm_max = {r["id"]: float(r["quantity"]) for _, r in _sp_reserved_rm.iterrows()}
+                            _sp_labels = st.multiselect("Raw Materials Used (reserved for this instruction)",
+                                                          list(_sp_rm_opts.keys()), key=f"sp_rm_{_pif}")
+                            _sp_rm_ids = [_sp_rm_opts[l] for l in _sp_labels]
+                            _sp_qty_map = {}
+                            for rid in _sp_rm_ids:
+                                _lbl = next(l for l, v in _sp_rm_opts.items() if v == rid)
+                                _sp_qty_map[rid] = st.number_input(
+                                    _lbl, min_value=0.0, max_value=_sp_rm_max.get(rid, 0.0),
+                                    step=1.0, key=f"sp_qty_{_pif}_{rid}")
+
+                        if st.button(_load_label, key=f"sp_create_{_pif}", disabled=not _stores_ok):
+                            if not sp_operator.strip():
+                                st.warning("Operator is required.")
+                            elif not _sp_rm_ids:
+                                st.warning("Select at least one QC-Approved raw material batch.")
+                            else:
+                                pb_id, result = create_production_batch(
+                                    _pi["product"], f"{_pi['formula_version']} ({_pi['formula_code']})",
+                                    _pi["factory"], sp_operator.strip(), sp_machine.strip(), sp_shift,
+                                    _sp_rm_ids, _sp_qty_map,
+                                    quantity=(sp_out_qty if sp_out_qty > 0 else None),
+                                    quantity_unit=(sp_out_unit if sp_out_qty > 0 else ""),
+                                    production_instruction_id=_pi_id,
+                                    planned_qty=_planned_next
+                                )
+                                if pb_id is None:
+                                    st.error(result)
+                                else:
+                                    st.success(f"✅ Batch **{result}** created from "
+                                              f"{_pi['instruction_no']} — status: **Production Started**")
+                                    st.rerun()
+                    elif _pi["status"] in ("Released to Production", "Acknowledged", "In Production"):
+                        st.success(f"✅ Produced quantity has reached the Required quantity "
+                                   f"({_prog['produced']:g} / {_prog['required']:g} {_prog['unit']}).")
+
+                    if _is_admin and _pi["status"] in ("Released to Production", "Acknowledged", "In Production") \
+                            and _prog["remaining"] > 1e-9:
+                        with st.expander("🛑 Short Close this Production Instruction (admin)"):
+                            st.caption("Use only when this instruction will never reach its Required "
+                                      "quantity (e.g. a persistent shortage). Already-created batches "
+                                      "and their FG stock are unaffected.")
+                            _sc_reason = st.text_area("Reason (required)", key=f"sc_reason_{_pi_id}")
+                            if st.button("Short Close", key=f"sc_btn_{_pi_id}"):
+                                _ok, _msg = short_close_production_instruction(
+                                    _pi_id, _sc_reason, st.session_state.username)
+                                st.success(_msg) if _ok else st.error(_msg)
+                                if _ok:
+                                    st.rerun()
+
+        st.markdown("---")
+        st.caption("Completed / cancelled / short-closed instructions and full history: see "
+                  "Formulation → Production Instructions." if _is_admin else
+                  "Completed instructions are visible on the linked batch's Batch 360° page.")
+
+    # ── PRODUCTION METRICS / MATERIAL REQUIREMENT CALCULATOR ────────────────
+    # Moved here from Formulation (Architecture Correction, Section 7):
+    # "How much raw material do I need?" is a Production execution question,
+    # not a formulation-design question — R&D defines the recipe (%), and
+    # Production decides how much it wants to manufacture and calculates the
+    # requirement from the Approved formula.
+    with tab_metrics:
+        st.subheader("📐 Material Requirement Calculator")
+        st.caption("Uses the product's Approved/active formulation, scaled to a planned "
+                  "production quantity, and compares against current stock.")
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            fm_calc_product = st.selectbox("Product", FCSC_PRODUCTS, key="fm_calc_product", format_func=fg_label)
+        with fc2:
+            fm_calc_qty = st.number_input("Planned Production Qty", min_value=0.0, step=1.0,
+                                           value=100.0, key="fm_calc_qty")
+        with fc3:
+            fm_calc_fac_opts = ["All Factories"] + FACTORIES
+            fm_calc_factory = st.selectbox("Check stock at", fm_calc_fac_opts, key="fm_calc_factory")
+
+        _fm_bom = get_active_bom(fm_calc_product)
+        if _fm_bom is None:
+            st.info(f"No active formula on file for **{fm_calc_product}** yet." +
+                     (" Add one in Formulation → Manage Formulas." if _is_admin else ""))
+        else:
+            st.caption(f"Using formula **{_fm_bom['version']}** "
+                        f"({_fm_bom['formula_code'] or 'no code'}) — Formulation Size: "
+                        f"{_fm_bom['batch_size']:g} {_fm_bom['batch_unit']}")
+            _fm_fac = None if fm_calc_factory == "All Factories" else fm_calc_factory
+            fm_req_df = calculate_material_requirement(fm_calc_product, fm_calc_qty, _fm_fac)
+            if fm_req_df.empty:
+                st.info("This formula doesn't have any material lines yet.")
+            else:
+                _fm_short = fm_req_df[fm_req_df["shortage"] > 0]
+                rm1, rm2 = st.columns(2)
+                rm1.metric("Materials Needed", len(fm_req_df))
+                rm2.metric("Short on Stock", len(_fm_short))
+                if not _fm_short.empty:
+                    st.warning(f"⚠️ {len(_fm_short)} material(s) don't have enough stock "
+                                f"for this run at the selected scope.")
+                _fm_req_disp = fm_req_df.copy()
+                _fm_req_disp["lab_code"] = _fm_req_disp["material"].apply(get_lab_code)
+                st.dataframe(
+                    _fm_req_disp[["lab_code", "material", "unit", "required_qty",
+                                  "available_qty", "shortage"]].rename(columns={
+                        "lab_code": "Lab Code", "material": "Material", "unit": "Unit",
+                        "required_qty": "Required", "available_qty": "Available", "shortage": "Shortage"
+                    }),
+                    width='stretch', hide_index=True
+                )
+
+                _fm_cost = bom_standard_cost(fm_calc_product)
+                if _fm_cost:
+                    _scaled_cost = _fm_cost * fm_calc_qty / _fm_bom["batch_size"] if _fm_bom["batch_size"] else 0
+                    cst1, cst2 = st.columns(2)
+                    cst1.metric("Standard Cost / Formulation Size", fmt_inr(_fm_cost))
+                    cst2.metric("Estimated Cost for This Run", fmt_inr(_scaled_cost))
+                    st.caption("Only materials with a unit cost on file (Formulation → Manage "
+                                "Formulas → Material Unit Costs) are included — this is a "
+                                "partial estimate until all materials have a cost set.")
+
+                if not _fm_short.empty and st.button(
+                        "🛒 Raise procurement requests for shortages", key="fm_raise_proc"):
+                    _fm_target_factory = _fm_fac or (factory if factory != ALL_FACTORIES else FACTORIES[0])
+                    _fm_raised = []
+                    for _, _row in _fm_short.iterrows():
+                        _rid = _open_procurement_request(
+                            _row["material"], _fm_target_factory, "manual", _row["shortage"],
+                            _row["unit"],
+                            f"Shortage identified via Production Metrics calculator for "
+                            f"{fm_calc_product} (planned qty {fm_calc_qty:g})"
+                        )
+                        _fm_raised.append(_rid)
+                    st.success(f"✅ Raised {len(_fm_raised)} procurement request(s): "
+                                + ", ".join(f"PR-{r:05d}" for r in _fm_raised))
+                    st.rerun()
 
     with tab_entry:
-        st.subheader("New Production Entry")
+        st.subheader("⚠️ Legacy Direct Production Entry")
+        st.caption(
+            "This path predates Production Instructions / Production Batches. It "
+            "writes straight to FG Stock with **no QC gate, no raw-material linkage "
+            "and no batch number** — it should only be used for an explicit "
+            "administrative exception (e.g. correcting an old record), never for "
+            "routine new production. For normal work, use **🧾 Production "
+            "Instructions** above, which enforces QC-approved formulation and "
+            "raw materials end to end."
+        )
+        _legacy_prod_allowed = _is_admin
+        if not _legacy_prod_allowed:
+            st.info("🔒 This legacy entry path is restricted to Administrators. "
+                    "Use Production Instructions → Start Production instead.")
         c1, c2, c3 = st.columns(3)
         with c1:
-            pr_date    = st.date_input("Date", key="pr_d")
+            pr_date    = st.date_input("Date", value=today_ist(), key="pr_d", disabled=not _legacy_prod_allowed)
             pr_factory = st.selectbox("Factory", FACTORIES, key="pr_f",
-                                       index=FACTORIES.index(factory) if factory in FACTORIES else 0)
-            pr_product = st.selectbox("Product", FCSC_PRODUCTS, key="pr_p", format_func=fg_label)
-            pr_custom  = st.text_input("Custom name (if 'Other / Custom')", key="pr_cust")
+                                       index=FACTORIES.index(factory) if factory in FACTORIES else 0,
+                                       disabled=not _legacy_prod_allowed)
+            pr_product = st.selectbox("Product", FCSC_PRODUCTS, key="pr_p", format_func=fg_label,
+                                       disabled=not _legacy_prod_allowed)
+            pr_custom  = st.text_input("Custom name (if 'Other / Custom')", key="pr_cust",
+                                        disabled=not _legacy_prod_allowed)
         with c2:
             pr_labour  = st.number_input("Labour (workers)", min_value=0, step=1, key="pr_l")
             pr_hours   = st.number_input("Hours worked", min_value=0.0, step=0.5, key="pr_h")
@@ -7049,12 +9281,77 @@ elif module == "Production":
                 progress_bar("Target achievement", pr_display, pr_target,
                              color="#145C3C" if pct >= 80 else "#A8791E" if pct >= 50 else "#6E1423")
 
-        if st.button("💾 Save Production"):
+        # Recipe visibility for the production team: the QC Head sets the
+        # active formula in Formulation → Manage Formulas; this shows it
+        # read-only wherever the product is selected here, so the team
+        # knows exactly what to manufacture before logging output. This is
+        # a live lookup of today's active BOM (not linked/snapshotted to
+        # this production entry) — the daily `production` log has no batch
+        # identity to attach a historical formula reference to; batch-level
+        # historical linkage is handled separately in Quality → Production
+        # Batch / Batch 360°.
+        if pr_product != "Other / Custom":
+            _pr_bom = get_active_bom(pr_product)
+            if _pr_bom is None:
+                st.warning(f"⚠ No active formulation found for **{fg_label(pr_product)}**.")
+            else:
+                st.info(f"📐 Active Formula: **{_pr_bom['version']}** "
+                        f"({_pr_bom['formula_code'] or 'no code'}) — reference batch "
+                        f"{_pr_bom['batch_size']:g} {_pr_bom['batch_unit']}")
+                with st.expander(f"📐 View Recipe — {fg_label(pr_product)}"):
+                    _pr_bom_lines = get_bom_lines(_pr_bom["id"])
+                    if _pr_bom_lines.empty:
+                        st.caption("This formula has no material lines on file.")
+                    else:
+                        st.dataframe(
+                            _pr_bom_lines[["material", "qty_per_batch", "unit", "notes"]]
+                                .rename(columns={"material": "Material",
+                                                  "qty_per_batch": "Standard Qty",
+                                                  "unit": "Unit", "notes": "Notes"}),
+                            width='stretch', hide_index=True
+                        )
+
+        # Cross-pipeline guard: this legacy path posts an independent FG Stock
+        # IN, additive to (not a replacement for) the batch-linked IN that
+        # Packing QC already auto-posts (Phase B). If this product/factory
+        # already has QC-tracked production batches, that's a strong signal
+        # the same physical output could already be getting counted through
+        # the proper pipeline — an audit flagged this as the single biggest
+        # FG-stock integrity risk in the app, so it needs an explicit,
+        # informed confirmation rather than a silent second posting. Shown
+        # above the button (not inside its click-handler) so the checkbox
+        # actually persists across the rerun it triggers.
+        _pr_final_preview = pr_custom.strip() if pr_product == "Other / Custom" and pr_custom.strip() else pr_product
+        _qc_batch_count = 0
+        if _pr_final_preview and _pr_final_preview != "Other / Custom":
+            _qc_batch_count = cur.execute(
+                "SELECT COUNT(*) FROM production_batches WHERE product=? AND factory=?",
+                (_pr_final_preview, pr_factory)
+            ).fetchone()[0]
+        _cross_pipeline_ok = True
+        if _qc_batch_count > 0:
+            st.warning(
+                f"⚠️ **{_pr_final_preview}** at **{pr_factory}** already has "
+                f"{_qc_batch_count} QC-tracked Production Batch(es) on file. This legacy entry "
+                f"adds its own separate FG Stock IN — if this output was already (or will be) "
+                f"produced through a Production Instruction → Batch → Packing QC, saving this "
+                f"too will double-count it in FG Stock."
+            )
+            _cross_pipeline_ok = st.checkbox(
+                "I confirm this is genuinely separate output (e.g. a historical correction, or "
+                "a run outside the QC pipeline) — not already counted through a Production Batch.",
+                key="pr_cross_pipeline_confirm"
+            )
+
+        if st.button("💾 Save Production", disabled=not _legacy_prod_allowed):
             final_product = pr_custom.strip() if pr_product == "Other / Custom" and pr_custom.strip() else pr_product
             if not final_product or final_product == "Other / Custom":
                 st.warning("Please enter a product name.")
             elif not pr_labour or not pr_hours:
                 st.warning("Labour and hours are required to calculate efficiency.")
+            elif not _cross_pipeline_ok:
+                st.warning("Confirm the checkbox above to proceed, or use 🧾 Production "
+                           "Instructions instead for QC-tracked output.")
             else:
                 # Duplicate guard: same date + factory + product
                 dup = pd.read_sql_query(
@@ -7303,79 +9600,35 @@ elif module == "Formulation":
         unsafe_allow_html=True,
     )
 
-    _fm_tab_labels = ["📐 Requirement Calculator", "📋 Active Formulations"]
-    if _is_admin:
+    # Department gating (Section 6/17): R&D and QC both need to see this
+    # module (R&D creates/revises formulas, QC approves them and releases
+    # Production Instructions) -- Production/Stores/Sales/Dispatch accounts
+    # only get the read-only calculator/active-formulations tabs. Admin and
+    # legacy 'All' factory-supervisor accounts keep seeing everything, same
+    # as before this change.
+    _fm_show_pi     = _dept_allows("RD", "QC")
+    _fm_show_manage = _dept_allows("RD", "QC")
+    _fm_tab_labels = ["📋 Active Formulations"]
+    if _fm_show_pi:
+        _fm_tab_labels.append("🧾 Production Instructions")
+    if _fm_show_manage:
         _fm_tab_labels.append("✏️ Manage Formulas")
     _fm_tabs = st.tabs(_fm_tab_labels)
-    tab_fm_calc, tab_fm_view = _fm_tabs[0], _fm_tabs[1]
-    tab_fm_manage = _fm_tabs[2] if _is_admin else None
+    tab_fm_view = _fm_tabs[0]
+    _fm_next_idx = 1
+    tab_fm_pi = None
+    if _fm_show_pi:
+        tab_fm_pi = _fm_tabs[_fm_next_idx]
+        _fm_next_idx += 1
+    tab_fm_manage = None
+    if _fm_show_manage:
+        tab_fm_manage = _fm_tabs[_fm_next_idx]
+        _fm_next_idx += 1
 
-    # ── REQUIREMENT CALCULATOR ──────────────────────────────────────────────
-    with tab_fm_calc:
-        st.subheader("Material Requirement Calculator")
-        fc1, fc2, fc3 = st.columns(3)
-        with fc1:
-            fm_calc_product = st.selectbox("Product", FCSC_PRODUCTS, key="fm_calc_product", format_func=fg_label)
-        with fc2:
-            fm_calc_qty = st.number_input("Planned Production Qty", min_value=0.0, step=1.0,
-                                           value=100.0, key="fm_calc_qty")
-        with fc3:
-            fm_calc_fac_opts = ["All Factories"] + FACTORIES
-            fm_calc_factory = st.selectbox("Check stock at", fm_calc_fac_opts, key="fm_calc_factory")
-
-        _fm_bom = get_active_bom(fm_calc_product)
-        if _fm_bom is None:
-            st.info(f"No active formula on file for **{fm_calc_product}** yet." +
-                     (" Add one in ✏️ Manage Formulas." if _is_admin else ""))
-        else:
-            st.caption(f"Using formula **{_fm_bom['version']}** "
-                        f"({_fm_bom['formula_code'] or 'no code'}) — reference batch: "
-                        f"{_fm_bom['batch_size']:g} {_fm_bom['batch_unit']}")
-            _fm_fac = None if fm_calc_factory == "All Factories" else fm_calc_factory
-            fm_req_df = calculate_material_requirement(fm_calc_product, fm_calc_qty, _fm_fac)
-            if fm_req_df.empty:
-                st.info("This formula doesn't have any material lines yet.")
-            else:
-                _fm_short = fm_req_df[fm_req_df["shortage"] > 0]
-                rm1, rm2 = st.columns(2)
-                rm1.metric("Materials Needed", len(fm_req_df))
-                rm2.metric("Short on Stock", len(_fm_short))
-                if not _fm_short.empty:
-                    st.warning(f"⚠️ {len(_fm_short)} material(s) don't have enough stock "
-                                f"for this run at the selected scope.")
-                st.dataframe(
-                    fm_req_df.rename(columns={
-                        "material": "Material", "unit": "Unit", "required_qty": "Required",
-                        "available_qty": "Available", "shortage": "Shortage"
-                    }),
-                    width='stretch', hide_index=True
-                )
-
-                _fm_cost = bom_standard_cost(fm_calc_product)
-                if _fm_cost:
-                    _scaled_cost = _fm_cost * fm_calc_qty / _fm_bom["batch_size"] if _fm_bom["batch_size"] else 0
-                    cst1, cst2 = st.columns(2)
-                    cst1.metric("Standard Cost / Reference Batch", fmt_inr(_fm_cost))
-                    cst2.metric("Estimated Cost for This Run", fmt_inr(_scaled_cost))
-                    st.caption("Only materials with a unit cost on file (Manage Formulas → "
-                                "Material Unit Costs) are included — this is a partial estimate "
-                                "until all materials have a cost set.")
-
-                if not _fm_short.empty and st.button(
-                        "🛒 Raise procurement requests for shortages", key="fm_raise_proc"):
-                    _fm_target_factory = _fm_fac or (factory if factory != ALL_FACTORIES else FACTORIES[0])
-                    _fm_raised = []
-                    for _, _row in _fm_short.iterrows():
-                        _rid = _open_procurement_request(
-                            _row["material"], _fm_target_factory, "manual", _row["shortage"],
-                            _row["unit"],
-                            f"Shortage identified via Formulation calculator for "
-                            f"{fm_calc_product} (planned qty {fm_calc_qty:g})"
-                        )
-                        _fm_raised.append(_rid)
-                    st.success(f"✅ Raised {len(_fm_raised)} procurement request(s): "
-                                + ", ".join(f"PR-{r:05d}" for r in _fm_raised))
-                    st.rerun()
+    # NOTE: the Material Requirement Calculator ("How much RM do I need for
+    # a planned production quantity?") has moved to Production → 📐
+    # Production Metrics. R&D defines the recipe here; Production decides
+    # how much it will manufacture and calculates requirement from there.
 
     # ── ACTIVE FORMULATIONS (read-only view) ────────────────────────────────
     with tab_fm_view:
@@ -7395,9 +9648,12 @@ elif module == "Formulation":
                     if _fm_lines.empty:
                         st.caption("No material lines.")
                     else:
+                        _fm_lines_disp = _fm_lines.copy()
+                        _fm_lines_disp["lab_code"] = _fm_lines_disp["material"].apply(get_lab_code)
                         st.dataframe(
-                            _fm_lines[["material", "qty_per_batch", "unit", "notes"]]
-                                .rename(columns={"material": "Material", "qty_per_batch": "Qty/Batch",
+                            _fm_lines_disp[["lab_code", "material", "percent", "qty_per_batch", "unit", "notes"]]
+                                .rename(columns={"lab_code": "Lab Code", "material": "Material",
+                                                  "percent": "%", "qty_per_batch": "Qty/Batch",
                                                   "unit": "Unit", "notes": "Notes"}),
                             width='stretch', hide_index=True
                         )
@@ -7405,13 +9661,226 @@ elif module == "Formulation":
                     if _fm_view_cost:
                         st.metric("Standard Cost / Batch", fmt_inr(_fm_view_cost))
 
+    # ── PRODUCTION INSTRUCTIONS (R&D-authorized only) ────────────────────────
+    # R&D defines WHAT should be manufactured — product, quantity, factory,
+    # and the exact Approved formula version to use — then releases it to
+    # Production. This is R&D's instruction / planned manufacturing
+    # requirement, translating a Sales commercial requirement into a
+    # concrete formulation + quantity for Production to execute. QC is not
+    # part of this decision: QC's role stays raw-material/finished-product
+    # testing and formula approval (see Version History below) — QC does
+    # not decide what product/quantity Production is supposed to make. The
+    # tab is still visible to QC (read-only) since QC needs to see which
+    # Approved formula version an instruction was issued against, but only
+    # R&D (or Admin/'All') can create, release, or cancel an instruction.
+    # Production never has to search the Formulation module for this
+    # (Section 17); it appears directly in their Production module.
+    _pi_can_create = _dept_allows("RD")
+    if tab_fm_pi is not None:
+        with tab_fm_pi:
+            if not _pi_can_create:
+                st.caption("🔒 Only R&D can create, release, or cancel a Production "
+                           "Instruction. QC can view instructions here but does not "
+                           "define what Production is to manufacture.")
+            # ── Sales orders waiting on a Production Instruction ─────────────
+            # NEW: closes "sales generates PO → production → R&D" — Sales
+            # forwards an order (Sales → To Production tab), it lands here,
+            # and picking one pre-fills the form below and snapshots the
+            # link (sales_order_id) onto the instruction once created.
+            _pi_pending_so = get_sales_orders_pending_production()
+            if not _pi_pending_so.empty:
+                st.markdown("#### 📥 Pending from Sales")
+                st.caption("Forwarded by Sales, waiting for a formula/quantity to be locked in.")
+                for _, _pso in _pi_pending_so.iterrows():
+                    psc1, psc2 = st.columns([5, 1])
+                    with psc1:
+                        st.markdown(
+                            f"**Order #{_pso['id']:05d}** — {_pso['customer']} — "
+                            f"{fg_label(_pso['product'])} ({_pso['qty']:g} units) — {_pso['factory']}"
+                        )
+                    with psc2:
+                        if st.button("Use ➡️", key=f"pi_use_so_{_pso['id']}", disabled=not _pi_can_create):
+                            st.session_state["pi_pending_so_id"] = int(_pso["id"])
+                            if _pso["product"] in FCSC_PRODUCTS:
+                                st.session_state["pi_product"] = _pso["product"]
+                            if _pso["factory"] in FACTORIES:
+                                st.session_state["pi_factory"] = _pso["factory"]
+                            st.session_state["pi_qty"] = float(_pso["qty"])
+                            st.rerun()
+                st.markdown("---")
+
+            _pi_linked_so_id = st.session_state.get("pi_pending_so_id")
+            if _pi_linked_so_id:
+                st.info(f"📎 This instruction will be linked to Sales Order "
+                        f"**#{_pi_linked_so_id:05d}**.")
+                if st.button("✖️ Unlink from this order", key="pi_unlink_so"):
+                    st.session_state.pop("pi_pending_so_id", None)
+                    st.rerun()
+
+            st.subheader("🧾 Create a Production Instruction")
+            st.caption("Only an **Approved** formula version can be selected — draft or "
+                       "superseded formulas cannot be issued for production.")
+
+            pi1, pi2, pi3 = st.columns(3)
+            with pi1:
+                pi_product = st.selectbox("Product", [p for p in FCSC_PRODUCTS if p != "Other / Custom"],
+                                            key="pi_product", format_func=fg_label)
+                _pi_approved = get_approved_boms(pi_product)
+            with pi2:
+                if _pi_approved.empty:
+                    st.warning("No Approved formula on file for this product yet.")
+                    pi_bom_id = None
+                else:
+                    _pi_bom_opts = {
+                        f"{r['version']} ({r['formula_code'] or 'no code'})": r["id"]
+                        for _, r in _pi_approved.iterrows()
+                    }
+                    _pi_bom_label = st.selectbox("Approved Formula / Version",
+                                                   list(_pi_bom_opts.keys()), key="pi_bom_pick")
+                    pi_bom_id = _pi_bom_opts[_pi_bom_label]
+            with pi3:
+                pi_factory = st.selectbox("Factory", FACTORIES, key="pi_factory")
+
+            pi4, pi5, pi6 = st.columns(3)
+            with pi4:
+                pi_qty = st.number_input("Quantity to Produce", min_value=0.0, step=10.0,
+                                          value=0.0, key="pi_qty")
+            with pi5:
+                pi_unit = st.selectbox("Quantity Unit", ["KG", "MT", "Litres", "Bags"], key="pi_unit")
+            with pi6:
+                pi_planned_date = st.date_input("Planned / Requested Date", value=today_ist(), key="pi_planned_date")
+
+            pi7, pi8 = st.columns([1, 2])
+            with pi7:
+                pi_priority = st.selectbox("Priority", ["Normal", "High", "Urgent"], key="pi_priority")
+            with pi8:
+                pi_notes = st.text_input("Instructions / Notes", key="pi_notes")
+
+            if pi_bom_id is not None and pi_qty > 0:
+                st.markdown("**Preview — scaled manufacturing recipe:**")
+                _pi_preview = scale_bom_lines(pi_bom_id, pi_qty)
+                if _pi_preview.empty:
+                    st.caption("This formula has no material lines on file.")
+                else:
+                    st.dataframe(
+                        _pi_preview[["material", "required_qty", "unit"]].rename(
+                            columns={"material": "Material", "required_qty": "Required Qty", "unit": "Unit"}),
+                        width='stretch', hide_index=True
+                    )
+
+            pib1, pib2 = st.columns(2)
+            with pib1:
+                if st.button("💾 Save as Draft", key="pi_save_draft", disabled=not _pi_can_create):
+                    if pi_bom_id is None:
+                        st.warning("Select an Approved formula first.")
+                    elif pi_qty <= 0:
+                        st.warning("Quantity to produce must be greater than zero.")
+                    else:
+                        pi_id, msg = create_production_instruction(
+                            pi_product, pi_bom_id, pi_qty, pi_unit, pi_factory,
+                            pi_planned_date, pi_priority, pi_notes,
+                            sales_order_id=_pi_linked_so_id
+                        )
+                        if pi_id is None:
+                            st.error(msg)
+                        else:
+                            st.session_state.pop("pi_pending_so_id", None)
+                            st.success(f"✅ Saved **{msg}** as Draft.")
+                            st.rerun()
+            with pib2:
+                if st.button("🚀 Save & Release to Production", key="pi_save_release",
+                              disabled=not _pi_can_create):
+                    if pi_bom_id is None:
+                        st.warning("Select an Approved formula first.")
+                    elif pi_qty <= 0:
+                        st.warning("Quantity to produce must be greater than zero.")
+                    else:
+                        pi_id, msg = create_production_instruction(
+                            pi_product, pi_bom_id, pi_qty, pi_unit, pi_factory,
+                            pi_planned_date, pi_priority, pi_notes,
+                            sales_order_id=_pi_linked_so_id
+                        )
+                        if pi_id is None:
+                            st.error(msg)
+                        else:
+                            release_production_instruction(pi_id)
+                            st.session_state.pop("pi_pending_so_id", None)
+                            st.success(f"✅ **{msg}** released to Production.")
+                            st.rerun()
+
+            st.markdown("---")
+            st.subheader("All Production Instructions")
+            _pi_all = list_production_instructions()
+            if _pi_all.empty:
+                st.info("No Production Instructions created yet.")
+            else:
+                for _, _pi_row in _pi_all.iterrows():
+                    _pi_id = int(_pi_row["id"])
+                    _prog = get_pi_progress(_pi_id)
+                    _pi = _prog["pi"]
+                    with st.expander(f"{_pi['instruction_no']} — {fg_label(_pi['product'])} @ "
+                                       f"{_pi['factory']} — {_pi['status']}"):
+                        ic1, ic2, ic3, ic4 = st.columns(4)
+                        ic1.metric("Required", f"{_prog['required']:g} {_prog['unit']}")
+                        ic2.metric("Formula", _pi["formula_version"] or "—")
+                        ic3.metric("Planned Date", _pi["planned_date"] or "—")
+                        ic4.metric("Priority", _pi["priority"])
+                        if _pi["notes"]:
+                            st.caption(f"Notes: {_pi['notes']}")
+                        if _pi["status"] == "Short Closed":
+                            st.error(f"🛑 Short Closed by {_pi['short_closed_by']} on "
+                                     f"{(_pi['short_closed_at'] or '')[:16]}: {_pi['short_close_reason']}")
+                        if _pi["status"] == "Draft":
+                            if st.button("🚀 Release to Production", key=f"pi_release_{_pi_id}",
+                                          disabled=not _pi_can_create):
+                                release_production_instruction(_pi_id)
+                                st.success(f"✅ {_pi['instruction_no']} released to Production.")
+                                st.rerun()
+                            if st.button("🚫 Cancel", key=f"pi_cancel_{_pi_id}",
+                                          disabled=not _pi_can_create):
+                                cancel_production_instruction(_pi_id)
+                                st.rerun()
+                        else:
+                            # Section 3/32: this PI may have MANY linked
+                            # Production Batches — show Produced/Remaining
+                            # across all of them, not just the most recent one.
+                            pc1, pc2, pc3 = st.columns(3)
+                            pc1.metric("Produced (actual)", f"{_prog['produced']:g} {_prog['unit']}")
+                            pc2.metric("Remaining", f"{_prog['remaining']:g} {_prog['unit']}")
+                            pc3.metric("Batches", _prog["batch_count"])
+                            if not _prog["batches"].empty:
+                                _bshow = _prog["batches"].copy()
+                                _bshow["planned_qty"] = _bshow["planned_qty"].apply(
+                                    lambda v: f"{v:g}" if pd.notna(v) else "—")
+                                _bshow["actual_qty"] = _bshow.apply(
+                                    lambda r: f"{r['actual_qty']:g} {r['quantity_unit']}"
+                                    if pd.notna(r["actual_qty"]) else "—", axis=1)
+                                st.dataframe(
+                                    _bshow[["batch_no", "status", "planned_qty", "actual_qty"]].rename(
+                                        columns={"batch_no": "Batch No.", "status": "Status",
+                                                 "planned_qty": "Planned", "actual_qty": "Actual"}),
+                                    width='stretch', hide_index=True
+                                )
+                                for _, _bb in _prog["batches"].iterrows():
+                                    if st.button(f"🔬 Open {_bb['batch_no']} →",
+                                                 key=f"pi_openbatch_{_pi_id}_{_bb['id']}"):
+                                        open_detail_view("batch", _bb["batch_no"])
+                            else:
+                                st.caption("No Production Batches created against this instruction yet.")
+
     # ── MANAGE FORMULAS (admin only) ────────────────────────────────────────
     if tab_fm_manage is not None:
         with tab_fm_manage:
             st.subheader("✏️ Create / Update a Formulation")
-            st.caption("Saving a new version becomes the active formula for that product "
-                        "immediately — the previous version is kept, not deleted, so old "
-                        "batches still trace back to whichever formula was active then.")
+            st.caption("Creating a new version starts as a **Draft** with no material lines — "
+                        "add materials below by **Percentage** of the Formulation Size. It does "
+                        "not become the active/approved formula until it's Approved (Version "
+                        "History) and passes validation. Older versions are kept, never deleted, "
+                        "so old batches and instructions still trace back to whichever formula "
+                        "was approved then.")
+
+            # Section 6: only R&D (or Admin/'All') creates/revises formulas.
+            _fm_can_create = _dept_allows("RD")
 
             mb1, mb2, mb3 = st.columns(3)
             with mb1:
@@ -7424,57 +9893,186 @@ elif module == "Formulation":
                 mb_code    = st.text_input("Formula Code", key="fm_mgmt_code",
                                             placeholder="e.g. TG3.0-STD")
             with mb3:
-                mb_batch_size = st.number_input("Reference Batch Size", min_value=0.01,
-                                                  value=100.0, step=1.0, key="fm_mgmt_size")
-                mb_batch_unit = st.selectbox("Batch Unit", ["KG", "MT", "Litres", "Bags"],
+                mb_batch_size = st.number_input("Formulation Size", min_value=0.01,
+                                                  value=100.0, step=1.0, key="fm_mgmt_size",
+                                                  help="Standard formulation size — material "
+                                                       "lines below are entered as a % of this.")
+                mb_batch_unit = st.selectbox("Unit", ["KG", "MT", "Litres", "Bags"],
                                                key="fm_mgmt_unit")
             mb_notes = st.text_area("Notes", key="fm_mgmt_notes")
 
-            st.markdown("#### Material Lines")
-            if "fm_line_count" not in st.session_state:
-                st.session_state.fm_line_count = 3
-            bl1, bl2 = st.columns([1, 5])
-            with bl1:
-                if st.button("➕ Add Line", key="fm_add_line"):
-                    st.session_state.fm_line_count += 1
-                    st.rerun()
-
-            fm_lines_input = []
-            for _i in range(st.session_state.fm_line_count):
-                lc1, lc2, lc3, lc4 = st.columns([3, 1.5, 1, 2])
-                _show_labels = (_i == 0)
-                with lc1:
-                    _m = st.selectbox("Material", MATERIALS, key=f"fm_line_mat_{_i}",
-                                       format_func=material_label,
-                                       label_visibility="visible" if _show_labels else "collapsed")
-                with lc2:
-                    _q = st.number_input("Qty/Batch", min_value=0.0, step=0.1, key=f"fm_line_qty_{_i}",
-                                          label_visibility="visible" if _show_labels else "collapsed")
-                with lc3:
-                    _u = st.selectbox("Unit", ["KG", "Litres", "MT", "Bags", "Units"],
-                                       key=f"fm_line_unit_{_i}",
-                                       label_visibility="visible" if _show_labels else "collapsed")
-                with lc4:
-                    _n = st.text_input("Notes", key=f"fm_line_notes_{_i}",
-                                        label_visibility="visible" if _show_labels else "collapsed")
-                if _q > 0:
-                    fm_lines_input.append({"material": _m, "qty_per_batch": _q, "unit": _u, "notes": _n})
-
-            if st.button("💾 Save Formulation", key="fm_save"):
-                ok, msg, bom_id = create_bom(mb_product, mb_version, mb_code, mb_batch_size,
-                                               mb_batch_unit, mb_notes, fm_lines_input)
+            if not _fm_can_create:
+                st.caption("🔒 Only R&D can create or revise a formulation.")
+            if st.button("➕ Create New Formulation Version (Draft)", key="fm_save",
+                         disabled=not _fm_can_create):
+                ok, msg, bom_id = create_bom_header(mb_product, mb_version, mb_code,
+                                                     mb_batch_size, mb_batch_unit, mb_notes)
                 if ok:
-                    _activate_bom(bom_id, mb_product)
-                    st.success(f"✅ {msg} Set as the active formula for {mb_product}.")
-                    st.session_state.fm_line_count = 3
+                    st.success(f"✅ {msg}")
+                    st.session_state["fm_active_bom_id"] = bom_id
+                    st.session_state.pop("fm_editing_line_id", None)
                     st.rerun()
                 else:
                     st.error(msg)
 
+            # ── MATERIAL LINES — Lab Code | Material | % | Qty | Unit | Edit/Delete ──
+            st.markdown("---")
+            st.markdown("#### Material Lines")
+
+            _fm_draft_hist = pd.read_sql_query(
+                "SELECT id, version, formula_code, status, created_at FROM bom_headers "
+                "WHERE product=? AND status='Draft' ORDER BY id DESC",
+                conn, params=(mb_product,)
+            )
+            if _fm_draft_hist.empty:
+                st.info("No Draft formulation for this product yet — create one above, "
+                        "then add its material lines here.")
+                _fm_edit_bom_id = None
+            else:
+                _fm_draft_opts = {
+                    f"{r['version']} ({r['formula_code'] or 'no code'}) — created {r['created_at']}": r["id"]
+                    for _, r in _fm_draft_hist.iterrows()
+                }
+                _fm_default_bom_id = st.session_state.get("fm_active_bom_id")
+                _fm_draft_ids = list(_fm_draft_opts.values())
+                _fm_default_idx = (_fm_draft_ids.index(_fm_default_bom_id)
+                                    if _fm_default_bom_id in _fm_draft_ids else 0)
+                _fm_edit_label = st.selectbox("Editing Draft version", list(_fm_draft_opts.keys()),
+                                               index=_fm_default_idx, key="fm_edit_draft_pick")
+                _fm_edit_bom_id = _fm_draft_opts[_fm_edit_label]
+                st.session_state["fm_active_bom_id"] = _fm_edit_bom_id
+
+            if _fm_edit_bom_id is not None:
+                _fm_edit_bom = get_bom(_fm_edit_bom_id)
+                _fm_edit_lines = get_bom_lines(_fm_edit_bom_id)
+
+                st.caption(f"Formulation Size = **{_fm_edit_bom['batch_size']:g} "
+                          f"{_fm_edit_bom['batch_unit']}**")
+
+                _fm_editing_line_id = st.session_state.get("fm_editing_line_id")
+
+                if _fm_edit_lines.empty:
+                    st.caption("No material lines yet — add the first one below.")
+                else:
+                    for _, _ln in _fm_edit_lines.iterrows():
+                        _ln_id = int(_ln["id"])
+                        if _fm_editing_line_id == _ln_id:
+                            # ── inline EDIT form for this one line ──
+                            ec1, ec2, ec3, ec4 = st.columns([3, 1.3, 1, 2])
+                            with ec1:
+                                _e_mat_idx = MATERIALS.index(_ln["material"]) if _ln["material"] in MATERIALS else 0
+                                _e_mat = st.selectbox("Material", MATERIALS, index=_e_mat_idx,
+                                                       format_func=material_label, key=f"fm_e_mat_{_ln_id}")
+                            with ec2:
+                                _e_pct = st.number_input("%", min_value=0.0, step=0.5,
+                                                          value=float(_ln["percent"] or 0),
+                                                          key=f"fm_e_pct_{_ln_id}")
+                            with ec3:
+                                _e_units = ["KG", "Litres", "MT", "Bags", "Units"]
+                                _e_u_idx = _e_units.index(_ln["unit"]) if _ln["unit"] in _e_units else 0
+                                _e_unit = st.selectbox("Unit", _e_units, index=_e_u_idx, key=f"fm_e_unit_{_ln_id}")
+                            with ec4:
+                                _e_notes = st.text_input("Notes", value=_ln["notes"] or "",
+                                                          key=f"fm_e_notes_{_ln_id}")
+                            st.caption(f"= {_fm_edit_bom['batch_size'] * _e_pct / 100:g} {_e_unit} "
+                                      f"of a {_fm_edit_bom['batch_size']:g} {_fm_edit_bom['batch_unit']} formulation")
+                            eb1, eb2 = st.columns([1, 1])
+                            with eb1:
+                                if st.button("💾 Save Changes", key=f"fm_e_save_{_ln_id}",
+                                             disabled=not _fm_can_create):
+                                    ok, msg = update_bom_line(_ln_id, _e_mat, _e_pct, _e_unit, _e_notes)
+                                    if ok:
+                                        st.session_state.pop("fm_editing_line_id", None)
+                                        st.success(f"✅ {msg}")
+                                        st.rerun()
+                                    else:
+                                        st.error(msg)
+                            with eb2:
+                                if st.button("✖️ Cancel", key=f"fm_e_cancel_{_ln_id}"):
+                                    st.session_state.pop("fm_editing_line_id", None)
+                                    st.rerun()
+                            st.markdown("---")
+                        else:
+                            lc1, lc2, lc3, lc4, lc5, lc6 = st.columns([1.3, 2.2, 0.9, 1.2, 0.8, 1.2])
+                            lc1.markdown(f"**{get_lab_code(_ln['material']) or '—'}**")
+                            lc2.markdown(material_label(_ln["material"]))
+                            lc3.markdown(f"{_ln['percent']:g}%")
+                            lc4.markdown(f"{_ln['qty_per_batch']:g} {_ln['unit']}")
+                            with lc5:
+                                if st.button("✏️", key=f"fm_edit_{_ln_id}", disabled=not _fm_can_create,
+                                             help="Edit this material line"):
+                                    st.session_state["fm_editing_line_id"] = _ln_id
+                                    st.rerun()
+                            with lc6:
+                                if st.button("🗑️", key=f"fm_del_{_ln_id}", disabled=not _fm_can_create,
+                                             help="Delete this material line"):
+                                    st.session_state[f"fm_confirm_del_{_ln_id}"] = True
+                                    st.rerun()
+                            if st.session_state.get(f"fm_confirm_del_{_ln_id}"):
+                                st.warning(f"Delete **{material_label(_ln['material'])}** from this "
+                                          f"formulation? This only removes this one line.")
+                                dc1, dc2 = st.columns([1, 1])
+                                with dc1:
+                                    if st.button("✅ Confirm Delete", key=f"fm_del_confirm_{_ln_id}"):
+                                        ok, msg = delete_bom_line(_ln_id)
+                                        st.session_state.pop(f"fm_confirm_del_{_ln_id}", None)
+                                        if ok:
+                                            st.success(f"✅ {msg}")
+                                        else:
+                                            st.error(msg)
+                                        st.rerun()
+                                with dc2:
+                                    if st.button("✖️ Cancel", key=f"fm_del_cancel_{_ln_id}"):
+                                        st.session_state.pop(f"fm_confirm_del_{_ln_id}", None)
+                                        st.rerun()
+
+                    st.markdown("---")
+
+                # ── live validation banner ──
+                _fm_val = bom_validation(_fm_edit_bom_id)
+                vc1, vc2, vc3 = st.columns(3)
+                vc1.metric("Total %", f"{_fm_val['total_percent']:g}%")
+                vc2.metric(f"Total Weight ({_fm_val['batch_unit']})", f"{_fm_val['total_qty']:g}")
+                vc3.metric(f"Formulation Size ({_fm_val['batch_unit']})", f"{_fm_val['batch_size']:g}")
+                if _fm_val["is_valid"]:
+                    st.success("✅ Formula Valid")
+                else:
+                    for _issue in _fm_val["issues"]:
+                        if _issue.startswith("🔴"):
+                            st.error(_issue)
+                        elif _issue.startswith("⚠️"):
+                            st.warning(_issue)
+                        else:
+                            st.caption(f"• {_issue}")
+
+                # ── add a new material line ──
+                st.markdown("#### ➕ Add Material Line")
+                al1, al2, al3, al4 = st.columns([3, 1.3, 1, 2])
+                with al1:
+                    _al_mat = st.selectbox("Material", MATERIALS, key="fm_al_mat", format_func=material_label)
+                    _al_lab_code = get_lab_code(_al_mat)
+                    st.caption(f"Lab Code: **{_al_lab_code or '⚠️ not set in Material Master'}**")
+                with al2:
+                    _al_pct = st.number_input("%", min_value=0.0, step=0.5, value=0.0, key="fm_al_pct")
+                with al3:
+                    _al_unit = st.selectbox("Unit", ["KG", "Litres", "MT", "Bags", "Units"], key="fm_al_unit")
+                with al4:
+                    _al_notes = st.text_input("Notes", key="fm_al_notes")
+                if _al_pct > 0:
+                    st.caption(f"= {_fm_edit_bom['batch_size'] * _al_pct / 100:g} {_al_unit} "
+                              f"of a {_fm_edit_bom['batch_size']:g} {_fm_edit_bom['batch_unit']} formulation")
+                if st.button("➕ Add Line", key="fm_al_add", disabled=not _fm_can_create):
+                    ok, msg, _line_id = add_bom_line(_fm_edit_bom_id, _al_mat, _al_pct, _al_unit, _al_notes)
+                    if ok:
+                        st.success(f"✅ {msg}")
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
             st.markdown("---")
             st.markdown("#### Version History")
             _fm_hist = pd.read_sql_query(
-                "SELECT id, version, formula_code, is_active, created_at, created_by "
+                "SELECT id, version, formula_code, status, is_active, created_at, created_by "
                 "FROM bom_headers WHERE product=? ORDER BY id DESC",
                 conn, params=(mb_product,)
             )
@@ -7482,23 +10080,57 @@ elif module == "Formulation":
                 st.caption("No versions saved yet for this product.")
             else:
                 _fm_hist_disp = _fm_hist.copy()
-                _fm_hist_disp["is_active"] = _fm_hist_disp["is_active"].apply(
-                    lambda x: "🟢 Active" if x else "")
+                _fm_hist_disp["status"] = _fm_hist_disp.apply(
+                    lambda r: ("🟢 " if r["is_active"] else "") + (r["status"] or "Draft"), axis=1)
                 st.dataframe(
-                    _fm_hist_disp.rename(columns={
+                    _fm_hist_disp[["id", "version", "formula_code", "status", "created_at", "created_by"]]
+                        .rename(columns={
                         "id": "ID", "version": "Version", "formula_code": "Code",
-                        "is_active": "Status", "created_at": "Created", "created_by": "By"
+                        "status": "Status", "created_at": "Created", "created_by": "By"
                     }),
                     width='stretch', hide_index=True
                 )
-                _fm_reactivate_opts = _fm_hist[_fm_hist["is_active"] == 0]["id"].tolist()
+                st.caption("Only an **Approved** formula can be selected for a new Production "
+                          "Instruction. A formula must have valid material lines (100% total, "
+                          "total weight = Formulation Size, every line has a Lab Code) before it "
+                          "can be approved. Approving a version marks whatever was previously "
+                          "Approved for this product as Superseded — nothing is deleted, so "
+                          "historical batches/instructions keep tracing back correctly.")
+                # Section 6: only QC approves/activates a formulation. R&D
+                # can draft it but cannot self-approve its own controlled
+                # master document.
+                _fm_can_approve = _dept_allows("QC")
+                if not _fm_can_approve:
+                    st.caption("🔒 Only QC can approve and activate a formulation version.")
+                _fm_approve_opts = _fm_hist[_fm_hist["status"] == "Draft"]["id"].tolist()
+                if _fm_approve_opts:
+                    _fm_appr_id = st.selectbox("Approve & activate a Draft version", _fm_approve_opts,
+                                                key="fm_approve")
+                    _fm_appr_val = bom_validation(int(_fm_appr_id))
+                    if not _fm_appr_val["is_valid"]:
+                        st.error("🔴 This version cannot be approved yet:")
+                        for _issue in _fm_appr_val["issues"]:
+                            st.caption(f"• {_issue}")
+                    if st.button("✅ Approve & Activate", key="fm_approve_btn",
+                                 disabled=not (_fm_can_approve and _fm_appr_val["is_valid"])):
+                        _ok, _msg = approve_bom(int(_fm_appr_id), mb_product)
+                        if _ok:
+                            st.success(f"✅ {_msg}")
+                        else:
+                            st.error(_msg)
+                        st.rerun()
+                _fm_reactivate_opts = _fm_hist[
+                    (_fm_hist["status"] == "Superseded") & (_fm_hist["is_active"] == 0)
+                ]["id"].tolist()
                 if _fm_reactivate_opts:
-                    _fm_re_id = st.selectbox("Re-activate an older version", _fm_reactivate_opts,
+                    _fm_re_id = st.selectbox("Re-approve a Superseded version", _fm_reactivate_opts,
                                               key="fm_reactivate")
-                    if st.button("↩️ Make this version active", key="fm_reactivate_btn"):
-                        _activate_bom(int(_fm_re_id), mb_product)
-                        log_audit("UPDATE", "bom_headers", _fm_re_id, f"Re-activated for {mb_product}")
-                        st.success("Version re-activated.")
+                    if st.button("↩️ Re-approve & activate", key="fm_reactivate_btn", disabled=not _fm_can_approve):
+                        _ok, _msg = approve_bom(int(_fm_re_id), mb_product)
+                        if _ok:
+                            st.success(f"✅ {_msg}")
+                        else:
+                            st.error(_msg)
                         st.rerun()
 
             st.markdown("---")
@@ -7537,7 +10169,7 @@ elif module == "Sand":
         st.subheader("New Sand Entry")
         c1, c2 = st.columns(2)
         with c1:
-            s_date    = st.date_input("Date", key="s_d")
+            s_date    = st.date_input("Date", value=today_ist(), key="s_d")
             s_factory = st.selectbox("Factory", FACTORIES, key="s_f",
                                       index=FACTORIES.index(factory) if factory in FACTORIES else 0)
         with c2:
@@ -7703,17 +10335,17 @@ elif module == "Stock":
         if _critical.empty and _low.empty:
             st.success("✅ All materials at healthy stock levels")
 
-    tab_entry, tab_log, tab_edit_stk, tab_status, tab_fg, tab_master, tab_fgmaster, tab_codes = st.tabs(
+    tab_entry, tab_log, tab_edit_stk, tab_status, tab_fg, tab_release, tab_master, tab_fgmaster, tab_codes = st.tabs(
         ["➕ Log Stock", "📋 Records", "✏️ Edit Record", "📦 Current Levels",
-         "🏭 Finished Goods Stock", "📇 Material Master", "🏷️ Finished Goods Master",
-         "🏷️ Material Codes (legacy)"]
+         "🏭 Finished Goods Stock", "🚚 Material Release", "📇 Material Master",
+         "🏷️ Finished Goods Master", "🏷️ Material Codes (legacy)"]
     )
 
     with tab_entry:
         st.subheader("New Stock Entry")
         c1, c2, c3 = st.columns(3)
         with c1:
-            st_date    = st.date_input("Date", key="stk_d")
+            st_date    = st.date_input("Date", value=today_ist(), key="stk_d")
             st_factory = st.selectbox("Factory", FACTORIES, key="stk_f",
                                        index=FACTORIES.index(factory) if factory in FACTORIES else 0)
         with c2:
@@ -7724,11 +10356,13 @@ elif module == "Stock":
                               help="From the official Material Master — not editable here.")
                 st_code = _stk_lab_code
             else:
-                st_code = st.text_input(
-                    "Lab Code", value=get_material_code(st_material), key="stk_code",
-                    placeholder="e.g. C0665/01",
-                    help="This material isn't in the official Material Master yet — "
-                         "enter its code manually, or add it via the Material Master tab.")
+                # Material Master is the single source of truth for Lab Codes —
+                # Stock no longer accepts a manually-typed fallback. The material
+                # must be given a Lab Code in Material Master before any stock
+                # can be logged against it.
+                st.error("⚠️ This material has no Lab Code in Material Master. "
+                         "Please update Material Master before entering stock.")
+                st_code = ""
             st_received = st.number_input("Received (units)", min_value=0, step=1, key="stk_r")
         with c3:
             st_used = st.number_input("Used (units)", min_value=0, step=1, key="stk_u")
@@ -7742,7 +10376,12 @@ elif module == "Stock":
             closing    = last_close + st_received - st_used
             st.metric("Closing Stock Preview", f"{closing:,}")
 
-        if st.button("💾 Save Stock"):
+        _stock_can_save = _dept_allows("Stores") and bool(_stk_lab_code)
+        if not _dept_allows("Stores"):
+            st.caption("🔒 Only Stores can log RM stock receipt/usage.")
+        elif not _stk_lab_code:
+            st.caption("🔒 Add this material's Lab Code in Material Master before logging stock.")
+        if st.button("💾 Save Stock", disabled=not _stock_can_save):
             try:
                 # FIX: duplicate-check + insert now run inside _write_lock so
                 # two sessions saving the same date/factory/material at
@@ -7777,12 +10416,6 @@ elif module == "Stock":
                     )
                 else:
                     recompute_stock_chain(st_factory, st_material)
-                    # Only sync to the legacy material_codes table for items with no
-                    # official Lab Code on file (e.g. "Other / Custom") — materials
-                    # already in materials_master keep their authoritative code and
-                    # are never overwritten from a stock entry.
-                    if not _stk_lab_code and st_code.strip():
-                        set_material_code(st_material, st_code.strip())
                     log_audit("INSERT", "stock", "new",
                               f"{st_factory} | {st_material} ({st_code.strip() or 'no code'}) | closing={closing}")
                     st.success(f"✅ {lab_code_label(st_material)} closing stock: {closing:,} units")
@@ -7856,11 +10489,11 @@ elif module == "Stock":
                                   help="From the official Material Master — not editable here.")
                     e_st_code = _e_stk_lab_code
                 else:
-                    e_st_code = st.text_input(
-                        "Lab Code", value=sel_row.get("code", "") or get_material_code(e_st_material),
-                        key="e_stk_code",
-                        help="This material isn't in the official Material Master yet — "
-                             "enter its code manually, or add it via the Material Master tab.")
+                    # Material Master is the single source of truth for Lab Codes —
+                    # no manual fallback here either.
+                    st.error("⚠️ This material has no Lab Code in Material Master. "
+                             "Please update Material Master before entering stock.")
+                    e_st_code = ""
                 e_st_received = st.number_input("Received (units)",
                     min_value=0, step=1, value=int(sel_row["received"]), key="e_stk_r")
             with skc3:
@@ -7879,7 +10512,9 @@ elif module == "Stock":
                 e_st_close  = e_st_last + e_st_received - e_st_used
                 st.metric("New Closing Stock", f"{e_st_close:,}")
 
-            if st.button("💾 Update Stock Record", key="stk_upd_btn"):
+            if not _e_stk_lab_code:
+                st.caption("🔒 Add this material's Lab Code in Material Master before updating this record.")
+            if st.button("💾 Update Stock Record", key="stk_upd_btn", disabled=not _e_stk_lab_code):
                 # FIX: remember the pair this row belonged to *before* the
                 # update — needed below to fix up the old chain too, since
                 # factory/material are editable and the row may be moving
@@ -7902,8 +10537,6 @@ elif module == "Stock":
                     # downstream is left showing a stale closing_stock.
                     recompute_stock_chain(_old_factory, _old_material)
                     recompute_stock_chain(e_st_factory, e_st_material)
-                    if not _e_stk_lab_code and e_st_code.strip():
-                        set_material_code(e_st_material, e_st_code.strip())
                     log_audit("UPDATE", "stock", sel_id,
                               f"{e_st_factory} | {e_st_material} | closing={e_st_close}")
                     st.success("✅ Stock record updated — downstream closing balances "
@@ -8073,6 +10706,98 @@ elif module == "Stock":
                            f"FG Stock now {_fg_new_closing:,.2f}")
                 st.rerun()
 
+    with tab_release:
+        st.subheader("🚚 Material Release for Production")
+        st.caption(
+            "Production checks with Stores for raw-material and packaging availability before "
+            "a batch can start. This is that checkpoint: Stores confirms materials are ready to "
+            "issue for a Production Instruction — only QC-Approved raw material batches count "
+            "as available. Production cannot start the batch until this is done."
+        )
+
+        _rel_can_release = _dept_allows("Stores")
+        if not _rel_can_release:
+            st.caption("🔒 Only Stores can release materials for production.")
+
+        _rel_pending = list_production_instructions(
+            statuses=["Released to Production", "Acknowledged"]
+        )
+        _rel_pending = _rel_pending[_rel_pending["stores_released"].fillna(0).astype(int) == 0]
+
+        if _rel_pending.empty:
+            st.success("✅ No instructions currently waiting on a Stores material release.")
+        else:
+            for _, _ri in _rel_pending.iterrows():
+                with st.expander(
+                    f"{_ri['instruction_no']} — {fg_label(_ri['product'])} — "
+                    f"{_ri['quantity']:g} {_ri['quantity_unit']} @ {_ri['factory']}"
+                ):
+                    _rel_req = scale_bom_lines(_ri["bom_id"], _ri["quantity"])
+                    if _rel_req.empty:
+                        st.caption("This formula has no material lines on file.")
+                    else:
+                        _rel_check = _rel_req.copy()
+                        _rel_avail = []
+                        for _, _rr in _rel_check.iterrows():
+                            _avail_qty = cur.execute(
+                                "SELECT COALESCE(SUM(quantity),0) FROM rm_batches "
+                                "WHERE material=? AND factory=? AND status='Approved'",
+                                (_rr["material"], _ri["factory"])
+                            ).fetchone()[0]
+                            # Phase B: net off whatever's already reserved against
+                            # OTHER instructions for this same material+factory —
+                            # otherwise two PIs could both show "sufficient" against
+                            # the exact same physical rm_batches and both get released.
+                            _reserved_elsewhere = cur.execute(
+                                f"SELECT COALESCE(SUM({_rm_res_held_expr('rr2')}),0) "
+                                "FROM rm_reservations rr2 "
+                                "JOIN rm_batches rb ON rb.id = rr2.rm_batch_id "
+                                "WHERE rb.material=? AND rb.factory=? AND rr2.status!='Cancelled'",
+                                (_rr["material"], _ri["factory"])
+                            ).fetchone()[0]
+                            _rel_avail.append(max(_avail_qty - _reserved_elsewhere, 0))
+                        _rel_check["qc_approved_available"] = _rel_avail
+                        _rel_check["ok"] = _rel_check["qc_approved_available"] >= _rel_check["required_qty"]
+                        st.dataframe(
+                            _rel_check[["material", "required_qty", "unit", "qc_approved_available", "ok"]]
+                                .rename(columns={"material": "Material", "required_qty": "Required",
+                                                  "unit": "Unit",
+                                                  "qc_approved_available": "Unreserved QC-Approved Available",
+                                                  "ok": "Sufficient?"}),
+                            width='stretch', hide_index=True
+                        )
+                        if not _rel_check["ok"].all():
+                            st.warning("⚠️ One or more materials are short on unreserved QC-Approved "
+                                       "stock — releasing will reserve whatever's actually available "
+                                       "(FIFO) and report any shortfall.")
+                    if st.button("✅ Release Materials for Production", key=f"rel_go_{_ri['id']}",
+                                 disabled=not _rel_can_release):
+                        _rel_ok, _rel_msg = release_stores_materials(int(_ri["id"]))
+                        if _rel_ok:
+                            st.success(f"{_rel_msg}")
+                        else:
+                            st.error(_rel_msg)
+                        st.rerun()
+
+        st.markdown("---")
+        st.caption("Already released — visible for reference:")
+        _rel_done = list_production_instructions()
+        if not _rel_done.empty:
+            _rel_done = _rel_done[_rel_done["stores_released"].fillna(0).astype(int) == 1]
+        if _rel_done.empty:
+            st.caption("None yet.")
+        else:
+            st.dataframe(
+                _rel_done[["instruction_no", "product", "factory", "stores_released_by",
+                            "stores_released_at"]].assign(
+                    product=lambda d: d["product"].apply(fg_label)
+                ).rename(columns={
+                    "instruction_no": "Instruction", "product": "Product", "factory": "Factory",
+                    "stores_released_by": "Released By", "stores_released_at": "Released At"
+                }),
+                width='stretch', hide_index=True, height=220
+            )
+
     with tab_master:
         st.subheader("📇 Material Master")
         st.caption("The official codification — Raw Materials, Packaging, Labels/Stickers, "
@@ -8117,6 +10842,14 @@ elif module == "Stock":
             width='stretch', hide_index=True, height=360
         )
 
+        # Section: code generation/confirmation for raw materials is R&D's
+        # responsibility per the QC head's discussion — everyone can still
+        # browse/read the Material Master (never restricted), only the
+        # write actions below are gated.
+        _mm_can_write = _dept_allows("RD")
+        if not _mm_can_write:
+            st.caption("🔒 Only R&D can add, edit, or confirm a material code.")
+
         st.markdown("---")
         st.markdown("#### Confirm a Pending Procurement Code")
         st.caption("Use this once the plant team resolves a code collision — this is the only "
@@ -8129,7 +10862,7 @@ elif module == "Stock":
             with mmp2:
                 mm_new_code = st.text_input("Confirmed Procurement Code", key="mm_new_code",
                                              placeholder="e.g. R1009")
-            if st.button("✅ Confirm Code", key="mm_confirm_code"):
+            if st.button("✅ Confirm Code", key="mm_confirm_code", disabled=not _mm_can_write):
                 if not mm_new_code.strip():
                     st.error("Enter the confirmed code before saving.")
                 else:
@@ -8157,7 +10890,7 @@ elif module == "Stock":
                 ["Raw Material", "Packaging", "Label/Sticker", "Process/Intermediate"], key="mm_add_cat")
         with am3:
             am_status = st.selectbox("Status", ["Confirmed", "Pending Code Confirmation"], key="mm_add_status")
-        if st.button("💾 Add Material", key="mm_add_btn"):
+        if st.button("💾 Add Material", key="mm_add_btn", disabled=not _mm_can_write):
             ok, msg = add_material_master(am_lab_code, am_name, am_proc_code, am_category, am_status)
             (st.success if ok else st.error)(msg)
             if ok:
@@ -8182,13 +10915,114 @@ elif module == "Stock":
             em_cat = st.selectbox("Category", _cat_opts,
                 index=(_cat_opts.index(_em_row["category"]) if _em_row["category"] in _cat_opts else 0),
                 key="mm_edit_cat")
-            if st.button("💾 Save Changes", key="mm_edit_save"):
+            if st.button("💾 Save Changes", key="mm_edit_save", disabled=not _mm_can_write):
                 ok, msg = update_material_master(int(_em_row["id"]), em_lab, em_proc, em_cat, em_status)
                 (st.success if ok else st.error)(msg)
                 if ok:
                     st.rerun()
             st.caption("Setting status to **Inactive** removes it from every dropdown (Stock, Quality, "
                         "Procurement, Formulation) without touching historical records that reference it.")
+
+        # ── Unit Conversion Factors ─────────────────────────────────────────
+        # Phase 1 of the gap-fix plan: a place to put a real, per-material
+        # conversion factor instead of the app silently summing "20 Bags" and
+        # "20 KG" of the same material as if they were the same number. This
+        # section only reads/writes material_stock_unit / material_unit_factors
+        # — it does not change how Stock, RM Receipt, or any total is
+        # calculated today. Populating real factors here is what makes the
+        # next phase (wiring recompute_stock_chain() and RM totals to use
+        # them) safe to do.
+        st.markdown("---")
+        st.markdown("#### ⚖️ Unit Conversion Factors")
+        st.caption(
+            "Every material has one **base unit** — the unit its stock total is meant to "
+            "be expressed in. If it's ever received or logged in a *different* unit (e.g. "
+            "Bags when the base unit is KG), the conversion factor here is what makes that "
+            "comparable. Bag/drum weight varies by material, so this can't be one global "
+            "number — it's set per material, per unit."
+        )
+
+        _uc_missing = materials_missing_unit_factors()
+        if not _uc_missing.empty:
+            with st.expander(
+                f"⚠️ {len(_uc_missing)} material/unit combination(s) in use with no factor on file",
+                expanded=False
+            ):
+                st.caption(
+                    "These units have actually been logged in Stock or RM Receipt but have no "
+                    "conversion factor yet, so quantities in these rows can't currently be "
+                    "reconciled against the material's other units. Add a factor below for each."
+                )
+                st.dataframe(
+                    _uc_missing.rename(columns={
+                        "material": "Material", "unit": "Unit Logged",
+                        "n_rows": "Rows Using This Unit", "base_unit": "Material's Base Unit"
+                    }),
+                    width='stretch', hide_index=True
+                )
+        else:
+            st.success("✅ Every unit currently in use across Stock and RM Receipt has a conversion factor on file.")
+
+        _uc_can_write = _dept_allows("RD")
+        if not _uc_can_write:
+            st.caption("🔒 Only R&D can set base units or conversion factors.")
+
+        _uc_all_units = ["KG", "MT", "Bags", "Litres", "Drums", "Barrel", "Units", "Other"]
+
+        uc1, uc2 = st.columns(2)
+        with uc1:
+            st.markdown("**Set a material's base unit**")
+            _uc_mat_pick = st.selectbox(
+                "Material", _mm_all["name"].tolist(), key="uc_mat_pick"
+            )
+            _uc_cur_base = get_material_base_unit(_uc_mat_pick)
+            _uc_base_idx = (_uc_all_units.index(_uc_cur_base)
+                             if _uc_cur_base in _uc_all_units else 0)
+            _uc_new_base = st.selectbox(
+                "Base unit", _uc_all_units, index=_uc_base_idx, key="uc_base_unit"
+            )
+            if st.button("💾 Save Base Unit", key="uc_save_base", disabled=not _uc_can_write):
+                set_material_base_unit(_uc_mat_pick, _uc_new_base, st.session_state.username)
+                st.success(f"✅ Base unit for **{_uc_mat_pick}** set to **{_uc_new_base}**.")
+                st.rerun()
+
+        with uc2:
+            st.markdown("**Add / update a conversion factor**")
+            _uc_fac_mat = st.selectbox(
+                "Material", _mm_all["name"].tolist(), key="uc_factor_mat"
+            )
+            _uc_fac_base = get_material_base_unit(_uc_fac_mat)
+            _uc_fac_unit_opts = [u for u in _uc_all_units if u.lower() != _uc_fac_base.lower()]
+            _uc_fac_unit = st.selectbox("From unit", _uc_fac_unit_opts, key="uc_factor_unit")
+            _uc_fac_val = st.number_input(
+                f"1 {_uc_fac_unit} = how many {_uc_fac_base}?",
+                min_value=0.0, step=0.1, format="%.4f", key="uc_factor_val"
+            )
+            if st.button("💾 Save Factor", key="uc_save_factor", disabled=not _uc_can_write):
+                if _uc_fac_val <= 0:
+                    st.error("Enter a factor greater than zero.")
+                else:
+                    set_material_unit_factor(_uc_fac_mat, _uc_fac_unit, _uc_fac_val,
+                                              st.session_state.username)
+                    st.success(
+                        f"✅ 1 {_uc_fac_unit} of **{_uc_fac_mat}** = {_uc_fac_val} {_uc_fac_base}."
+                    )
+                    st.rerun()
+
+        _uc_existing = pd.read_sql_query(
+            "SELECT material, unit, factor_to_base, updated_by, updated_at "
+            "FROM material_unit_factors ORDER BY material, unit", conn
+        )
+        if not _uc_existing.empty:
+            with st.expander(f"📋 {len(_uc_existing)} conversion factor(s) on file", expanded=False):
+                _uc_existing["base_unit"] = _uc_existing["material"].apply(get_material_base_unit)
+                st.dataframe(
+                    _uc_existing.rename(columns={
+                        "material": "Material", "unit": "Unit", "factor_to_base": "Factor",
+                        "base_unit": "Base Unit", "updated_by": "Set By", "updated_at": "Set At"
+                    }),
+                    width='stretch', hide_index=True
+                )
 
         st.markdown("---")
         st.markdown("#### 📤 Import Material Master (Excel / CSV)")
@@ -8282,6 +11116,13 @@ elif module == "Stock":
             width='stretch', hide_index=True, height=360
         )
 
+        # Section: code generation for finished products is R&D's
+        # responsibility per the QC head's discussion — browsing stays open
+        # to everyone, only the write actions below are gated.
+        _fgm_can_write = _dept_allows("RD")
+        if not _fgm_can_write:
+            st.caption("🔒 Only R&D can add, edit, or confirm a finished-product code.")
+
         st.markdown("---")
         st.markdown("#### Confirm a Pending Code")
         st.caption("Use this once the plant team assigns the code — this is the only place "
@@ -8294,7 +11135,7 @@ elif module == "Stock":
             with fgmp2:
                 fgm_new_code = st.text_input("Confirmed RM Code", key="fgm_new_code",
                                               placeholder="e.g. FPS_C010_1K")
-            if st.button("✅ Confirm Code", key="fgm_confirm_code"):
+            if st.button("✅ Confirm Code", key="fgm_confirm_code", disabled=not _fgm_can_write):
                 if not fgm_new_code.strip():
                     st.error("Enter the confirmed code before saving.")
                 else:
@@ -8318,7 +11159,7 @@ elif module == "Stock":
         with afg2:
             afg_code = st.text_input("RM Code", key="fgm_add_code", placeholder="e.g. FPS_C010_1K")
         afg_status = st.selectbox("Status", ["Confirmed", "Pending Code Confirmation"], key="fgm_add_status")
-        if st.button("💾 Add Finished Product", key="fgm_add_btn"):
+        if st.button("💾 Add Finished Product", key="fgm_add_btn", disabled=not _fgm_can_write):
             ok, msg = add_finished_good(afg_name, afg_code, afg_status)
             (st.success if ok else st.error)(msg)
             if ok:
@@ -8338,7 +11179,7 @@ elif module == "Stock":
                 _fgm_cur_status = _efg_row["status"] if _efg_row["status"] in _fgm_status_opts else "Confirmed"
                 efg_status = st.selectbox("Status", _fgm_status_opts,
                     index=_fgm_status_opts.index(_fgm_cur_status), key="fgm_edit_status")
-            if st.button("💾 Save Changes", key="fgm_edit_save"):
+            if st.button("💾 Save Changes", key="fgm_edit_save", disabled=not _fgm_can_write):
                 ok, msg = update_finished_good(int(_efg_row["id"]), efg_code, efg_status)
                 (st.success if ok else st.error)(msg)
                 if ok:
@@ -9110,9 +11951,12 @@ elif module == "Quality":
             im_qty  = st.number_input("Quantity", min_value=0.0, step=1.0, key="im_qty")
             im_unit = st.selectbox("Unit", ["KG", "Bags", "Litres", "MT", "Barrel", "Units"], key="im_unit")
             im_factory = st.selectbox("Factory", FACTORIES if _is_admin else [_user_factory], key="im_factory")
-            im_date = st.date_input("Received Date", key="im_date")
+            im_date = st.date_input("Received Date", value=today_ist(), key="im_date")
 
-        if st.button("💾 Save — Awaiting QC", key="im_save"):
+        _q_can_stores = _dept_allows("Stores")
+        if not _q_can_stores:
+            st.caption("🔒 Only Stores can log incoming material.")
+        if st.button("💾 Save — Awaiting QC", key="im_save", disabled=not _q_can_stores):
             if not im_supplier_final or not im_batch_no.strip():
                 st.warning("Supplier and batch number are required.")
             else:
@@ -9164,7 +12008,10 @@ elif module == "Quality":
                         _iq_remarks    = st.text_area("Remarks", key=f"iq_rem_{rm['id']}")
                         _iq_decision   = st.radio("Decision", ["Pass", "Fail"], key=f"iq_dec_{rm['id']}",
                                                     horizontal=True)
-                    if st.button("💾 Submit Inspection", key=f"iq_submit_{rm['id']}"):
+                    _q_can_qc = _dept_allows("QC")
+                    if not _q_can_qc:
+                        st.caption("🔒 Only QC can record an incoming inspection decision.")
+                    if st.button("💾 Submit Inspection", key=f"iq_submit_{rm['id']}", disabled=not _q_can_qc):
                         record_incoming_inspection(
                             rm["id"], _iq_appearance, _iq_colour, _iq_moisture, _iq_particle,
                             _iq_remarks, _iq_decision, st.session_state.username
@@ -9207,11 +12054,25 @@ elif module == "Quality":
                     "Output Unit", ["Bags", "Pieces", "Drums", "KG", "MT"], key="pb_out_unit")
 
             _pb_bom = get_active_bom(pb_product)
-            if _pb_bom:
-                st.info(f"📐 Formula on file: **{_pb_bom['version']}** "
+            if _pb_bom is None:
+                st.warning("⚠ No active formulation found for this product.")
+            else:
+                st.info(f"📐 Active Formula: **{_pb_bom['version']}** "
                         f"({_pb_bom['formula_code'] or 'no code'}) — reference batch "
-                        f"{_pb_bom['batch_size']:g} {_pb_bom['batch_unit']}. See the "
-                        f"Formulation module to check required quantities for this run.")
+                        f"{_pb_bom['batch_size']:g} {_pb_bom['batch_unit']}. This batch will "
+                        f"be linked to this exact formula version on save.")
+                with st.expander("📐 View Formulation"):
+                    _pb_bom_lines = get_bom_lines(_pb_bom["id"])
+                    if _pb_bom_lines.empty:
+                        st.caption("This formula has no material lines on file.")
+                    else:
+                        st.dataframe(
+                            _pb_bom_lines[["material", "qty_per_batch", "unit", "notes"]]
+                                .rename(columns={"material": "Material",
+                                                  "qty_per_batch": "Standard Qty",
+                                                  "unit": "Unit", "notes": "Notes"}),
+                            width='stretch', hide_index=True
+                        )
 
             _approved_rm = pd.read_sql_query(
                 "SELECT id, material, batch_no, quantity, unit FROM rm_batches "
@@ -9239,7 +12100,10 @@ elif module == "Quality":
                         _qty_used_map[rid] = st.number_input(
                             _label, min_value=0.0, step=1.0, key=f"pb_qty_{rid}")
 
-            if st.button("🚀 Create Batch", key="pb_create"):
+            _q_can_production = _dept_allows("Production")
+            if not _q_can_production:
+                st.caption("🔒 Only Production can create a production batch.")
+            if st.button("🚀 Create Batch", key="pb_create", disabled=not _q_can_production):
                 if not pb_operator.strip():
                     st.warning("Operator is required.")
                 elif not _selected_rm_ids:
@@ -9267,8 +12131,13 @@ elif module == "Quality":
             else:
                 for _, pb in _pb_all.iterrows():
                     with st.expander(f"{pb['batch_no']} — {fg_label(pb['product'])} @ {pb['factory']} — {pb['status']}"):
-                        if st.button("🔍 Open Batch 360° page →", key=f"batch360_{pb['id']}"):
-                            open_detail_view("batch", pb["batch_no"])
+                        _pb_btn1, _pb_btn2 = st.columns(2)
+                        with _pb_btn1:
+                            if st.button("📐 View Formulation", key=f"pbform_{pb['id']}"):
+                                open_detail_view("batch", pb["batch_no"])
+                        with _pb_btn2:
+                            if st.button("🔬 Open QC / Batch 360° →", key=f"batch360_{pb['id']}"):
+                                open_detail_view("batch", pb["batch_no"])
                         render_batch_progress(pb["status"])
                         st.caption(f"Operator: {pb['operator']} · Machine: {pb['machine']} · "
                                     f"Shift: {pb['shift']} · Created: {pb['created_at'][:16]}")
@@ -9296,6 +12165,9 @@ elif module == "Quality":
         else:
             for _, pb in _proc_pending.iterrows():
                 with st.expander(f"{pb['batch_no']} — {fg_label(pb['product'])} @ {pb['factory']}"):
+                    if st.button("🔍 View Batch 360° (Formulation + Production + QC)",
+                                 key=f"pq_b360_{pb['id']}"):
+                        open_detail_view("batch", pb["batch_no"])
                     pq1, pq2 = st.columns(2)
                     with pq1:
                         _pq_visc = st.text_input("Viscosity", key=f"pq_visc_{pb['id']}")
@@ -9305,7 +12177,10 @@ elif module == "Quality":
                         _pq_app  = st.text_input("Appearance", key=f"pq_app_{pb['id']}")
                     _pq_remarks = st.text_area("Remarks", key=f"pq_rem_{pb['id']}")
                     _pq_decision = st.radio("Decision", ["Pass", "Fail"], key=f"pq_dec_{pb['id']}", horizontal=True)
-                    if st.button("💾 Submit", key=f"pq_submit_{pb['id']}"):
+                    _q_can_qc_pq = _dept_allows("QC")
+                    if not _q_can_qc_pq:
+                        st.caption("🔒 Only QC can record a Process QC decision.")
+                    if st.button("💾 Submit", key=f"pq_submit_{pb['id']}", disabled=not _q_can_qc_pq):
                         record_process_inspection(pb["id"], _pq_visc, _pq_dens, _pq_temp,
                                                     _pq_app, _pq_remarks, _pq_decision, st.session_state.username)
                         if _pq_decision == "Pass":
@@ -9325,6 +12200,9 @@ elif module == "Quality":
         else:
             for _, pb in _fg_pending.iterrows():
                 with st.expander(f"{pb['batch_no']} — {fg_label(pb['product'])} @ {pb['factory']}"):
+                    if st.button("🔍 View Batch 360° (Formulation + Production + QC)",
+                                 key=f"fg_b360_{pb['id']}"):
+                        open_detail_view("batch", pb["batch_no"])
                     fg1, fg2 = st.columns(2)
                     with fg1:
                         _fg_adh = st.text_input("Adhesion", key=f"fg_adh_{pb['id']}")
@@ -9334,7 +12212,10 @@ elif module == "Quality":
                         _fg_col = st.text_input("Colour", key=f"fg_col_{pb['id']}")
                         _fg_wt  = st.text_input("Weight", key=f"fg_wt_{pb['id']}")
                     _fg_decision = st.radio("Decision", ["Pass", "Fail"], key=f"fg_dec_{pb['id']}", horizontal=True)
-                    if st.button("💾 Submit", key=f"fg_submit_{pb['id']}"):
+                    _q_can_qc_fg = _dept_allows("QC")
+                    if not _q_can_qc_fg:
+                        st.caption("🔒 Only QC can record a Finished Goods QC decision.")
+                    if st.button("💾 Submit", key=f"fg_submit_{pb['id']}", disabled=not _q_can_qc_fg):
                         record_fg_inspection(pb["id"], _fg_adh, _fg_str, _fg_con, _fg_col, _fg_wt,
                                               _fg_decision, st.session_state.username)
                         if _fg_decision == "Pass":
@@ -9354,6 +12235,9 @@ elif module == "Quality":
         else:
             for _, pb in _pk_pending.iterrows():
                 with st.expander(f"{pb['batch_no']} — {fg_label(pb['product'])} @ {pb['factory']}"):
+                    if st.button("🔍 View Batch 360° (Formulation + Production + QC)",
+                                 key=f"pk_b360_{pb['id']}"):
+                        open_detail_view("batch", pb["batch_no"])
                     pk1, pk2 = st.columns(2)
                     with pk1:
                         _pk_bag   = st.checkbox("Correct Bag", key=f"pk_bag_{pb['id']}")
@@ -9362,11 +12246,17 @@ elif module == "Quality":
                         _pk_batch = st.checkbox("Correct Batch", key=f"pk_bat_{pb['id']}")
                         _pk_wt_ok = st.checkbox("Net Weight OK", key=f"pk_wt_{pb['id']}")
                         _pk_seal  = st.checkbox("Seal Quality OK", key=f"pk_seal_{pb['id']}")
-                    if st.button("💾 Submit", key=f"pk_submit_{pb['id']}"):
-                        record_packing_inspection(pb["id"], _pk_bag, _pk_label, _pk_batch,
-                                                    _pk_wt_ok, _pk_seal, st.session_state.username)
+                    _q_can_qc_pk = _dept_allows("QC")
+                    if not _q_can_qc_pk:
+                        st.caption("🔒 Only QC can record a Packing QC decision.")
+                    if st.button("💾 Submit", key=f"pk_submit_{pb['id']}", disabled=not _q_can_qc_pk):
+                        _insp_id, _fg_msg = record_packing_inspection(
+                            pb["id"], _pk_bag, _pk_label, _pk_batch,
+                            _pk_wt_ok, _pk_seal, st.session_state.username)
                         if all([_pk_bag, _pk_label, _pk_batch, _pk_wt_ok, _pk_seal]):
                             st.success(f"✅ {pb['batch_no']} → Packing QC Passed")
+                            if _fg_msg:
+                                st.info(_fg_msg)
                         else:
                             st.error(f"🛑 {pb['batch_no']} → Rework — NCR raised")
                         st.rerun()
@@ -9382,8 +12272,14 @@ elif module == "Quality":
         else:
             for _, pb in _pdi_pending.iterrows():
                 with st.expander(f"{pb['batch_no']} — {fg_label(pb['product'])} @ {pb['factory']}"):
+                    if st.button("🔍 View Batch 360° (Formulation + Production + QC)",
+                                 key=f"pdi_b360_{pb['id']}"):
+                        open_detail_view("batch", pb["batch_no"])
                     _pdi_done = st.checkbox("PDI Completed?", key=f"pdi_{pb['id']}")
-                    if st.button("💾 Submit", key=f"pdi_submit_{pb['id']}"):
+                    _q_can_qc_pdi = _dept_allows("QC")
+                    if not _q_can_qc_pdi:
+                        st.caption("🔒 Only QC can record the Pre-Dispatch Inspection.")
+                    if st.button("💾 Submit", key=f"pdi_submit_{pb['id']}", disabled=not _q_can_qc_pdi):
                         record_dispatch_approval(pb["id"], _pdi_done, st.session_state.username)
                         if _pdi_done:
                             st.success(f"✅ {pb['batch_no']} → Dispatch Approved")
@@ -9392,25 +12288,36 @@ elif module == "Quality":
                         st.rerun()
 
         st.markdown("---")
-        st.subheader("Cleared for Dispatch")
+        st.subheader("Ready for Dispatch")
+        # CONTAINMENT (architecture correction, Step 0): QC/PDI's role ends
+        # here. It used to have a "Mark Dispatched" button that called
+        # mark_batch_dispatched() directly -- flipping a batch straight to
+        # Dispatched with no challan, no FG stock movement, no Sales Order
+        # link, no quantity/batch validation, and no Dispatch audit trail.
+        # That let QC silently bypass the entire Dispatch module. Removed.
+        # QC's only remaining action for a cleared batch is to see it listed
+        # here as evidence PDI passed -- picking it up for an actual dispatch
+        # transaction is the Dispatch module's job (Phase C will make that
+        # module batch-aware; today it still dispatches by product+qty, see
+        # Dispatch → Add Dispatch).
         _cleared_q = "SELECT * FROM production_batches WHERE status='Dispatch Approved'" + \
                       (" AND factory=?" if _q_factory_filter else "") + " ORDER BY id"
         _cleared = pd.read_sql_query(_cleared_q, conn, params=(_q_factory_filter,) if _q_factory_filter else ())
         if _cleared.empty:
             st.caption("No batches currently cleared and waiting to leave the factory.")
         else:
+            st.caption(
+                "These batches have passed PDI and are cleared for dispatch. "
+                "QC/PDI cannot dispatch goods, generate challans, or deduct FG "
+                "stock — that happens in the Dispatch module."
+            )
             for _, pb in _cleared.iterrows():
-                ccol1, ccol2 = st.columns([4, 1])
-                ccol1.markdown(
-                    f"{status_pill('Cleared', 'success')} &nbsp; "
+                st.markdown(
+                    f"{status_pill('Ready for Dispatch', 'success')} &nbsp; "
                     f"<code style='font-size:12.5px;'>{pb['batch_no']}</code> — "
                     f"{fg_label(pb['product'])} @ {pb['factory']}",
                     unsafe_allow_html=True
                 )
-                if ccol2.button("🚚 Mark Dispatched", key=f"dispatched_{pb['id']}"):
-                    mark_batch_dispatched(pb["id"])
-                    st.success(f"{pb['batch_no']} marked Dispatched.")
-                    st.rerun()
 
     # ── NCR & CAPA ────────────────────────────────────────────────────────────
     with tab_ncr:
@@ -9535,6 +12442,39 @@ elif module == "Quality":
                     else:
                         st.warning("Install `qrcode` (pip install qrcode[pil]) to enable QR codes.")
 
+                # ── R&D/Production's Batch Card + QC's Test Report / MTC ──────────
+                # NEW: the three documents the QC head specifically asked for,
+                # alongside the existing all-in-one Traceability Certificate.
+                st.markdown("#### Batch Card, Test Report & Certificate")
+                if HAS_REPORTLAB:
+                    dcol1, dcol2, dcol3 = st.columns(3)
+                    with dcol1:
+                        st.download_button(
+                            "🧾 Batch Card (PDF)",
+                            data=generate_batch_card_pdf(trace),
+                            file_name=f"FCSC_BatchCard_{trace_batch_no}.pdf",
+                            mime="application/pdf", key="trace_batchcard_dl",
+                        )
+                        st.caption("Production's record — formula, operator, materials drawn.")
+                    with dcol2:
+                        st.download_button(
+                            "🧪 Test Report (PDF)",
+                            data=generate_test_report_pdf(trace),
+                            file_name=f"FCSC_TestReport_{trace_batch_no}.pdf",
+                            mime="application/pdf", key="trace_testreport_dl",
+                        )
+                        st.caption("QC's full working record — every parameter, every stage.")
+                    with dcol3:
+                        st.download_button(
+                            "📜 Material Testing Certificate (PDF)",
+                            data=generate_mtc_pdf(trace),
+                            file_name=f"FCSC_MTC_{trace_batch_no}.pdf",
+                            mime="application/pdf", key="trace_mtc_dl",
+                        )
+                        st.caption("Short, signed certificate — suitable for a customer.")
+                else:
+                    st.warning("Install `reportlab` (pip install reportlab) to enable PDF export.")
+
     with tab_qdash:
         st.subheader("📊 Quality Dashboard")
 
@@ -9604,7 +12544,7 @@ elif module == "Dispatch":
         st.subheader("New Dispatch Entry")
         c1, c2, c3 = st.columns(3)
         with c1:
-            sl_date    = st.date_input("Date", key="sl_d")
+            sl_date    = st.date_input("Date", value=today_ist(), key="sl_d")
             sl_factory = st.selectbox("Factory", FACTORIES, key="sl_f",
                                        index=FACTORIES.index(factory) if factory in FACTORIES else 0)
             # Customer dropdown from master, with manual fallback
@@ -9654,7 +12594,10 @@ elif module == "Dispatch":
             gc1.metric("Taxable Amount", fmt_inr(sl_total))
             gc2.metric(f"Total incl. GST {sl_gst_rate}%", fmt_inr(sl_grand))
 
-        if st.button("💾 Save Dispatch"):
+        _dispatch_can_save = _dept_allows("Dispatch")
+        if not _dispatch_can_save:
+            st.caption("🔒 Only Dispatch can record a dispatch.")
+        if st.button("💾 Save Dispatch", disabled=not _dispatch_can_save):
             final_sl_product = (sl_custom_prd.strip()
                                 if sl_product == "Other / Custom" and sl_custom_prd.strip()
                                 else sl_product)
@@ -9988,9 +12931,9 @@ elif module == "Reconciliation":
 elif module == "Sales":
 
     st.title("📈 Sales")
-    tab_add, tab_records, tab_edit_so, tab_targets, tab_invoice, tab_order_status = st.tabs([
+    tab_add, tab_records, tab_edit_so, tab_targets, tab_invoice, tab_order_status, tab_to_prod = st.tabs([
         "➕ New Order", "📋 Records", "✏️ Edit Record", "🎯 Targets",
-        "🧾 Invoice", "🔎 Order Status"
+        "🧾 Invoice", "🔎 Order Status", "🏭 To Production"
     ])
 
     # ── collect all sales reps from existing records for dropdown ─────────
@@ -10001,12 +12944,20 @@ elif module == "Sales":
 
     with tab_add:
         st.subheader("New Sales Order")
+        # Section 9 (Formulation Architecture Correction): Sales captures the
+        # customer's commercial order — it does NOT decide the manufacturing
+        # factory. The factory column is still populated (for backward
+        # compatibility with existing reports/filters) from the current
+        # active-factory context, but it is no longer a Sales decision — R&D
+        # / Production determine where the order is actually manufactured
+        # when they create the Production Instruction (Formulation → 🧾
+        # Production Instructions), independently of this value.
+        so_factory = factory if factory != ALL_FACTORIES else FACTORIES[0]
         c1, c2, c3 = st.columns(3)
         with c1:
-            so_date    = st.date_input("Date", key="so_d")
-            so_factory = st.selectbox("Factory", FACTORIES, key="so_f",
-                                       index=FACTORIES.index(factory)
-                                             if factory in FACTORIES else 0)
+            so_date    = st.date_input("Date", value=today_ist(), key="so_d")
+            st.caption(f"📍 Logged under **{so_factory}** — the manufacturing plant is "
+                      "decided later by R&D/Production, not by Sales.")
             # Customer dropdown from master
             _so_cust_opts = ["— Type below —"] + CUSTOMER_LIST
             _so_cust_pick = st.selectbox("Customer (from master)", _so_cust_opts, key="so_cust_pick")
@@ -10050,7 +13001,10 @@ elif module == "Sales":
             sc1.metric("Taxable Amount", fmt_inr(so_total))
             sc2.metric(f"Total incl. GST {so_gst_rate}%", fmt_inr(so_grand))
 
-        if st.button("💾 Save Sales Order"):
+        _sales_can_save = _dept_allows("Sales")
+        if not _sales_can_save:
+            st.caption("🔒 Only Sales can create a Sales Order.")
+        if st.button("💾 Save Sales Order", disabled=not _sales_can_save):
             final_so_product = (so_custom_prd.strip()
                                 if so_product == "Other / Custom" and so_custom_prd.strip()
                                 else so_product)
@@ -10180,10 +13134,13 @@ elif module == "Sales":
             with ec1:
                 e_so_date    = st.date_input("Date",
                     value=pd.to_datetime(sel_so_row["date"]).date(), key="e_so_d")
-                e_so_factory = st.selectbox("Factory", FACTORIES, key="e_so_f",
-                    index=FACTORIES.index(sel_so_row["factory"])
-                          if sel_so_row["factory"] in FACTORIES else 0,
-                    disabled=not _is_admin)
+                # Section 9: Sales does not decide the manufacturing factory —
+                # the value is preserved as-is (not editable from Sales) so
+                # historical records/reports keep working; R&D/Production own
+                # factory allocation via the Production Instruction instead.
+                e_so_factory = sel_so_row["factory"]
+                st.caption(f"📍 Factory on file: **{e_so_factory or '—'}** — not editable "
+                          "here; manufacturing plant is decided by R&D/Production.")
                 e_so_cust = st.text_input("Customer",
                     value=sel_so_row["customer"], key="e_so_cust")
             with ec2:
@@ -10436,6 +13393,64 @@ elif module == "Sales":
                 else:
                     st.info("No matching production batch found yet for this order's product/factory.")
 
+    # ── SALES ORDER → PRODUCTION HANDOFF ────────────────────────────────────
+    # NEW: "sales person generates a PO, passes it onto the production dept."
+    # This is that handoff, made explicit and trackable instead of implicit.
+    with tab_to_prod:
+        st.subheader("🏭 Send Orders to Production")
+        st.caption(
+            "Forwards a Sales Order into the manufacturing pipeline. R&D then issues a "
+            "Production Instruction against it from **Formulation → Production "
+            "Instructions**, which is what actually starts the batch/QC/Stores chain."
+        )
+
+        _wo_pipeline_df = pd.read_sql_query(
+            "SELECT * FROM sales_orders WHERE wo_status != 'New' ORDER BY id DESC LIMIT 100", conn
+        )
+        _wo_new_df = pd.read_sql_query(
+            "SELECT * FROM sales_orders WHERE wo_status='New' OR wo_status IS NULL ORDER BY id DESC", conn
+        )
+
+        st.markdown("#### Not yet sent")
+        if _wo_new_df.empty:
+            st.success("✅ Every sales order has been forwarded to Production.")
+        else:
+            _sales_can_send = _dept_allows("Sales")
+            if not _sales_can_send:
+                st.caption("🔒 Only Sales can forward an order to Production.")
+            for _, _wo in _wo_new_df.iterrows():
+                wc1, wc2 = st.columns([5, 1])
+                with wc1:
+                    st.markdown(
+                        f"**Order #{_wo['id']:05d}** — {_wo['customer']} — "
+                        f"{fg_label(_wo['product'])} ({_wo['qty']:g} units) — "
+                        f"{_wo['factory']} — {_wo['date']}"
+                    )
+                with wc2:
+                    if st.button("📤 Send", key=f"wo_send_{_wo['id']}", disabled=not _sales_can_send):
+                        send_sales_order_to_production(int(_wo["id"]))
+                        st.success(f"Order #{_wo['id']:05d} sent to Production.")
+                        st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### Pipeline status")
+        if _wo_pipeline_df.empty:
+            st.caption("No orders forwarded yet.")
+        else:
+            _wo_disp = _wo_pipeline_df.copy()
+            _wo_disp["product"] = _wo_disp["product"].apply(fg_label)
+            st.dataframe(
+                _wo_disp[["id", "customer", "product", "qty", "factory", "wo_status"]]
+                    .rename(columns={"id": "Order #", "customer": "Customer", "product": "Product",
+                                      "qty": "Qty", "factory": "Factory", "wo_status": "Status"}),
+                width='stretch', hide_index=True, height=320
+            )
+            st.caption(
+                "**Sent to Production** → waiting for R&D to issue a Production Instruction · "
+                "**Instruction Created** → formula/quantity locked, waiting for QC + Stores · "
+                "**In Production** → a batch is running · **Completed** → batch dispatched."
+            )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  COST
@@ -10449,7 +13464,7 @@ elif module == "Cost":
         st.subheader("New Cost Entry")
         c1, c2, c3 = st.columns(3)
         with c1:
-            co_date    = st.date_input("Date", key="co_d")
+            co_date    = st.date_input("Date", value=today_ist(), key="co_d")
             co_factory = st.selectbox("Factory", FACTORIES, key="co_f",
                                        index=FACTORIES.index(factory) if factory in FACTORIES else 0)
         with c2:
@@ -11205,7 +14220,11 @@ elif module == "Customers":
                         conn.commit()
                         log_audit("INSERT", "customers", "new", cust_name.strip())
                         # Invalidate cache so dropdown updates immediately
-                        load_customers.clear()
+                        # FIX: load_customers() is a plain wrapper function with
+                        # no .clear() method — only the underlying @st.cache_data
+                        # function (_load_customers_cached) has one. Calling
+                        # load_customers.clear() raised AttributeError here.
+                        _load_customers_cached.clear()
                         st.success(f"✅ Customer **{cust_name}** added.")
                         st.rerun()
                     except sqlite3.Error as e:
@@ -11281,7 +14300,9 @@ elif module == "Customers":
                         )
                         conn.commit()
                         log_audit("UPDATE", "customers", sel_cust_id, e_cust_name.strip())
-                        load_customers.clear()
+                        # FIX: see note above — clear the cached loader itself,
+                        # not the uncached wrapper (which has no .clear()).
+                        _load_customers_cached.clear()
                         st.success("✅ Customer updated.")
                         st.rerun()
                     except sqlite3.Error as e:
@@ -11303,6 +14324,96 @@ elif module == "Pilot Dashboard":
         "Visible to admins only.</p>",
         unsafe_allow_html=True,
     )
+
+    # ── USER MANAGEMENT (department-scoped accounts) ────────────────────────
+    # There was previously no UI to create accounts at all -- only the 5
+    # accounts seeded on first run existed (admin + one supervisor per
+    # factory). This adds the ability to create new accounts scoped to a
+    # single department (R&D / QC / Production / Stores / Sales / Dispatch),
+    # and to change an existing account's department. Never touches
+    # password/role of existing accounts except where the admin explicitly
+    # edits them here.
+    with st.expander("👤 User Management — create accounts, assign departments", expanded=False):
+        st.caption(
+            "Every account has a **role** (admin sees everything everywhere; "
+            "supervisor is scoped to one factory) and a **department** "
+            "(which controlled actions — formulation, QC decisions, batch "
+            "creation, stock issue, sales orders, dispatch — the account can "
+            "perform). Choose **All Departments** to match today's factory-"
+            "supervisor behaviour (full access within their factory); choose "
+            "a specific department for a role-restricted account such as a "
+            "QC Head or an R&D user."
+        )
+
+        st.markdown("##### ➕ Create New Account")
+        uc1, uc2, uc3 = st.columns(3)
+        with uc1:
+            nu_username = st.text_input("Username", key="nu_username").strip().lower()
+            nu_password = st.text_input("Temporary Password", type="password", key="nu_password")
+        with uc2:
+            nu_display  = st.text_input("Display Name", key="nu_display")
+            nu_role     = st.selectbox("Role", ["supervisor", "admin"], key="nu_role")
+        with uc3:
+            nu_factory  = st.selectbox("Factory (blank for admin/HQ)",
+                                        ([""] + FACTORIES) if nu_role != "admin" else [""],
+                                        key="nu_factory", disabled=(nu_role == "admin"))
+            nu_dept     = st.selectbox("Department", DEPARTMENTS,
+                                        format_func=lambda d: DEPARTMENT_LABELS.get(d, d),
+                                        index=DEPARTMENTS.index("All"), key="nu_dept",
+                                        disabled=(nu_role == "admin"))
+
+        if st.button("💾 Create Account", key="nu_create"):
+            if not nu_username or not nu_password or not nu_display.strip():
+                st.warning("Username, password and display name are required.")
+            elif get_user(nu_username) is not None:
+                st.error(f"Username '{nu_username}' already exists.")
+            elif nu_role != "admin" and not nu_factory:
+                st.warning("Select a factory for a supervisor account.")
+            else:
+                _final_dept = "Admin" if nu_role == "admin" else nu_dept
+                cur.execute(
+                    "INSERT INTO users (username,password,role,factory,display,department) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (nu_username, _hash_password(nu_password), nu_role,
+                     (nu_factory or None) if nu_role != "admin" else None,
+                     nu_display.strip(), _final_dept)
+                )
+                conn.commit()
+                log_audit("INSERT", "users", nu_username,
+                           f"role={nu_role} factory={nu_factory or 'HQ'} department={_final_dept}")
+                st.success(f"✅ Account '{nu_username}' created — ask them to change their "
+                           "password from the sidebar after first login.")
+                st.rerun()
+
+        st.markdown("---")
+        st.markdown("##### ✏️ Update Department for Existing Account")
+        _um_users = pd.read_sql_query("SELECT username, display, role, factory, department FROM users ORDER BY username", conn)
+        if not _um_users.empty:
+            _um_disp = _um_users.copy()
+            _um_disp["department"] = _um_disp["department"].fillna("All").apply(lambda d: DEPARTMENT_LABELS.get(d, d))
+            _um_disp["factory"] = _um_disp["factory"].fillna("Admin / HQ")
+            st.dataframe(
+                _um_disp.rename(columns={"username": "Username", "display": "Name",
+                                          "role": "Role", "factory": "Factory",
+                                          "department": "Department"}),
+                hide_index=True, width='stretch'
+            )
+            _um_target = st.selectbox("Account to update", _um_users["username"].tolist(), key="um_target")
+            _um_target_row = _um_users[_um_users["username"] == _um_target].iloc[0]
+            _um_new_dept = st.selectbox(
+                "New Department", DEPARTMENTS,
+                format_func=lambda d: DEPARTMENT_LABELS.get(d, d),
+                index=DEPARTMENTS.index(_um_target_row["department"]) if _um_target_row["department"] in DEPARTMENTS else 0,
+                key="um_new_dept", disabled=(_um_target_row["role"] == "admin")
+            )
+            if st.button("💾 Update Department", key="um_update_dept", disabled=(_um_target_row["role"] == "admin")):
+                cur.execute("UPDATE users SET department=? WHERE username=?", (_um_new_dept, _um_target))
+                conn.commit()
+                log_audit("UPDATE", "users", _um_target, f"department={_um_new_dept}")
+                st.success(f"✅ '{_um_target}' is now scoped to {DEPARTMENT_LABELS.get(_um_new_dept, _um_new_dept)}.")
+                st.rerun()
+
+    st.markdown("---")
 
     _pd_users     = pd.read_sql_query("SELECT username, role, factory, display FROM users", conn)
     _pd_logins    = pd.read_sql_query("SELECT * FROM login_log ORDER BY id DESC", conn)
