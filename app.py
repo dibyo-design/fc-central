@@ -17,6 +17,17 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from io import BytesIO
 
+# NEW: pure/testable logic (password hashing, invoice numbering) now lives
+# in fcsc_core.py — see that file's docstring for why. Aliased with the
+# original names below so every existing call site in this file (there are
+# many) keeps working completely unchanged.
+from fcsc_core import (
+    hash_password as _hash_password,
+    verify_password as _verify_password,
+    financial_year_label as _financial_year_label,
+    format_invoice_no,
+)
+
 # ================= TIMEZONE =================
 # FIX: Streamlit Cloud runs its servers in UTC. Every timestamp in the app
 # (login times, audit trail, batch-number date prefixes, "Generated at"
@@ -74,10 +85,20 @@ except ImportError:
     HAS_REQUESTS = False
 
 # ================= LOGGING =================
+# FIX: fcsc_app.log used to be a bare relative filename — same class of bug
+# as the old "fcsc.db" relative path (see _get_db_path below): it silently
+# lands wherever the process happens to be launched from, which may not be
+# writable, may not be the same folder twice in a row, and on ephemeral
+# hosting may not exist after a restart. Pinned to the same stable,
+# non-synced local directory as the database and backups so all three
+# always agree on where "this app's data" lives, regardless of cwd.
+_APP_DATA_DIR = os.path.join(os.path.expanduser("~"), ".fcsc_app_data")
+os.makedirs(_APP_DATA_DIR, exist_ok=True)
+
 # FIX: Errors that used to be silently swallowed (bare `except: pass`) are now
 # recorded here so real bugs don't vanish. Doesn't stop the app from continuing.
 logging.basicConfig(
-    filename="fcsc_app.log",
+    filename=os.path.join(_APP_DATA_DIR, "fcsc_app.log"),
     level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
@@ -367,9 +388,21 @@ def _get_db_path() -> str:
     # Pulled out into its own helper (rather than inlined in get_connection)
     # so the backup code below resolves the SAME path instead of each
     # keeping its own copy of this logic — see FIX note at the backup sites.
-    _db_dir = os.path.join(os.path.expanduser("~"), ".fcsc_app_data")
-    os.makedirs(_db_dir, exist_ok=True)
-    return os.path.join(_db_dir, "fcsc.db")
+    return os.path.join(_APP_DATA_DIR, "fcsc.db")
+
+
+def _get_backup_dir() -> str:
+    # FIX: backups were previously written to a bare relative "fcsc_backups"
+    # folder — the exact same class of cwd-dependent bug that _get_db_path
+    # above was written to fix for the live database. That meant the daily
+    # backup job had almost certainly been silently no-oping or scattering
+    # files across whatever directory the app was launched from since the
+    # DB itself was moved to ~/.fcsc_app_data. Backups now live in a fixed
+    # subfolder next to the live DB, so "where's my data" and "where are my
+    # backups" always resolve the same way regardless of launch directory.
+    _dir = os.path.join(_APP_DATA_DIR, "backups")
+    os.makedirs(_dir, exist_ok=True)
+    return _dir
 
 @st.cache_resource
 def get_connection() -> sqlite3.Connection:
@@ -462,31 +495,15 @@ def _write_lock():
 
 
 # ================= AUTH =================
-# FIX: Passwords are now salted and hashed with hashlib.scrypt (a slow,
+# FIX: Passwords are salted and hashed with hashlib.scrypt (a slow,
 # purpose-built password KDF) instead of one unsalted SHA-256 pass. Plain
 # SHA-256 is fast by design (it's a checksum algorithm), which makes it
 # practical to brute-force or rainbow-table offline; scrypt is deliberately
 # slow and salted per-user so the same password never hashes the same way
 # twice and can't be cracked with precomputed tables.
-_SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2 ** 14, 8, 1
-
-def _hash_password(password: str, salt: bytes | None = None) -> str:
-    salt = salt or secrets.token_bytes(16)
-    digest = hashlib.scrypt(password.encode(), salt=salt,
-                             n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P, dklen=32)
-    return f"{salt.hex()}${digest.hex()}"
-
-def _verify_password(password: str, stored: str) -> bool:
-    try:
-        salt_hex, digest_hex = stored.split("$")
-        salt = bytes.fromhex(salt_hex)
-        candidate = hashlib.scrypt(password.encode(), salt=salt,
-                                    n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P, dklen=32)
-        # FIX: constant-time comparison — avoids leaking timing information
-        # about how many bytes of the hash matched.
-        return hmac.compare_digest(candidate.hex(), digest_hex)
-    except Exception:
-        return False
+# (hash_password/verify_password themselves now live in fcsc_core.py so
+# they're unit-testable without booting the whole app — imported and
+# aliased near the top of this file.)
 
 cur.executescript("""
 CREATE TABLE IF NOT EXISTS users (
@@ -550,6 +567,21 @@ except sqlite3.OperationalError as _e:
 cur.execute("UPDATE users SET department='Admin' WHERE role='admin' AND (department IS NULL OR department='')")
 cur.execute("UPDATE users SET department='All'   WHERE role='supervisor' AND (department IS NULL OR department='')")
 conn.commit()
+
+# -- ADDITIVE MIGRATION: must_change_password flag. FIX: default seeded
+# accounts (admin@fcsc, belda@fcsc, etc. -- see _DEFAULT_USERS below) and
+# every admin-created account had a temporary password that a comment
+# *told* people to change, but nothing enforced it. If someone forgot, or
+# this source file was ever shared/committed anywhere, those credentials
+# work indefinitely. Existing accounts are left at 0 (not retroactively
+# locked out); newly seeded/created accounts below are set to 1 and are
+# blocked from every module until they set their own password.
+try:
+    cur.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER DEFAULT 0")
+    conn.commit()
+except sqlite3.OperationalError as _e:
+    if "duplicate column name" not in str(_e).lower():
+        raise
 
 DEPARTMENTS = ["All", "RD", "QC", "Production", "Stores", "Sales", "Dispatch", "Admin"]
 DEPARTMENT_LABELS = {
@@ -632,19 +664,26 @@ _DEFAULT_USERS = [
 if cur.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
     for _uname, _pw, _role, _fac, _disp in _DEFAULT_USERS:
         _dept = "Admin" if _role == "admin" else "All"
-        cur.execute("INSERT INTO users (username,password,role,factory,display,department) VALUES (?,?,?,?,?,?)",
+        # FIX: seeded accounts now start with must_change_password=1 — the
+        # documented default credentials only ever work for exactly one
+        # login before the app forces a real password to be set (see the
+        # login gate below).
+        cur.execute("INSERT INTO users (username,password,role,factory,display,department,must_change_password) "
+                     "VALUES (?,?,?,?,?,?,1)",
                      (_uname, _hash_password(_pw), _role, _fac, _disp, _dept))
     conn.commit()
 
 def get_user(username: str) -> dict | None:
     row = cur.execute(
-        "SELECT username, password, role, factory, display, department FROM users WHERE username = ?",
+        "SELECT username, password, role, factory, display, department, "
+        "COALESCE(must_change_password, 0) FROM users WHERE username = ?",
         (username,)
     ).fetchone()
     if row is None:
         return None
     return {"username": row[0], "password": row[1], "role": row[2],
-            "factory": row[3], "display": row[4], "department": row[5]}
+            "factory": row[3], "display": row[4], "department": row[5],
+            "must_change_password": bool(row[6])}
 
 # ── Server-side brute-force protection ─────────────────────────────────────────
 # FIX: Previously tracked in st.session_state, which is scoped to a single
@@ -1326,16 +1365,20 @@ def get_notifications(is_admin: bool, user_factory: str | None) -> list[dict]:
         pass
 
     try:
-        _stock_q = (
-            "SELECT s.material, s.factory, s.closing_stock, "
-            "COALESCE(r.threshold, ?) AS threshold FROM stock s "
-            "INNER JOIN (SELECT factory, material, MAX(id) AS max_id FROM stock GROUP BY factory, material) latest "
-            "ON s.factory = latest.factory AND s.material = latest.material AND s.id = latest.max_id "
-            "LEFT JOIN reorder_levels r ON r.material = s.material AND r.factory = s.factory"
-            + fac_clause
-        )
-        low_rows = cur.execute(_stock_q, (DEFAULT_REORDER_THRESHOLD, *fac_params)).fetchall()
-        n_low = sum(1 for _, _, qty, thr in low_rows if qty < thr)
+        # FIX (Gap P0-1): was reading the legacy `stock` table, which QC-
+        # approved RM receipts never populate — see get_rm_physical_stock().
+        _pairs = all_rm_factory_materials()
+        if not is_admin and user_factory:
+            _pairs = [(f, m) for f, m in _pairs if f == user_factory]
+        n_low = 0
+        for _f, _m in _pairs:
+            _snap = get_rm_physical_stock(_f, _m)
+            _thr_row = cur.execute(
+                "SELECT threshold FROM reorder_levels WHERE material=? AND factory=?", (_m, _f)
+            ).fetchone()
+            _thr = _thr_row[0] if _thr_row else DEFAULT_REORDER_THRESHOLD
+            if _snap["available_qty"] < _thr:
+                n_low += 1
         if n_low:
             notes.append({"icon": "📉", "severity": "warning", "module": "Stock",
                           "text": f"{n_low} material(s) below reorder threshold"})
@@ -1716,6 +1759,7 @@ def show_login_page() -> None:
                     st.session_state.user_factory = user["factory"]
                     st.session_state.display_name = user["display"]
                     st.session_state.department   = user.get("department") or ("Admin" if user["role"] == "admin" else "All")
+                    st.session_state.must_change_password = user.get("must_change_password", False)
                     log_login(uname, user["factory"], user["role"])
                     st.rerun()
                 else:
@@ -1752,6 +1796,42 @@ if "logged_in" not in st.session_state:
 
 if not st.session_state.logged_in:
     show_login_page()
+    st.stop()
+
+# ── Forced password change for temporary/default credentials ────────────────
+# FIX: closes the gap where seeded default accounts (and admin-created
+# accounts, which also start with a temporary password) could be used
+# indefinitely without ever being rotated. Nothing else in the app renders
+# until this is cleared.
+if st.session_state.get("must_change_password"):
+    st.warning(
+        "🔒 **You're signed in with a temporary password.** For security, "
+        "set your own password before continuing."
+    )
+    with st.form("force_pw_change_form"):
+        _fpw_new  = st.text_input("New password", type="password")
+        _fpw_new2 = st.text_input("Confirm new password", type="password")
+        _fpw_submitted = st.form_submit_button("Set password and continue")
+    if _fpw_submitted:
+        if len(_fpw_new) < 6:
+            st.error("New password must be at least 6 characters.")
+        elif _fpw_new != _fpw_new2:
+            st.error("Passwords do not match.")
+        else:
+            cur.execute(
+                "UPDATE users SET password = ?, must_change_password = 0 WHERE username = ?",
+                (_hash_password(_fpw_new), st.session_state.username)
+            )
+            conn.commit()
+            log_audit("UPDATE", "users", st.session_state.username,
+                      "Forced password change completed at first login")
+            st.session_state.must_change_password = False
+            st.success("Password updated. Loading your dashboard…")
+            st.rerun()
+    if st.button("Log out instead"):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
     st.stop()
 
 # ── Session inactivity timeout (2 hours) ─────────────────────────────────────
@@ -2221,6 +2301,49 @@ _safe_add_column("production_batches", "quantity_unit TEXT DEFAULT ''")
 # on file when this batch was created.", never guessed or backfilled.
 _safe_add_column("production_batches", "bom_id INTEGER")
 
+# -- NEW (G-03): Controlled Stock Adjustment workflow ------------------------
+# Manual FG/RM stock adjustments no longer post directly. This table is the
+# PENDING -> APPROVED/REJECTED -> POSTED request record; the actual ledger
+# movement (fg_stock / stock) is only ever written once, from inside the
+# approval transaction (see approve_and_post_stock_adjustment() further
+# below), never from the request-creation step. Requester and approver are
+# always enforced to be two different users in that function, not merely
+# hidden in the UI.
+cur.executescript("""
+CREATE TABLE IF NOT EXISTS stock_adjustment_requests (
+    id               INTEGER PRIMARY KEY,
+    factory          TEXT NOT NULL,
+    stock_type       TEXT NOT NULL,                    -- 'FG' | 'RM'
+    material         TEXT NOT NULL,                     -- product (FG) or material (RM)
+    quantity         REAL NOT NULL,                      -- unsigned magnitude
+    direction        TEXT NOT NULL,                       -- '+' | '-'
+    unit             TEXT DEFAULT '',
+    reason           TEXT NOT NULL,
+    requester        TEXT NOT NULL,
+    requested_at     TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'PENDING',    -- PENDING|APPROVED|REJECTED|POSTED
+    approver         TEXT DEFAULT '',
+    decision_at      TEXT DEFAULT '',
+    decision_reason  TEXT DEFAULT '',
+    posted_at        TEXT DEFAULT '',
+    ledger_ref_id    INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_sar_status      ON stock_adjustment_requests(status);
+CREATE INDEX IF NOT EXISTS idx_sar_factory_typ ON stock_adjustment_requests(factory, stock_type, material);
+""")
+conn.commit()
+
+# The legacy RM `stock` ledger gains the same adjustment/source-tracing
+# columns fg_stock already has, so a controlled RM adjustment can append its
+# own ledger row (received=0, used=0, adjustment=+/-qty, source_module=
+# 'STOCK_ADJUSTMENT') without ever touching the received/used columns that
+# Stores' routine receipt/usage entries use. Purely additive — every existing
+# row defaults to adjustment=0, which recompute_stock_chain() now folds in
+# (see the updated function below) as a no-op for all historical data.
+_safe_add_column("stock", "adjustment REAL DEFAULT 0")
+_safe_add_column("stock", "source_module TEXT DEFAULT ''")
+_safe_add_column("stock", "source_ref_id INTEGER")
+
 cur.executescript("""
 CREATE TABLE IF NOT EXISTS fg_product_unit (
     product         TEXT PRIMARY KEY,
@@ -2358,6 +2481,132 @@ def materials_missing_unit_factors() -> pd.DataFrame:
         lambda r: get_material_unit_factor(r["material"], r["unit"]) is not None, axis=1
     )
     return _all[~_all["has_factor"]].drop(columns=["has_factor"]).reset_index(drop=True)
+
+# -- Gap P0-1 FIX: single source of truth for RM physical/available stock ---
+# Audit finding: rm_batches (QC-approved lot receipts) and the legacy `stock`
+# table (manual "Log Stock" entries) were two fully independent ledgers with
+# no link between them -- create_rm_batch()/record_incoming_inspection()
+# never write to `stock`, and nothing in `stock` ever reads rm_batches. The
+# real FIFO reservation engine (release_stores_materials()) already queries
+# rm_batches directly and is correct; the problem was everywhere ELSE that
+# reports "current stock" -- low-stock alerts, the notification bell, the
+# dashboard AI-insights panel -- read only `stock`, which a storekeeper had
+# to remember to update by hand as a *second*, separate entry. A material
+# received and QC-approved through the real workflow but never re-typed into
+# Log Stock could run out on the factory floor without ever alerting anyone.
+#
+# This function makes rm_batches (+ its consumption trail in
+# production_batch_materials, + its holds in rm_reservations, + approved
+# corrections in stock_adjustment_requests) THE authoritative source going
+# forward, per the correct model:
+#     Physical Stock = Approved Receipts + Approved Adjustments - Consumption
+#     Available/ATP  = Physical Stock - Active Reservations
+# Every quantity is converted to the material's base unit via
+# convert_material_qty_to_base() before being summed, fixing the raw-scalar
+# arithmetic bug in recompute_stock_chain() (Gap P0-2, tracked separately).
+# The legacy `stock` table is untouched by this fix -- it still exists for
+# historical rows -- but it is no longer read by the low-stock/procurement
+# trigger or the notification bell (see below).
+def get_rm_physical_stock(factory: str, material: str) -> dict:
+    """Computes physical and available RM stock for one (factory, material)
+    pair directly from rm_batches, in the material's base unit.
+
+    Returns:
+        {
+          "physical_qty":  float,  # Approved receipts + approved adjustments - consumption
+          "reserved_qty":  float,  # Active (status='Reserved') holds
+          "available_qty": float,  # physical_qty - reserved_qty (never negative-clamped;
+                                    # a negative value here is itself a data-integrity
+                                    # signal -- more reserved/consumed than was ever
+                                    # receipted -- and should surface, not be hidden)
+          "base_unit":     str,
+          "unconverted":   list[str],  # human-readable notes for any row that had
+                                        # no unit-conversion factor on file, so the
+                                        # caller can flag the total as approximate
+                                        # instead of silently trusting it
+        }
+    """
+    base_unit = get_material_base_unit(material)
+    unconverted: list[str] = []
+
+    receipts = cur.execute(
+        "SELECT id, quantity, unit FROM rm_batches WHERE factory=? AND material=? "
+        "AND status='Approved'", (factory, material)
+    ).fetchall()
+    physical = 0.0
+    for rb_id, qty, unit in receipts:
+        conv_qty, is_exact, note = convert_material_qty_to_base(material, qty or 0, unit or base_unit)
+        if not is_exact:
+            unconverted.append(f"RM-{rb_id:05d} receipt: {qty} {unit} — {note}")
+        physical += conv_qty
+
+    consumed_rows = cur.execute(
+        "SELECT pbm.qty_used, rb.unit, rb.id FROM production_batch_materials pbm "
+        "JOIN rm_batches rb ON rb.id = pbm.rm_batch_id "
+        "WHERE rb.factory=? AND rb.material=?", (factory, material)
+    ).fetchall()
+    consumed = 0.0
+    for qty_used, unit, rb_id in consumed_rows:
+        conv_qty, is_exact, note = convert_material_qty_to_base(material, qty_used or 0, unit or base_unit)
+        if not is_exact:
+            unconverted.append(f"RM-{rb_id:05d} consumption: {qty_used} {unit} — {note}")
+        consumed += conv_qty
+    physical -= consumed
+
+    # FIX (P0-2, follow-on from P0-1): approved RM stock adjustments
+    # (physical-count corrections, damage/write-offs — approve_and_post_
+    # stock_adjustment()) were being posted to the legacy `stock` ledger but
+    # never read back here, so an approved, audited correction had zero
+    # effect on physical stock anywhere in the app. POSTED is the terminal
+    # status once approve_and_post_stock_adjustment() commits (PENDING ->
+    # APPROVED -> POSTED in one transaction) — PENDING/REJECTED requests
+    # correctly have no stock effect and are excluded.
+    adjustment_rows = cur.execute(
+        "SELECT id, quantity, direction, unit FROM stock_adjustment_requests "
+        "WHERE factory=? AND material=? AND stock_type='RM' AND status='POSTED'",
+        (factory, material)
+    ).fetchall()
+    adjustment = 0.0
+    for req_id, qty, direction, unit in adjustment_rows:
+        signed_qty = (qty or 0) if direction == "+" else -(qty or 0)
+        conv_qty, is_exact, note = convert_material_qty_to_base(material, signed_qty, unit or base_unit)
+        if not is_exact:
+            unconverted.append(f"Adjustment request #{req_id}: {signed_qty} {unit} — {note}")
+        adjustment += conv_qty
+    physical += adjustment
+
+    reserved_rows = cur.execute(
+        "SELECT reserved_qty, consumed_qty, unit FROM rm_reservations "
+        "WHERE factory=? AND material=? AND status='Reserved'", (factory, material)
+    ).fetchall()
+    reserved = 0.0
+    for res_qty, cons_qty, unit in reserved_rows:
+        outstanding = (res_qty or 0) - (cons_qty or 0)
+        if outstanding <= 0:
+            continue
+        conv_qty, is_exact, note = convert_material_qty_to_base(material, outstanding, unit or base_unit)
+        if not is_exact:
+            unconverted.append(f"reservation hold: {outstanding} {unit} — {note}")
+        reserved += conv_qty
+
+    return {
+        "physical_qty": round(physical, 4),
+        "reserved_qty": round(reserved, 4),
+        "available_qty": round(physical - reserved, 4),
+        "base_unit": base_unit,
+        "unconverted": unconverted,
+    }
+
+
+def all_rm_factory_materials() -> list[tuple[str, str]]:
+    """Every distinct (factory, material) pair with at least one rm_batches
+    row -- the population get_rm_physical_stock() should be scanned over,
+    replacing `SELECT DISTINCT ... FROM stock` (Gap P0-1)."""
+    return cur.execute(
+        "SELECT DISTINCT factory, material FROM rm_batches "
+        "WHERE material IS NOT NULL AND TRIM(material) != '' "
+        "AND factory IS NOT NULL AND TRIM(factory) != ''"
+    ).fetchall()
 
 # -- NEW: Official Finished Goods Master (single source of truth) ---------
 # Mirrors materials_master/material_aliases below but for finished products.
@@ -3898,6 +4147,31 @@ for _mig in [
     "ALTER TABLE production ADD COLUMN production_batch_id INTEGER",
     "ALTER TABLE sales      ADD COLUMN production_batch_id INTEGER",
     "ALTER TABLE stock      ADD COLUMN rm_batch_id INTEGER",
+    # NEW (P0-3): daily_log had no record of who entered it or which
+    # department they belonged to, so ownership couldn't be enforced on
+    # Edit/Delete — any logged-in user could alter any other department's
+    # entries. NULL/'' for every pre-existing row (unowned, same as today —
+    # editable by Admin only until it's next saved, never blocked from
+    # being read).
+    "ALTER TABLE daily_log ADD COLUMN created_by TEXT DEFAULT ''",
+    "ALTER TABLE daily_log ADD COLUMN created_by_dept TEXT DEFAULT ''",
+    # NEW (P0-1, second pass): `production` is now written to ONLY by the
+    # Legacy Direct Entry / Admin Correction path (the new PI→Batch→QC
+    # pipeline posts FG stock from production_batches instead) — an audit
+    # confirmed this by checking every INSERT INTO production in the code.
+    # That makes it safe to turn every row here into a proper two-person
+    # correction record instead of an instantly-posted one: status starts
+    # 'Pending Approval' and only a *different* Admin approving it triggers
+    # the FG stock posting. Existing rows predate this workflow and already
+    # have their FG postings made, so they backfill as 'Posted' — nothing
+    # about their FG stock effect changes.
+    "ALTER TABLE production ADD COLUMN status TEXT DEFAULT 'Posted'",
+    "ALTER TABLE production ADD COLUMN reference_doc TEXT DEFAULT ''",
+    "ALTER TABLE production ADD COLUMN correction_reason TEXT DEFAULT ''",
+    "ALTER TABLE production ADD COLUMN entered_by TEXT DEFAULT ''",
+    "ALTER TABLE production ADD COLUMN entered_at TEXT DEFAULT ''",
+    "ALTER TABLE production ADD COLUMN approved_by TEXT DEFAULT ''",
+    "ALTER TABLE production ADD COLUMN approved_at TEXT DEFAULT ''",
 ]:
     try:
         cur.execute(_mig)
@@ -3909,6 +4183,81 @@ for _mig in [
         # silently.
         if "duplicate column" not in str(e).lower():
             logger.warning("Migration failed: %s | %s", _mig, e)
+
+# ================= INVOICE NUMBERING =================
+# FIX: GST invoice PDFs previously printed "Order #00001" — the raw
+# sales_orders autoincrement id — as the invoice number. That's not GST
+# compliant: invoice numbers must be unique, strictly sequential with no
+# gaps, and (per common practice / most accounting software) reset at the
+# start of each financial year. An autoincrement id can have gaps (deleted/
+# corrected orders) and never resets. This gives every order a real,
+# immutable invoice number the first time an invoice is generated for it,
+# drawn from a per-financial-year counter, and never reissues or reuses one.
+cur.executescript("""
+CREATE TABLE IF NOT EXISTS invoice_counters (
+    financial_year TEXT PRIMARY KEY,
+    next_seq        INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS invoice_numbers (
+    order_id        INTEGER PRIMARY KEY,
+    invoice_no      TEXT NOT NULL UNIQUE,
+    financial_year  TEXT NOT NULL,
+    seq             INTEGER NOT NULL,
+    created_at      TEXT NOT NULL
+);
+""")
+conn.commit()
+
+def get_or_create_invoice_number(order_id: int, order_date: str) -> str:
+    """Returns this order's permanent invoice number, allocating one from
+    the current financial year's sequence on first call. Idempotent —
+    calling this again for the same order_id always returns the same
+    number rather than burning another sequence slot, so re-downloading an
+    invoice PDF never shifts anyone else's numbering.
+
+    (_financial_year_label / format_invoice_no live in fcsc_core.py — pure
+    functions, unit-tested there — imported and aliased near the top of
+    this file.)"""
+    existing = cur.execute(
+        "SELECT invoice_no FROM invoice_numbers WHERE order_id = ?", (order_id,)
+    ).fetchone()
+    if existing:
+        return existing[0]
+
+    try:
+        _d = datetime.date.fromisoformat(str(order_date)[:10])
+    except ValueError:
+        _d = today_ist()
+    fy = _financial_year_label(_d)
+
+    # FIX: allocation is a read-then-write on the shared per-FY counter —
+    # exactly the race _write_lock() exists to close (see its definition
+    # above), so two supervisors invoicing at the same instant can't be
+    # handed the same sequence number.
+    with _write_lock():
+        # Re-check inside the lock in case of a concurrent call for the
+        # same order_id that raced us to this point.
+        existing = cur.execute(
+            "SELECT invoice_no FROM invoice_numbers WHERE order_id = ?", (order_id,)
+        ).fetchone()
+        if existing:
+            return existing[0]
+        row = cur.execute(
+            "SELECT next_seq FROM invoice_counters WHERE financial_year = ?", (fy,)
+        ).fetchone()
+        seq = row[0] if row else 1
+        cur.execute(
+            "INSERT INTO invoice_counters (financial_year, next_seq) VALUES (?,?) "
+            "ON CONFLICT(financial_year) DO UPDATE SET next_seq=excluded.next_seq",
+            (fy, seq + 1)
+        )
+        invoice_no = format_invoice_no("FCSC", fy, seq)
+        cur.execute(
+            "INSERT INTO invoice_numbers (order_id, invoice_no, financial_year, seq, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (order_id, invoice_no, fy, seq, now_ist().isoformat(timespec="seconds"))
+        )
+    return invoice_no
 
 # ================= INDEXES =================
 # FIX: These columns are filtered on in almost every query in the app
@@ -4073,6 +4422,17 @@ def lab_code_label(material_name: str) -> str:
     item not yet added to the official master)."""
     code = get_lab_code(material_name)
     return code if code else material_name
+
+def formulation_material_selector_label(material_name: str) -> str:
+    """Lab-Code-only display label for Formulation's Add Material Line selector
+    (e.g. 'C3345/20'). Unlike lab_code_label(), this never falls back to the
+    Procurement Code or Material Name: if no Lab Code is on file, the material
+    is shown as unavailable so nothing else about it leaks into the selector.
+    The selectbox still returns the underlying canonical material value, so
+    add_bom_line() and existing Lab Code validation are unaffected — this only
+    changes what's displayed."""
+    code = get_lab_code(material_name)
+    return code if code else "🚫 Unavailable (no Lab Code)"
 MATERIALS      = get_material_master_names()
 # "Other / Custom" kept as a catch-all for anything genuinely not yet in the
 # official master (see Codification_for_System.xlsx) — new/unlisted materials
@@ -4336,11 +4696,24 @@ def delete_row_ui(df: pd.DataFrame, table: str,
     """Renders an expander with two-step confirmation before deleting a row.
     `on_delete`, if given, is called with the full row (as it was *before*
     deletion) right after the DELETE commits — used by Production/Dispatch to
-    reverse the linked FG stock movement so nothing is orphaned (Sections 7/8)."""
+    reverse the linked FG stock movement so nothing is orphaned (Sections 7/8).
+
+    P0-2 hardening: an audit flagged that hard deletion of transactional
+    records had no permission gate at all — any user who could see a
+    module's Delete expander could permanently remove a posted record.
+    Deletion of transactional data is now Admin-only, and a reason is
+    mandatory and captured in the audit trail. This does not touch
+    read/browse access to any module — only who can actually delete a row,
+    and only here, in the one shared helper every module's delete goes
+    through."""
     assert table in _ALLOWED_TABLES, f"Invalid table: {table}"
     if df.empty:
         return
     with st.expander("🗑️ Delete a Record", expanded=False):
+        if not _is_admin:
+            st.info("🔒 Deleting a record is restricted to Administrators. "
+                     "Ask an Admin if this record needs to be removed.")
+            return
         # FIX: not every table has a `date` column (e.g. "customers"), so the
         # date portion of the label is now optional instead of a hard
         # KeyError when it's missing.
@@ -4352,6 +4725,11 @@ def delete_row_ui(df: pd.DataFrame, table: str,
         }
         chosen = st.selectbox("Select record to delete", list(options.keys()),
                                key=f"{key_prefix}_del_select")
+        reason = st.text_input(
+            "Deletion Reason *", key=f"{key_prefix}_del_reason",
+            placeholder="e.g. Duplicate entry, entered against wrong factory",
+            help="Required — saved into the audit trail with this deletion."
+        )
 
         # ── Step 1: arm the confirmation ──────────────────────────────────
         armed_key = f"{key_prefix}_del_armed"
@@ -4359,25 +4737,31 @@ def delete_row_ui(df: pd.DataFrame, table: str,
             st.session_state[armed_key] = False
 
         if not st.session_state[armed_key]:
-            if st.button("🗑️ Delete this record", key=f"{key_prefix}_del_btn"):
+            if st.button("🗑️ Delete this record", key=f"{key_prefix}_del_btn",
+                         disabled=not reason.strip()):
                 st.session_state[armed_key] = True
                 st.rerun()
+            if not reason.strip():
+                st.caption("Enter a reason above to enable deletion.")
         else:
             # ── Step 2: show the red confirmation prompt ──────────────────
             st.error(
                 f"⚠️ **Are you sure?** This will permanently delete:\n\n"
                 f"> {chosen}\n\n"
+                f"Reason: {reason.strip()}\n\n"
                 f"This action **cannot be undone**."
             )
             col_yes, col_no = st.columns(2)
             with col_yes:
-                if st.button("✅ Yes, delete it", key=f"{key_prefix}_del_confirm"):
+                if st.button("✅ Yes, delete it", key=f"{key_prefix}_del_confirm",
+                             disabled=not reason.strip()):
                     rid = options[chosen]
                     _row_before = df[df["id"] == rid].iloc[0] if "id" in df.columns else None
                     try:
                         cur.execute(f"DELETE FROM {table} WHERE id = ?", (rid,))
                         conn.commit()
-                        log_audit("DELETE", table, rid, f"label={chosen}")
+                        log_audit("DELETE", table, rid,
+                                  f"label={chosen} | reason={reason.strip()}")
                         if on_delete is not None and _row_before is not None:
                             on_delete(_row_before)
                         st.session_state[armed_key] = False
@@ -4434,14 +4818,20 @@ def recompute_stock_chain(factory: str, material: str) -> None:
     """
     if not factory or not material:
         return
+    # G-03: rows written by approve_and_post_stock_adjustment() carry
+    # received=0, used=0, adjustment=+/-qty — folding `adjustment` in here
+    # keeps this the single source of truth for RM closing balances,
+    # exactly like fg_stock's closing_stock already includes its own
+    # `adjustment` column. adjustment defaults to 0 for every pre-existing
+    # row, so this is a no-op for all historical data.
     rows = cur.execute(
-        "SELECT id, received, used FROM stock WHERE factory=? AND material=? "
+        "SELECT id, received, used, adjustment FROM stock WHERE factory=? AND material=? "
         "ORDER BY date ASC, id ASC",
         (factory, material)
     ).fetchall()
     running = 0
-    for rid, received, used in rows:
-        running += (received or 0) - (used or 0)
+    for rid, received, used, adjustment in rows:
+        running += (received or 0) - (used or 0) + (adjustment or 0)
         cur.execute("UPDATE stock SET closing_stock=? WHERE id=?", (running, rid))
     conn.commit()
 
@@ -4864,35 +5254,37 @@ def _open_procurement_request(material: str, factory: str, trigger_type: str,
     return req_id
 
 def scan_low_stock_and_trigger_procurement() -> list[dict]:
-    """Checks the latest closing stock per (factory, material) against its
-    reorder threshold. For anything below threshold that doesn't already
-    have an open procurement request, opens one and emails the purchase
-    department. Returns the list of newly created alerts."""
+    """Checks physical/available RM stock against each material's reorder
+    threshold. For anything below threshold that doesn't already have an
+    open procurement request, opens one and emails the purchase department.
+    Returns the list of newly created alerts.
+
+    FIX (Gap P0-1): previously scanned the legacy `stock` table, which is
+    only ever updated by manual "Log Stock" entry and is never touched by
+    RM Receipt / QC approval. A material received and QC-approved through
+    the real workflow but never separately hand-logged into Stock could run
+    out on the floor without ever triggering an alert -- see
+    get_rm_physical_stock() for the full fix rationale. Now scans every
+    (factory, material) pair that actually has rm_batches activity, and
+    compares AVAILABLE stock (physical minus active reservations) against
+    threshold -- material already earmarked for a released job is not
+    "available" to cover a new shortfall, so this is the operationally
+    correct number to reorder against, not gross physical stock."""
     created: list[dict] = []
     try:
-        latest = pd.read_sql_query("""
-            SELECT s.factory, s.material, s.closing_stock,
-                   COALESCE(s.unit, '') AS unit
-            FROM stock s
-            INNER JOIN (
-                SELECT factory, material, MAX(date) AS max_date
-                FROM stock GROUP BY factory, material
-            ) latest
-            ON s.factory = latest.factory AND s.material = latest.material
-               AND s.date = latest.max_date
-        """, conn)
+        pairs = all_rm_factory_materials()
     except Exception as e:
         logger.warning("Low-stock scan query failed: %s", e)
         return created
 
-    for _, row in latest.iterrows():
-        factory_, material_ = row["factory"], row["material"]
+    for factory_, material_ in pairs:
+        snap = get_rm_physical_stock(factory_, material_)
         threshold_row = cur.execute(
             "SELECT threshold FROM reorder_levels WHERE material=? AND factory=?",
             (material_, factory_)
         ).fetchone()
         threshold = threshold_row[0] if threshold_row else DEFAULT_REORDER_THRESHOLD
-        if row["closing_stock"] >= threshold:
+        if snap["available_qty"] >= threshold:
             continue
 
         already_open = cur.execute(
@@ -4903,19 +5295,21 @@ def scan_low_stock_and_trigger_procurement() -> list[dict]:
             continue  # already actioned — don't spam a fresh alert every rerun
 
         req_id = _open_procurement_request(
-            material_, factory_, "auto_low_stock", row["closing_stock"], row["unit"],
-            f"Auto-triggered: stock {row['closing_stock']:.2f} {row['unit']} "
+            material_, factory_, "auto_low_stock", snap["available_qty"], snap["base_unit"],
+            f"Auto-triggered: available stock {snap['available_qty']:.2f} {snap['base_unit']} "
             f"below reorder threshold {threshold:.2f}"
+            + (f" [WARNING: {len(snap['unconverted'])} row(s) had no unit conversion "
+               f"factor on file — total may be approximate]" if snap["unconverted"] else "")
         )
         sent, msg = send_procurement_alert_email(
-            material_, factory_, row["closing_stock"], threshold, row["unit"], req_id
+            material_, factory_, snap["available_qty"], threshold, snap["base_unit"], req_id
         )
         # NEW: WhatsApp/SMS goes out alongside the email — same trigger,
         # different channel, for people who don't watch email closely.
         broadcast_phone_alert(
             "low_stock",
-            f"⚠️ FCSC Low Stock — {material_} @ {factory_}: {row['closing_stock']:.2f} "
-            f"{row['unit']} (below {threshold:.2f}). PR-{req_id:05d} opened."
+            f"⚠️ FCSC Low Stock — {material_} @ {factory_}: {snap['available_qty']:.2f} "
+            f"{snap['base_unit']} (below {threshold:.2f}). PR-{req_id:05d} opened."
         )
         created.append({"material": material_, "factory": factory_, "request_id": req_id,
                          "email_sent": sent, "email_msg": msg})
@@ -5055,31 +5449,59 @@ def broadcast_phone_alert(event: str, body: str) -> list[tuple[str, bool, str]]:
     return results
 
 # ================= REORDER-POINT FORECASTING =================
-# NEW: uses the daily `used` figures already logged in the stock table to
-# estimate a consumption rate per (factory, material), then projects how
-# many days remain before closing stock crosses the reorder threshold —
-# rather than only alerting once it's already below it.
+# Estimates a consumption rate per (factory, material) from real production
+# consumption over the trailing lookback window, then projects how many
+# days remain before physical stock crosses the reorder threshold — rather
+# than only alerting once it's already below it.
+#
+# FIX (P0-4, same root cause as P0-1/P0-2/P0-3): this used to read
+# avg_daily_used and closing_stock entirely from the legacy `stock` table,
+# which real production consumption never touches -- so any material
+# consumed only through the real pipeline showed zero usage / a frozen
+# closing_stock here, silently breaking both Procurement's forecast and the
+# Material 360 "Expected Exhaustion" tab. Now sourced from get_rm_physical_
+# stock() for the current balance and from production_batch_materials (real
+# consumption, dated via production_batches.created_at) for the usage rate,
+# the same real tables the rest of the P0-1 fix chain already uses.
 def reorder_forecast(days_history: int = 30) -> pd.DataFrame:
-    """Returns one row per (factory, material) currently tracked in stock,
-    with average daily usage, days remaining until the reorder threshold,
-    and a projected reorder date. NaN/None days_remaining means usage has
-    been zero/flat over the lookback window, so no forecast can be made."""
-    cutoff = str(today_ist() - datetime.timedelta(days=days_history))
-    hist = pd.read_sql_query(
-        "SELECT factory, material, date, used, closing_stock FROM stock "
-        "WHERE date >= ? ORDER BY factory, material, date",
-        conn, params=(cutoff,)
-    )
-    if hist.empty:
+    """Returns one row per (factory, material) with at least one approved
+    RM receipt on file, with average daily usage, days remaining until the
+    reorder threshold, and a projected reorder date. NaN/None
+    days_to_threshold means usage has been zero/flat over the lookback
+    window, so no forecast can be made."""
+    pairs = all_rm_factory_materials()
+    if not pairs:
         return pd.DataFrame()
 
-    latest_idx = hist.groupby(["factory", "material"])["date"].idxmax()
-    latest = hist.loc[latest_idx, ["factory", "material", "closing_stock"]].reset_index(drop=True)
+    cutoff = str(today_ist() - datetime.timedelta(days=days_history))
+    today_str = str(today_ist())
 
-    usage = (hist.groupby(["factory", "material"])["used"]
-                  .mean().reset_index().rename(columns={"used": "avg_daily_used"}))
+    rows = []
+    for fac, mat in pairs:
+        base_unit = get_material_base_unit(mat)
+        snap = get_rm_physical_stock(fac, mat)
 
-    out = latest.merge(usage, on=["factory", "material"], how="left")
+        used_rows = cur.execute(
+            "SELECT pbm.qty_used, rb.unit, DATE(pb.created_at) "
+            "FROM production_batch_materials pbm "
+            "JOIN rm_batches rb ON rb.id = pbm.rm_batch_id "
+            "JOIN production_batches pb ON pb.id = pbm.production_batch_id "
+            "WHERE rb.factory=? AND rb.material=?", (fac, mat)
+        ).fetchall()
+        used_total = 0.0
+        for qty, unit, d in used_rows:
+            if not d or d < cutoff or d > today_str:
+                continue
+            conv_qty, _, _ = convert_material_qty_to_base(mat, qty or 0, unit or base_unit)
+            used_total += conv_qty
+        avg_daily_used = used_total / days_history if days_history else 0.0
+
+        rows.append({
+            "factory": fac, "material": mat,
+            "closing_stock": snap["physical_qty"],
+            "avg_daily_used": avg_daily_used,
+        })
+    out = pd.DataFrame(rows)
 
     thresholds = pd.read_sql_query("SELECT material, factory, threshold FROM reorder_levels", conn)
     out = out.merge(thresholds, on=["material", "factory"], how="left")
@@ -5771,17 +6193,42 @@ def set_production_capacity(product: str, capacity: float, capacity_unit: str, u
 # 'Instruction Created' via create_production_instruction above); the rest
 # of the chain (In Production / Completed) is propagated automatically by
 # the functions above as the linked batch progresses.
-def send_sales_order_to_production(so_id: int) -> None:
-    cur.execute(
+def send_sales_order_to_production(so_id: int, acting_factory: str | None = None) -> bool:
+    """FIX: previously any Sales-department account could forward ANY
+    factory's sales order into production — the UI listed every factory's
+    unsent orders together with no filter, and this function itself never
+    checked which factory the order actually belonged to. `acting_factory`
+    is the caller's own (locked) factory for a non-admin; when given, the
+    order is only forwarded if it actually belongs to that factory. Admins
+    (acting_factory=None) can still forward any order, matching their
+    existing full access elsewhere. Returns False (no-op) if blocked."""
+    if acting_factory is not None:
+        _match = cur.execute(
+            "SELECT 1 FROM sales_orders WHERE id=? AND factory=?", (so_id, acting_factory)
+        ).fetchone()
+        if not _match:
+            return False
+    n = cur.execute(
         "UPDATE sales_orders SET wo_status='Sent to Production' WHERE id=? AND wo_status='New'",
         (so_id,)
-    )
+    ).rowcount
     conn.commit()
-    log_audit("UPDATE", "sales_orders", so_id, "Sent to Production")
+    if n:
+        log_audit("UPDATE", "sales_orders", so_id, "Sent to Production")
+    return bool(n)
 
-def get_sales_orders_pending_production() -> pd.DataFrame:
+def get_sales_orders_pending_production(restrict_factory: str | None = None) -> pd.DataFrame:
     """Sales Orders that have been forwarded to Production but don't yet
-    have a Production Instruction issued against them."""
+    have a Production Instruction issued against them. FIX: previously
+    returned every factory's pending orders regardless of caller — see the
+    Sales "To Production" and Formulation "Production Instructions" call
+    sites, both updated to pass the viewer's own factory when they aren't
+    admin, matching the isolation enforced everywhere else in the app."""
+    if restrict_factory:
+        return pd.read_sql_query(
+            "SELECT * FROM sales_orders WHERE wo_status='Sent to Production' AND factory=? "
+            "ORDER BY id DESC", conn, params=(restrict_factory,)
+        )
     return pd.read_sql_query(
         "SELECT * FROM sales_orders WHERE wo_status='Sent to Production' ORDER BY id DESC", conn
     )
@@ -6774,13 +7221,29 @@ def generate_mtc_pdf(trace: dict) -> bytes | None:
 
     doc.build(story)
     return buf.getvalue()
-COMPANY_INFO = {
-    "name": "Firstchoice Speciality Chemicals Pvt. Ltd.",
-    "address": "Belda, Mogra, Singur & Siliguri, West Bengal, India",
-    "gstin": "— set your company GSTIN in COMPANY_INFO —",
-    "email": "support@fcsc.co.in",
-    "phone": "+91 33 3500 0230",
-}
+# FIX: company GSTIN used to be a hardcoded placeholder string that would
+# print on real customer tax invoices unless someone remembered to edit the
+# source code. Now read from st.secrets/env, same pattern as SMTP/Twilio, so
+# it's set once during deployment and never lives in source control. If it's
+# still not configured, invoice generation below refuses to produce a PDF
+# rather than shipping a document with a placeholder GSTIN.
+def _get_company_info() -> dict:
+    gstin = ""
+    try:
+        if "company" in st.secrets:
+            gstin = st.secrets["company"].get("gstin", "")
+    except Exception:
+        pass
+    gstin = gstin or os.environ.get("COMPANY_GSTIN", "")
+    return {
+        "name": "Firstchoice Speciality Chemicals Pvt. Ltd.",
+        "address": "Belda, Mogra, Singur & Siliguri, West Bengal, India",
+        "gstin": gstin.strip(),
+        "email": "support@fcsc.co.in",
+        "phone": "+91 33 3500 0230",
+    }
+
+COMPANY_INFO = _get_company_info()
 
 def generate_invoice_pdf(order_row: dict, customer_row: dict | None) -> bytes | None:
     """Builds a GST-style invoice PDF for one sales order. `order_row` is a
@@ -6791,7 +7254,16 @@ def generate_invoice_pdf(order_row: dict, customer_row: dict | None) -> bytes | 
     (e.g. invoice numbering sequence, e-invoice IRN if applicable)."""
     if not HAS_REPORTLAB:
         return None
+    # FIX: refuse to generate a tax invoice with an unconfigured GSTIN
+    # instead of silently printing the placeholder string that used to live
+    # here. Caller (Sales/Dispatch invoice buttons) is expected to show
+    # st.error() and a link to Settings when this returns None for this
+    # reason vs. missing reportlab — see the two call sites.
+    if not COMPANY_INFO.get("gstin"):
+        logger.warning("Invoice generation blocked: company GSTIN not configured")
+        return None
     o = order_row
+    invoice_no = get_or_create_invoice_number(o["id"], o["date"])
     buf = BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4,
                              topMargin=16*mm, bottomMargin=16*mm,
@@ -6806,8 +7278,13 @@ def generate_invoice_pdf(order_row: dict, customer_row: dict | None) -> bytes | 
         Paragraph(f"{COMPANY_INFO['address']}<br/>GSTIN: {COMPANY_INFO['gstin']}<br/>"
                   f"{COMPANY_INFO['email']} | {COMPANY_INFO['phone']}", body),
         Spacer(1, 10),
-        Paragraph(f"<b>TAX INVOICE</b> &nbsp;&nbsp; Order #{o['id']:05d} &nbsp;&nbsp; "
-                  f"Date: {o['date']}", styles["Heading3"]),
+        # FIX: was "Order #{id:05d}" — the raw DB autoincrement id, which
+        # isn't GST-compliant (see get_or_create_invoice_number above for
+        # why). Order id is still shown, just no longer labelled as the
+        # invoice number.
+        Paragraph(f"<b>TAX INVOICE</b> &nbsp;&nbsp; Invoice No: {invoice_no} &nbsp;&nbsp; "
+                  f"Date: {o['date']} &nbsp;&nbsp; <font size=8>(Order #{o['id']:05d})</font>",
+                  styles["Heading3"]),
         Spacer(1, 6),
     ]
 
@@ -6861,15 +7338,29 @@ def generate_invoice_pdf(order_row: dict, customer_row: dict | None) -> bytes | 
     doc.build(story)
     return buf.getvalue()
 
-def get_order_status(order_id: int) -> dict | None:
+def get_order_status(order_id: int, restrict_factory: str | None = None) -> dict | None:
     """Customer-facing order status lookup: which batch (if known) fulfilled
     this order and its dispatch stage, for a simple 'has my order shipped'
     answer without a phone call. Best-effort — links an order to a batch via
     matching product + factory + date, since sales_orders doesn't currently
-    store a direct batch reference."""
-    order = cur.execute(
-        "SELECT * FROM sales_orders WHERE id = ?", (order_id,)
-    ).fetchone()
+    store a direct batch reference.
+
+    FIX: previously looked up by order id alone with no factory check — a
+    factory-locked supervisor account could type any order number and see
+    another plant's customer name, product, quantity, and revenue. When
+    `restrict_factory` is given (i.e. the caller isn't an admin), the order
+    must belong to that factory or this returns None, exactly as if the
+    order didn't exist — same behaviour a genuinely unknown order id gets,
+    so this doesn't even reveal "an order with this id exists elsewhere"."""
+    if restrict_factory:
+        order = cur.execute(
+            "SELECT * FROM sales_orders WHERE id = ? AND factory = ?",
+            (order_id, restrict_factory)
+        ).fetchone()
+    else:
+        order = cur.execute(
+            "SELECT * FROM sales_orders WHERE id = ?", (order_id,)
+        ).fetchone()
     if order is None:
         return None
     cols = [d[0] for d in cur.description]
@@ -7062,10 +7553,9 @@ with st.sidebar:
                     if st.button("✅ Yes, wipe transactional data", key="reset_erp_confirm"):
                         try:
                             # Safety net: timestamped full backup before touching anything.
-                            _rbk_dir = "fcsc_backups"
-                            os.makedirs(_rbk_dir, exist_ok=True)
-                            _rbk_name = (f"{_rbk_dir}/fcsc_pre_reset_"
-                                         f"{now_ist().strftime('%Y%m%d_%H%M%S')}.db")
+                            _rbk_name = os.path.join(
+                                _get_backup_dir(),
+                                f"fcsc_pre_reset_{now_ist().strftime('%Y%m%d_%H%M%S')}.db")
                             conn.commit()
                             # FIX: was shutil.copy2("fcsc.db", ...) — a relative path
                             # that no longer points at the live DB (see get_connection /
@@ -7121,7 +7611,7 @@ with st.sidebar:
             elif cp_new != cp_new2:
                 st.error("New passwords do not match.")
             else:
-                cur.execute("UPDATE users SET password = ? WHERE username = ?",
+                cur.execute("UPDATE users SET password = ?, must_change_password = 0 WHERE username = ?",
                             (_hash_password(cp_new), _uname))
                 conn.commit()
                 st.success("Password updated and saved.")
@@ -7150,9 +7640,8 @@ with st.sidebar:
 # ── DB backup ─────────────────────────────────────────────────────────────
 if _is_admin and "db_backed_up" not in st.session_state:
     try:
-        _backup_dir = "fcsc_backups"
-        os.makedirs(_backup_dir, exist_ok=True)
-        _backup_name = f"{_backup_dir}/fcsc_{today_ist()}.db"
+        _backup_dir = _get_backup_dir()
+        _backup_name = os.path.join(_backup_dir, f"fcsc_{today_ist()}.db")
         if not os.path.exists(_backup_name):
             # FIX: was shutil.copy2("fcsc.db", ...) — a relative path that no
             # longer matches where the live DB actually lives (see
@@ -7170,6 +7659,62 @@ if _is_admin and "db_backed_up" not in st.session_state:
         # FIX: backup failure still never blocks the app, but is now logged.
         logger.warning("DB backup failed: %s", e)
     st.session_state["db_backed_up"] = True
+
+# NEW: on-disk backups are worthless if the disk itself is lost — a local
+# daily .db file doesn't protect you from the server dying, being
+# reprovisioned, or (on ephemeral hosts) simply restarting. Until this is
+# wired up to real off-box storage (S3, a second server, etc.), give the
+# admin a one-click way to pull the latest backup down to their own
+# machine, so "offsite copy" doesn't depend on remembering to SSH in.
+# NEW: SMTP/Twilio failing to send used to be visible only if an admin
+# happened to open Procurement → Settings. A low-stock alert or a vendor
+# notification silently not going out is exactly the kind of failure that
+# should be loud, not something you discover a week later when the
+# warehouse actually runs out. This surfaces it on every page an admin
+# loads instead.
+if _is_admin:
+    _alerts_smtp_off   = _get_smtp_transport() is None
+    _alerts_twilio_off = _get_twilio_config() is None
+    if _alerts_smtp_off or _alerts_twilio_off:
+        _off = []
+        if _alerts_smtp_off:
+            _off.append("email")
+        if _alerts_twilio_off:
+            _off.append("WhatsApp/SMS")
+        st.sidebar.warning(
+            f"🔕 {' & '.join(_off).capitalize()} alerts are OFF — low-stock "
+            f"and procurement notifications won't be sent. Configure under "
+            f"Procurement → Settings."
+        )
+
+if _is_admin:
+    with st.sidebar.expander("⬇️ Download latest backup", expanded=False):
+        try:
+            _bk_dir = _get_backup_dir()
+            _bk_all = sorted(
+                [f for f in os.listdir(_bk_dir) if f.endswith(".db")],
+                reverse=True,
+            )
+            if not _bk_all:
+                st.caption("No backups on disk yet.")
+            else:
+                _latest_bk = _bk_all[0]
+                with open(os.path.join(_bk_dir, _latest_bk), "rb") as _bkf:
+                    st.download_button(
+                        "Download " + _latest_bk,
+                        data=_bkf.read(),
+                        file_name=_latest_bk,
+                        mime="application/octet-stream",
+                        key="dl_latest_backup",
+                    )
+                st.caption(
+                    "Save this somewhere off this server regularly — a local "
+                    "backup on the same disk as the live database doesn't "
+                    "protect you if the server itself is lost."
+                )
+        except Exception as e:
+            logger.warning("Backup download UI failed: %s", e)
+            st.caption("Backup download unavailable right now.")
 
 # ── unit converters ────────────────────────────────────────────────────────
 def to_mt(value: float) -> float:
@@ -7271,6 +7816,224 @@ def reverse_fg_stock_for_source(fac: str, product: str, source_module: str,
         source_ref_id=source_ref_id, movement_type="Reversal"
     )
 
+# ── G-03: Controlled Stock Adjustment workflow (Request -> Approve -> Post) ──
+# Replaces "Save Adjustment -> immediately changes stock" for both FG and RM
+# with a two-person, auditable lifecycle:
+#
+#   create_stock_adjustment_request()      PENDING only — never touches a ledger.
+#   approve_and_post_stock_adjustment()    the ONLY place a request's ledger
+#                                           movement is ever written, atomic
+#                                           with the PENDING->POSTED transition.
+#   reject_stock_adjustment_request()      PENDING -> REJECTED, no ledger effect.
+#
+# _post_fg_adjustment_locked / _post_rm_adjustment_locked assume they are
+# already running inside an open _write_lock() transaction — SQLite's
+# BEGIN IMMEDIATE does not nest, so these are never called on their own; only
+# approve_and_post_stock_adjustment() calls them, from inside its own
+# _write_lock() block, so the status flip and the ledger write commit or roll
+# back together.
+
+def create_stock_adjustment_request(factory: str, stock_type: str, material: str,
+                                     quantity: float, direction: str, reason: str,
+                                     requester: str, unit: str = "") -> int:
+    """Records a PENDING adjustment request. Never changes stock — the
+    ledger is only ever touched by approve_and_post_stock_adjustment()."""
+    if stock_type not in ("FG", "RM"):
+        raise ValueError("stock_type must be 'FG' or 'RM'")
+    if direction not in ("+", "-"):
+        raise ValueError("direction must be '+' or '-'")
+    if quantity <= 0:
+        raise ValueError("quantity must be a positive magnitude")
+    if not reason.strip():
+        raise ValueError("reason is required")
+    try:
+        with _write_lock():
+            cur.execute(
+                "INSERT INTO stock_adjustment_requests "
+                "(factory,stock_type,material,quantity,direction,unit,reason,requester,"
+                "requested_at,status) VALUES (?,?,?,?,?,?,?,?,?,'PENDING')",
+                (factory, stock_type, material, quantity, direction, unit, reason.strip(),
+                 requester, now_ist().isoformat(timespec="seconds"))
+            )
+            new_id = cur.lastrowid
+    except sqlite3.OperationalError as e:
+        # KNOWN LIMITATION (see approve_and_post_stock_adjustment for the
+        # full explanation): _write_lock() shares one sqlite3.Connection
+        # across every Streamlit session/thread, so two near-simultaneous
+        # writers can occasionally collide on Python's own transaction
+        # tracking rather than SQLite's file lock. Caught narrowly here so a
+        # genuinely rare collision surfaces as "please retry" instead of an
+        # unhandled crash — it does not affect correctness (nothing partial
+        # is ever committed either way).
+        if "transaction" in str(e).lower():
+            raise RuntimeError(
+                "Another stock write was in progress at the same instant — please try again."
+            ) from e
+        raise
+    log_audit("INSERT", "stock_adjustment_requests", new_id,
+              f"{stock_type} | {factory} | {material} | {direction}{quantity} | "
+              f"reason: {reason.strip()} | requested by {requester}")
+    return new_id
+
+
+def _post_fg_adjustment_locked(date_val, fac: str, product: str, signed_qty: float,
+                                request_id: int) -> float:
+    """Appends the FG ledger row for an approved adjustment. MUST only be
+    called from inside an existing _write_lock() transaction."""
+    prev = get_fg_closing_stock(fac, product)
+    closing = prev + signed_qty
+    cur.execute(
+        "INSERT INTO fg_stock (date,factory,product,fg_code,production_in,dispatch_out,"
+        "adjustment,closing_stock,source_module,source_ref_id,created_at,movement_type) "
+        "VALUES (?,?,?,?,0,0,?,?,?,?,?,?)",
+        (str(date_val), fac, product, get_fg_code(product) or "", signed_qty, closing,
+         "STOCK_ADJUSTMENT", request_id, _now_iso(), "Adjustment")
+    )
+    return closing
+
+
+def _post_rm_adjustment_locked(date_val, fac: str, material: str, signed_qty: float,
+                                request_id: int) -> float:
+    """Appends the RM ledger row for an approved adjustment (received=0,
+    used=0, adjustment=signed_qty) — never touches the received/used columns
+    Stores' routine Log Stock entries use. MUST only be called from inside an
+    existing _write_lock() transaction."""
+    row = cur.execute(
+        "SELECT closing_stock FROM stock WHERE factory=? AND material=? "
+        "ORDER BY id DESC LIMIT 1", (fac, material)
+    ).fetchone()
+    prev = float(row[0]) if row else 0.0
+    closing = prev + signed_qty
+    cur.execute(
+        "INSERT INTO stock (date,factory,material,received,used,closing_stock,unit,code,"
+        "adjustment,source_module,source_ref_id) VALUES (?,?,?,0,0,?,?,?,?,?,?)",
+        (str(date_val), fac, material, closing, "", get_lab_code(material) or "",
+         signed_qty, "STOCK_ADJUSTMENT", request_id)
+    )
+    return closing
+
+
+def approve_and_post_stock_adjustment(request_id: int, approver: str,
+                                       decision_reason: str = "") -> tuple[bool, str]:
+    """Approves a PENDING request and posts its ledger movement in the SAME
+    atomic transaction as the PENDING->POSTED status change: either both
+    happen, or (if posting raises) the whole transaction rolls back and the
+    request is left exactly as it was — never left showing POSTED with no
+    matching ledger row, and never left silently stuck as APPROVED.
+
+    The conditional UPDATE (`WHERE status='PENDING'`) is the idempotency
+    guard: a double-click, page refresh, retry, or a second approver racing
+    this one can never post the same request twice. If 0 rows match, the
+    request was already decided and this call is a safe no-op.
+
+    KNOWN LIMITATION — genuinely concurrent (same-instant, different-thread)
+    approvals: this app's `_write_lock()` opens its transaction directly on
+    one sqlite3.Connection object that every Streamlit session/thread shares
+    (see get_connection()'s @st.cache_resource). Python's sqlite3 module
+    tracks "currently in a transaction" on that Connection object itself, so
+    when two threads call `conn.execute("BEGIN IMMEDIATE")` at truly the
+    same instant, the loser can get a hard `OperationalError:  cannot start
+    a transaction within a transaction` from Python before SQLite's own file
+    lock / PRAGMA busy_timeout ever gets a chance to make it simply wait, as
+    the comment on _write_lock() intends. This is a pre-existing limitation
+    of _write_lock() itself (it is not specific to stock adjustments — it
+    would affect any two truly-simultaneous writers anywhere in the app) and
+    is out of scope to fix here without touching shared infrastructure.
+    Verified under an actual multi-threaded race: it does NOT corrupt data
+    or double-post (exactly one of the two competing calls ever writes a
+    ledger row) — the only symptom is that the losing call raises instead of
+    returning a clean (False, "please retry") tuple like the sequential
+    "already decided" case does. Caught narrowly below so that symptom is at
+    least surfaced as a clear, actionable error rather than an unhandled
+    crash. See the G-03 deliverable report, Section G, for the recommended
+    proper fix (a dedicated lock around the BEGIN IMMEDIATE call itself)."""
+    now = now_ist().isoformat(timespec="seconds")
+    try:
+        with _write_lock():
+            row = cur.execute(
+                "SELECT factory, stock_type, material, quantity, direction, requester, "
+                "unit, status FROM stock_adjustment_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            if row is None:
+                return False, "Request not found."
+            factory, stock_type, material, quantity, direction, requester, unit, status = row
+            if status != "PENDING":
+                return False, f"Request is already {status} — no action taken."
+            if approver == requester:
+                # Backend enforcement — never rely on the Approve button merely
+                # being hidden for the requester.
+                return False, "Approver must be a different user from the requester."
+            n = cur.execute(
+                "UPDATE stock_adjustment_requests SET status='APPROVED', approver=?, "
+                "decision_at=?, decision_reason=? WHERE id=? AND status='PENDING'",
+                (approver, now, decision_reason.strip(), request_id)
+            ).rowcount
+            if n == 0:
+                return False, "Request was already decided by someone else — no action taken."
+            signed_qty = quantity if direction == "+" else -quantity
+            if stock_type == "FG":
+                closing = _post_fg_adjustment_locked(today_ist(), factory, material,
+                                                      signed_qty, request_id)
+            else:
+                closing = _post_rm_adjustment_locked(today_ist(), factory, material,
+                                                      signed_qty, request_id)
+            ledger_id = cur.lastrowid
+            cur.execute(
+                "UPDATE stock_adjustment_requests SET status='POSTED', posted_at=?, "
+                "ledger_ref_id=? WHERE id=?",
+                (now, ledger_id, request_id)
+            )
+    except sqlite3.OperationalError as e:
+        if "transaction" in str(e).lower():
+            return False, ("Another approval hit the database at the exact same instant — "
+                            "nothing was posted. Please try again.")
+        raise
+    log_audit("APPROVE_AND_POST", "stock_adjustment_requests", request_id,
+              f"{stock_type} | {factory} | {material} | {direction}{quantity} | "
+              f"approver={approver} | ledger_id={ledger_id} | closing={closing:,.2f}")
+    return True, (f"Approved and posted — {stock_type} stock for {material} @ {factory} "
+                  f"is now {closing:,.2f} {unit or ''}".strip() + f" (ledger ref #{ledger_id}).")
+
+
+def reject_stock_adjustment_request(request_id: int, approver: str,
+                                     decision_reason: str) -> tuple[bool, str]:
+    """PENDING -> REJECTED. No ledger effect, ever. Rejection reason is
+    mandatory. Same requester!=approver enforcement and idempotency guard as
+    approval (see approve_and_post_stock_adjustment for the concurrency
+    caveat this shares)."""
+    if not decision_reason.strip():
+        return False, "A rejection reason is required."
+    now = now_ist().isoformat(timespec="seconds")
+    try:
+        with _write_lock():
+            row = cur.execute(
+                "SELECT requester, status FROM stock_adjustment_requests WHERE id=?",
+                (request_id,)
+            ).fetchone()
+            if row is None:
+                return False, "Request not found."
+            requester, status = row
+            if status != "PENDING":
+                return False, f"Request is already {status} — no action taken."
+            if approver == requester:
+                return False, "Approver must be a different user from the requester."
+            n = cur.execute(
+                "UPDATE stock_adjustment_requests SET status='REJECTED', approver=?, "
+                "decision_at=?, decision_reason=? WHERE id=? AND status='PENDING'",
+                (approver, now, decision_reason.strip(), request_id)
+            ).rowcount
+            if n == 0:
+                return False, "Request was already decided — no action taken."
+    except sqlite3.OperationalError as e:
+        if "transaction" in str(e).lower():
+            return False, ("Another decision hit the database at the exact same instant — "
+                            "nothing was changed. Please try again.")
+        raise
+    log_audit("REJECT", "stock_adjustment_requests", request_id,
+              f"rejected by {approver} | reason: {decision_reason.strip()}")
+    return True, "Request rejected — no stock movement was posted."
+
+
 # ── FG canonical stock unit (Section 6) ──────────────────────────────────────
 # Production is entered as a weight (MT internally, displayed/entered in
 # whatever unit the sidebar UNIT SYSTEM selector is set to). Dispatch is
@@ -7311,6 +8074,17 @@ def convert_production_qty_to_fg_unit(qty_display: float, product: str) -> tuple
     file for a packed-unit product) — the caller must surface this rather
     than silently writing an incompatible-unit number to the ledger."""
     qty_kg = to_mt(qty_display) * 1000.0  # normalise via the existing MT converter
+    return convert_mt_to_fg_unit(qty_kg / 1000.0, product)
+
+def convert_mt_to_fg_unit(qty_mt: float, product: str) -> tuple[float, bool, str]:
+    """Same conversion as convert_production_qty_to_fg_unit(), but starting
+    from an already-canonical MT quantity instead of a sidebar-unit display
+    value. Used wherever the caller's own `unit` selection (a per-session
+    sidebar preference) must NOT influence the result — e.g. approving a
+    legacy correction someone else submitted, where the MT value was fixed
+    at submission time and re-deriving it via the approver's current unit
+    setting would silently convert it wrong."""
+    qty_kg = float(qty_mt) * 1000.0
     cfg = get_fg_stock_unit_cfg(product)
     stock_unit = cfg["stock_unit"]
     pack_kg = cfg["pack_weight_kg"]
@@ -7680,6 +8454,17 @@ CUSTOMER_LIST = load_customers()
 # bare spinner, since this runs on every module load for every user ────────
 _data_skel = show_skeleton_cards(count=5)
 prod_df       = load_filtered("production",  factory, d_start, d_end)
+# P0-1: `production` now also holds Pending/Rejected legacy corrections that
+# haven't posted (or will never post) to FG Stock — see the two-person
+# approval workflow in Production → Legacy Direct Entry. Every other
+# consumer of prod_df (Dashboard, Analysis, the Production module's own
+# Quick Summary/charts) is a report of *actual* production, so those rows
+# must not be counted until approved. Filtered once, here, rather than at
+# each of the ~15 places prod_df is summed — the Legacy tab's own approval
+# queue queries `production` directly and is unaffected by this filter.
+if not prod_df.empty and "status" in prod_df.columns:
+    prod_df = prod_df[prod_df["status"] != "Pending Approval"]
+    prod_df = prod_df[prod_df["status"] != "Rejected"]
 sand_df       = load_filtered("sand",        factory, d_start, d_end)
 stock_df      = load_filtered("stock",       factory, d_start, d_end)
 sales_df      = load_filtered("sales",       factory, d_start, d_end)   # Dispatch table
@@ -8012,12 +8797,32 @@ def render_customer_360(customer_name: str) -> None:
     st.title(f"🏢 {_cust_dict['name']}")
     st.caption(f"GSTIN: {_cust_dict['gstin'] or '—'} · Phone: {_cust_dict['phone'] or '—'}")
 
-    _orders = pd.read_sql_query(
-        "SELECT * FROM sales_orders WHERE customer = ? ORDER BY date DESC",
-        conn, params=(customer_name,))
-    _dispatches = pd.read_sql_query(
-        "SELECT * FROM sales WHERE customer = ? ORDER BY date DESC",
-        conn, params=(customer_name,))
+    # FIX: `customers` is intentionally a single company-wide table (a
+    # customer can buy from more than one plant), but that meant this 360
+    # view showed a customer's full order/dispatch history and revenue
+    # across ALL factories to everyone — including a supervisor account
+    # that's hard-locked to one factory everywhere else in the app. Scope
+    # the order/dispatch history to the viewer's own factory unless they're
+    # admin, matching the isolation the rest of the app already enforces.
+    _c360_restrict = None if _is_admin else _user_factory
+    if _c360_restrict:
+        st.caption(
+            f"Showing **{_c360_restrict}** activity only for this customer. "
+            f"Admin accounts can see activity across all factories."
+        )
+        _orders = pd.read_sql_query(
+            "SELECT * FROM sales_orders WHERE customer = ? AND factory = ? ORDER BY date DESC",
+            conn, params=(customer_name, _c360_restrict))
+        _dispatches = pd.read_sql_query(
+            "SELECT * FROM sales WHERE customer = ? AND factory = ? ORDER BY date DESC",
+            conn, params=(customer_name, _c360_restrict))
+    else:
+        _orders = pd.read_sql_query(
+            "SELECT * FROM sales_orders WHERE customer = ? ORDER BY date DESC",
+            conn, params=(customer_name,))
+        _dispatches = pd.read_sql_query(
+            "SELECT * FROM sales WHERE customer = ? ORDER BY date DESC",
+            conn, params=(customer_name,))
 
     _total_orders  = len(_orders) + len(_dispatches)
     _outstanding   = (_dispatches[_dispatches["status"].isin(["Pending", "Partial", "Overdue"])]["total"].sum()
@@ -8103,11 +8908,19 @@ def render_customer_360(customer_name: str) -> None:
             _o_id  = _o_opts[_o_pick]
             _o_row = _orders[_orders["id"] == _o_id].iloc[0].to_dict()
             pdf_bytes = generate_invoice_pdf(_o_row, _cust_dict)
-            st.download_button(
-                "📥 Download Invoice (PDF)", data=pdf_bytes,
-                file_name=f"FCSC_Invoice_{_o_id:05d}.pdf", mime="application/pdf",
-                key="cust360_inv_dl",
-            )
+            if pdf_bytes is None:
+                st.error(
+                    "Can't generate this invoice — your company GSTIN isn't "
+                    "configured yet. Set it in `.streamlit/secrets.toml` under "
+                    "`[company] gstin = \"...\"` (or the COMPANY_GSTIN env var), "
+                    "then restart the app."
+                )
+            else:
+                st.download_button(
+                    "📥 Download Invoice (PDF)", data=pdf_bytes,
+                    file_name=f"FCSC_Invoice_{_o_id:05d}.pdf", mime="application/pdf",
+                    key="cust360_inv_dl",
+                )
 
     with tab_contact:
         st.markdown("**Contact on file:**")
@@ -8139,21 +8952,77 @@ def render_material_360(material_name: str) -> None:
             st.warning("⏳ This material's Procurement Code is still awaiting plant-team "
                        "confirmation — see the Material Master tab under Stock to update it.")
 
-    _hist = pd.read_sql_query(
-        "SELECT * FROM stock WHERE material = ? ORDER BY date", conn, params=(material_name,))
-    if _hist.empty:
+    # FIX (P0-3, same root cause as P0-1/P0-2): these metrics used to be
+    # read entirely from the legacy `stock` table (manual Log Stock entries
+    # only) — a material consumed purely through real production would show
+    # "No stock records found" here despite having real, actively-managed
+    # physical stock. Now computed from the real transactional tables
+    # (rm_batches / production_batch_materials / stock_adjustment_requests),
+    # the same sources get_rm_physical_stock() already uses, unit-converted
+    # the same way.
+    _base_unit_m = get_material_base_unit(material_name)
+    _has_any_receipt = cur.execute(
+        "SELECT 1 FROM rm_batches WHERE material=? AND status='Approved' LIMIT 1",
+        (material_name,)
+    ).fetchone()
+    if not _has_any_receipt:
         st.info(f"No stock records found yet for **{material_name}**.")
         return
 
-    _hist_range = _hist[(_hist["date"] >= str(d_start)) & (_hist["date"] <= str(d_end))]
-    _opening = None
-    if not _hist_range.empty:
-        _first = _hist_range.sort_values("date").iloc[0]
-        _opening = _first["closing_stock"] - _first["received"] + _first["used"]
+    def _consumed_between(lo, hi):
+        rows = cur.execute(
+            "SELECT pbm.qty_used, rb.unit, DATE(pb.created_at) "
+            "FROM production_batch_materials pbm "
+            "JOIN rm_batches rb ON rb.id = pbm.rm_batch_id "
+            "JOIN production_batches pb ON pb.id = pbm.production_batch_id "
+            "WHERE rb.material=?", (material_name,)
+        ).fetchall()
+        total = 0.0
+        for qty, unit, d in rows:
+            if not d or (lo and d < lo) or (hi and d > hi):
+                continue
+            conv_qty, _, _ = convert_material_qty_to_base(material_name, qty or 0, unit or _base_unit_m)
+            total += conv_qty
+        return total
+
+    def _receipts_between(lo, hi):
+        rows = cur.execute(
+            "SELECT quantity, unit, received_date FROM rm_batches "
+            "WHERE material=? AND status='Approved'", (material_name,)
+        ).fetchall()
+        total = 0.0
+        for qty, unit, d in rows:
+            if not d or (lo and d < lo) or (hi and d > hi):
+                continue
+            conv_qty, _, _ = convert_material_qty_to_base(material_name, qty or 0, unit or _base_unit_m)
+            total += conv_qty
+        return total
+
+    def _adjustments_between(lo, hi):
+        rows = cur.execute(
+            "SELECT quantity, direction, unit, posted_at FROM stock_adjustment_requests "
+            "WHERE material=? AND stock_type='RM' AND status='POSTED'", (material_name,)
+        ).fetchall()
+        total = 0.0
+        for qty, direction, unit, posted_at in rows:
+            d = (posted_at or "")[:10]
+            if not d or (lo and d < lo) or (hi and d > hi):
+                continue
+            signed_qty = (qty or 0) if direction == "+" else -(qty or 0)
+            conv_qty, _, _ = convert_material_qty_to_base(material_name, signed_qty, unit or _base_unit_m)
+            total += conv_qty
+        return total
+
+    _day_before_range = str(d_start - datetime.timedelta(days=1))
+    _opening = (_receipts_between(None, _day_before_range)
+                + _adjustments_between(None, _day_before_range)
+                - _consumed_between(None, _day_before_range))
 
     _today_str_m = str(today_ist())
-    _today_used  = _hist[_hist["date"] == _today_str_m]["used"].sum()
-    _avg_used    = _hist_range["used"].mean() if not _hist_range.empty else _hist["used"].mean()
+    _today_used  = _consumed_between(_today_str_m, _today_str_m)
+
+    _range_days = max((d_end - d_start).days + 1, 1)
+    _avg_used   = _consumed_between(str(d_start), str(d_end)) / _range_days
 
     _vendor_name = get_default_vendor_for_material(material_name)
     _vendor      = get_vendor(_vendor_name) if _vendor_name else None
@@ -8163,10 +9032,11 @@ def render_material_360(material_name: str) -> None:
         "WHERE material = ? ORDER BY id DESC LIMIT 1", conn, params=(material_name,))
 
     kc1, kc2, kc3, kc4 = st.columns(4)
-    kc1.metric("Opening Stock (range start)", f"{_opening:,.0f}" if _opening is not None else "—")
+    kc1.metric("Opening Stock (range start)", f"{_opening:,.0f}")
     kc2.metric("Today's Consumption", f"{_today_used:,.0f}")
-    kc3.metric("Average Consumption", f"{_avg_used:,.1f}" if pd.notna(_avg_used) else "—")
+    kc3.metric("Average Consumption", f"{_avg_used:,.1f}")
     kc4.metric("Preferred Supplier", _vendor_name or "Not set")
+
 
     tab_stock, tab_supplier, tab_exhaust, tab_pr = st.tabs([
         "📦 Factory-wise Stock", "🚚 Supplier & Last Purchase",
@@ -8174,18 +9044,23 @@ def render_material_360(material_name: str) -> None:
     ])
 
     with tab_stock:
-        _current = pd.read_sql_query(
-            "SELECT material, factory, closing_stock, date FROM stock s1 "
-            "WHERE material = ? AND id = (SELECT MAX(id) FROM stock s2 "
-            "WHERE s2.material = s1.material AND s2.factory = s1.factory) ORDER BY factory",
-            conn, params=(material_name,))
+        # FIX (P0-3, same as P0-1's Current Stock Levels tab): was reading
+        # the legacy `stock` table's closing_stock, never updated by real
+        # production consumption. Now computed live per factory via
+        # get_rm_physical_stock().
+        _factories_m = [r[0] for r in cur.execute(
+            "SELECT DISTINCT factory FROM rm_batches WHERE material=? ORDER BY factory",
+            (material_name,)
+        ).fetchall()]
+        _current = pd.DataFrame(
+            [{"factory": _f, "closing_stock": get_rm_physical_stock(_f, material_name)["physical_qty"]}
+             for _f in _factories_m]
+        )
         if _current.empty:
             st.info("No current stock on file.")
         else:
             st.dataframe(
-                _current.drop(columns=["material"])
-                        .rename(columns={"factory": "Factory", "closing_stock": "Closing Stock",
-                                          "date": "Last Updated"}),
+                _current.rename(columns={"factory": "Factory", "closing_stock": "Closing Stock"}),
                 width='stretch', hide_index=True
             )
             _max = int(_current["closing_stock"].max()) or 1
@@ -8315,19 +9190,23 @@ def generate_ai_insights(p_df: pd.DataFrame, s_df: pd.DataFrame,
         if pend > 0:
             insights.append(("warning", f"Pending / overdue payments: {fmt_inr(pend)}"))
 
-    if not stock_df.empty:
-        low = stock_df.sort_values("date").groupby(["factory", "material"]).last().reset_index()
-        for _, row in low.iterrows():
-            _th_row = cur.execute(
-                "SELECT threshold FROM reorder_levels WHERE material=? AND factory=?",
-                (row["material"], row["factory"])
-            ).fetchone()
-            _threshold = _th_row[0] if _th_row else DEFAULT_REORDER_THRESHOLD
-            if row["closing_stock"] < _threshold:
-                insights.append(("warning",
-                    f"Low stock: {row['material']} at {row['factory']} "
-                    f"({int(row['closing_stock'])} units, threshold {int(_threshold)}) — "
-                    f"see Procurement module"))
+    # FIX (Gap P0-1): was reading the legacy `stock` table (stock_df), which
+    # QC-approved RM receipts never populate — see get_rm_physical_stock().
+    _insight_pairs = all_rm_factory_materials()
+    if factory and factory != ALL_FACTORIES:
+        _insight_pairs = [(f, m) for f, m in _insight_pairs if f == factory]
+    for _f, _m in _insight_pairs:
+        _snap = get_rm_physical_stock(_f, _m)
+        _th_row = cur.execute(
+            "SELECT threshold FROM reorder_levels WHERE material=? AND factory=?",
+            (_m, _f)
+        ).fetchone()
+        _threshold = _th_row[0] if _th_row else DEFAULT_REORDER_THRESHOLD
+        if _snap["available_qty"] < _threshold:
+            insights.append(("warning",
+                f"Low stock: {_m} at {_f} "
+                f"({_snap['available_qty']:.2f} {_snap['base_unit']} available, "
+                f"threshold {_threshold:.2f}) — see Procurement module"))
 
     # NEW: surface open procurement requests so they aren't only visible
     # inside the Procurement module itself.
@@ -8821,9 +9700,10 @@ elif module == "Daily Log":
                 else:
                     try:
                         cur.execute(
-                            "INSERT INTO daily_log VALUES (NULL,?,?,?,?,?,?,?)",
+                            "INSERT INTO daily_log VALUES (NULL,?,?,?,?,?,?,?,?,?)",
                             (str(dl_date), dl_factory, dl_cat,
-                             dl_activity, dl_person, dl_status, dl_notes)
+                             dl_activity, dl_person, dl_status, dl_notes,
+                             st.session_state.get("username", ""), _user_dept)
                         )
                         conn.commit()
                         log_audit("INSERT", "daily_log", "new",
@@ -8880,30 +9760,47 @@ elif module == "Daily Log":
             sel_id  = opts[sel_label]
             sel_row = log_df[log_df["id"] == sel_id].iloc[0]
 
+            # P0-3 (ownership): editing another department's log entry was
+            # previously wide open to any logged-in user. An entry can now
+            # only be edited by Admin/'All' accounts or by the same
+            # department that originally logged it; rows saved before this
+            # column existed have no recorded department, so — same as a
+            # deliberately unowned record — only Admin can edit them.
+            _dl_owner_dept = sel_row.get("created_by_dept") or ""
+            _dl_edit_allowed = _is_admin or (_dl_owner_dept != "" and _dept_allows(_dl_owner_dept))
+            if not _dl_edit_allowed:
+                st.info(f"🔒 This entry was logged by **{_dl_owner_dept or 'an earlier version of the app (no department on file)'}**"
+                        f" — only Admin or that department can edit it.")
+
             ec1, ec2, ec3 = st.columns(3)
             with ec1:
                 e_dl_date    = st.date_input("Date",
-                    value=pd.to_datetime(sel_row["date"]).date(), key="e_dl_d")
+                    value=pd.to_datetime(sel_row["date"]).date(), key="e_dl_d",
+                    disabled=not _dl_edit_allowed)
                 e_dl_factory = st.selectbox("Factory", FACTORIES, key="e_dl_f",
                     index=FACTORIES.index(sel_row["factory"])
                           if sel_row["factory"] in FACTORIES else 0,
                     disabled=not _is_admin)
                 e_dl_cat = st.selectbox("Category", LOG_CATEGORIES, key="e_dl_cat",
                     index=LOG_CATEGORIES.index(sel_row["category"])
-                          if sel_row["category"] in LOG_CATEGORIES else 0)
+                          if sel_row["category"] in LOG_CATEGORIES else 0,
+                    disabled=not _dl_edit_allowed)
             with ec2:
                 e_dl_activity = st.text_input("Activity Description",
-                    value=sel_row["activity"], key="e_dl_act")
+                    value=sel_row["activity"], key="e_dl_act",
+                    disabled=not _dl_edit_allowed)
                 e_dl_person   = st.text_input("Personnel / Team",
-                    value=sel_row["personnel"], key="e_dl_per")
+                    value=sel_row["personnel"], key="e_dl_per",
+                    disabled=not _dl_edit_allowed)
             with ec3:
                 e_dl_status = st.selectbox("Status", LOG_STATUSES, key="e_dl_stat",
                     index=LOG_STATUSES.index(sel_row["status"])
-                          if sel_row["status"] in LOG_STATUSES else 0)
+                          if sel_row["status"] in LOG_STATUSES else 0,
+                    disabled=not _dl_edit_allowed)
                 e_dl_notes  = st.text_input("Notes", value=sel_row["notes"] or "",
-                    key="e_dl_notes")
+                    key="e_dl_notes", disabled=not _dl_edit_allowed)
 
-            if st.button("💾 Update Log Entry", key="log_upd_btn"):
+            if st.button("💾 Update Log Entry", key="log_upd_btn", disabled=not _dl_edit_allowed):
                 if not e_dl_activity.strip():
                     st.warning("Activity description is required.")
                 else:
@@ -9241,7 +10138,7 @@ elif module == "Production":
                     st.rerun()
 
     with tab_entry:
-        st.subheader("⚠️ Legacy Direct Production Entry")
+        st.subheader("⚠️ Legacy Direct Production Entry — Admin Correction Mode")
         st.caption(
             "This path predates Production Instructions / Production Batches. It "
             "writes straight to FG Stock with **no QC gate, no raw-material linkage "
@@ -9249,12 +10146,47 @@ elif module == "Production":
             "administrative exception (e.g. correcting an old record), never for "
             "routine new production. For normal work, use **🧾 Production "
             "Instructions** above, which enforces QC-approved formulation and "
-            "raw materials end to end."
+            "raw materials end to end.\n\n"
+            "**Two-person control:** submitting here does *not* post to FG Stock "
+            "immediately. It creates a Pending correction that a **different** "
+            "Admin must review and approve below before anything posts."
         )
-        _legacy_prod_allowed = _is_admin
-        if not _legacy_prod_allowed:
+        _legacy_admin_ok = _is_admin
+        if not _legacy_admin_ok:
             st.info("🔒 This legacy entry path is restricted to Administrators. "
                     "Use Production Instructions → Start Production instead.")
+
+        # Correction Mode gate (P0-1): being Admin is necessary but no longer
+        # sufficient on its own — an audit flagged that a warning banner isn't
+        # a real ERP control, since an admin could open this tab out of habit
+        # and post through it without a second thought. This checkbox plus a
+        # mandatory reason is a deliberate, logged second step that must be
+        # taken before any field below becomes usable.
+        _legacy_correction_mode = False
+        if _legacy_admin_ok:
+            _legacy_correction_mode = st.checkbox(
+                "🔓 Enable Correction Mode — I understand this bypasses QC, raw-material "
+                "linkage, and batch numbering, and (once approved) will post directly "
+                "to FG Stock.",
+                key="pr_correction_mode"
+            )
+            if not _legacy_correction_mode:
+                st.caption("Enable Correction Mode above to unlock this form.")
+        _legacy_prod_allowed = _legacy_admin_ok and _legacy_correction_mode
+
+        _pr_correction_reason = st.text_input(
+            "Correction Reason *", key="pr_correction_reason",
+            placeholder="e.g. Backfilling a production record from before the ERP went live",
+            disabled=not _legacy_prod_allowed,
+            help="Required — saved into the audit trail with this entry."
+        )
+        _pr_reference_doc = st.text_input(
+            "Reference Document *", key="pr_reference_doc",
+            placeholder="e.g. Physical logbook page, WhatsApp thread, signed memo number",
+            disabled=not _legacy_prod_allowed,
+            help="Required — the original evidence this correction is based on."
+        )
+
         c1, c2, c3 = st.columns(3)
         with c1:
             pr_date    = st.date_input("Date", value=today_ist(), key="pr_d", disabled=not _legacy_prod_allowed)
@@ -9343,9 +10275,15 @@ elif module == "Production":
                 key="pr_cross_pipeline_confirm"
             )
 
-        if st.button("💾 Save Production", disabled=not _legacy_prod_allowed):
+        if st.button("📤 Submit for Approval", disabled=not _legacy_prod_allowed):
             final_product = pr_custom.strip() if pr_product == "Other / Custom" and pr_custom.strip() else pr_product
-            if not final_product or final_product == "Other / Custom":
+            if not _legacy_correction_mode:
+                st.warning("Enable Correction Mode above before saving.")
+            elif not _pr_correction_reason.strip():
+                st.warning("A Correction Reason is required for every legacy direct entry.")
+            elif not _pr_reference_doc.strip():
+                st.warning("A Reference Document is required for every legacy direct entry.")
+            elif not final_product or final_product == "Other / Custom":
                 st.warning("Please enter a product name.")
             elif not pr_labour or not pr_hours:
                 st.warning("Labour and hours are required to calculate efficiency.")
@@ -9366,36 +10304,112 @@ elif module == "Production":
                     )
                 else:
                     try:
+                        # P0-1: no FG stock posting happens here anymore — this
+                        # only records the correction as Pending Approval. A
+                        # *different* Admin must approve it below (see the
+                        # "⏳ Pending Legacy Corrections" section) before
+                        # record_fg_stock_movement is ever called for it.
                         cur.execute(
                             "INSERT INTO production (date,factory,product,labour,hours,"
-                            "production,efficiency) VALUES (?,?,?,?,?,?,?)",
+                            "production,efficiency,status,reference_doc,correction_reason,"
+                            "entered_by,entered_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                             (str(pr_date), pr_factory, final_product,
-                             pr_labour, pr_hours, pr_mt, round(pr_eff, 4))
+                             pr_labour, pr_hours, pr_mt, round(pr_eff, 4),
+                             "Pending Approval", _pr_reference_doc.strip(),
+                             _pr_correction_reason.strip(),
+                             st.session_state.get("username", ""),
+                             now_ist().isoformat(timespec="seconds"))
                         )
                         conn.commit()
                         _new_prod_id = cur.lastrowid
-                        log_audit("INSERT", "production", "new",
-                                  f"{pr_factory} | {final_product} | {pr_display} {unit}")
-                        # Production -> FG Stock IN (Section 3). Converted into the
-                        # product's canonical FG stock unit (Section 6) — Production
-                        # is entered in a weight unit, Dispatch's "Qty" is a packed-unit
-                        # count, and the two must never be mixed unconverted.
-                        _fg_qty, _fg_exact, _fg_note = convert_production_qty_to_fg_unit(
-                            pr_display, final_product)
-                        _fg_unit = get_fg_stock_unit_cfg(final_product)["stock_unit"]
-                        _new_fg_closing = record_fg_stock_movement(
-                            pr_date, pr_factory, final_product,
-                            production_in=_fg_qty, source_module="Production",
-                            source_ref_id=_new_prod_id
+                        log_audit("LEGACY_CORRECTION_SUBMITTED", "production", _new_prod_id,
+                                  f"{pr_factory} | {final_product} | {pr_display} {unit} | "
+                                  f"reason: {_pr_correction_reason.strip()} | "
+                                  f"ref: {_pr_reference_doc.strip()}")
+                        st.success(
+                            f"📤 Submitted — {pr_display:,.2f} {unit} of {final_product}. "
+                            f"This is **Pending Approval** and has NOT posted to FG Stock yet. "
+                            f"A different Admin must approve it below."
                         )
-                        st.success(f"✅ Saved — {pr_display:,.2f} {unit} of {final_product} | "
-                                   f"Efficiency: {pr_eff:.4f} | FG Stock ({_fg_unit}) now "
-                                   f"{_new_fg_closing:,.2f}")
-                        if not _fg_exact:
-                            st.warning(f"⚠️ {_fg_note}")
                         st.rerun()
                     except sqlite3.Error as e:
                         st.error(f"Database error: {e}")
+
+        # ── Pending Legacy Corrections — approval queue ─────────────────────
+        # P0-1 two-person control: the submitter above never triggers the FG
+        # stock posting themselves. Only here, and only a *different* Admin
+        # clicking Approve, actually calls record_fg_stock_movement — closing
+        # the "a warning isn't a control" gap the audit raised. Rejecting
+        # leaves FG Stock untouched (nothing was ever posted for a Pending row).
+        st.markdown("---")
+        st.markdown("#### ⏳ Pending Legacy Corrections — Approve")
+        if _is_admin:
+            _pending_corr = pd.read_sql_query(
+                "SELECT * FROM production WHERE status='Pending Approval' ORDER BY id DESC", conn
+            )
+            if _pending_corr.empty:
+                st.caption("No legacy corrections awaiting approval.")
+            else:
+                for _, _pc in _pending_corr.iterrows():
+                    _pc_id = int(_pc["id"])
+                    with st.expander(
+                        f"#{_pc_id} — {_pc['factory']} | {fg_label(_pc['product'])} | "
+                        f"{from_mt(_pc['production']):,.2f} {unit} | submitted by {_pc['entered_by']}",
+                        expanded=False
+                    ):
+                        st.caption(f"Date: **{_pc['date']}** · Entered: {_pc['entered_at']}")
+                        st.caption(f"Reason: {_pc['correction_reason'] or '—'}")
+                        st.caption(f"Reference Document: {_pc['reference_doc'] or '—'}")
+                        _self_submitted = (
+                            _pc["entered_by"] == st.session_state.get("username", "")
+                        )
+                        if _self_submitted:
+                            st.warning("🔒 You submitted this correction — a *different* "
+                                       "Admin must approve it (two-person control).")
+                        pc_col1, pc_col2 = st.columns(2)
+                        with pc_col1:
+                            if st.button("✅ Approve & Post to FG Stock", key=f"pc_approve_{_pc_id}",
+                                         disabled=_self_submitted):
+                                _pc_mt = float(_pc["production"])
+                                _fg_qty, _fg_exact, _fg_note = convert_mt_to_fg_unit(
+                                    _pc_mt, _pc["product"])
+                                _fg_unit = get_fg_stock_unit_cfg(_pc["product"])["stock_unit"]
+                                _new_fg_closing = record_fg_stock_movement(
+                                    _pc["date"], _pc["factory"], _pc["product"],
+                                    production_in=_fg_qty, source_module="Production",
+                                    source_ref_id=_pc_id
+                                )
+                                cur.execute(
+                                    "UPDATE production SET status='Posted', approved_by=?, "
+                                    "approved_at=? WHERE id=?",
+                                    (st.session_state.get("username", ""),
+                                     now_ist().isoformat(timespec="seconds"), _pc_id)
+                                )
+                                conn.commit()
+                                log_audit("LEGACY_CORRECTION_APPROVED", "production", _pc_id,
+                                          f"{_pc['factory']} | {_pc['product']} | "
+                                          f"FG Stock ({_fg_unit}) now {_new_fg_closing:,.2f}")
+                                st.success(f"✅ Approved and posted — FG Stock ({_fg_unit}) "
+                                           f"now {_new_fg_closing:,.2f}")
+                                if not _fg_exact:
+                                    st.warning(f"⚠️ {_fg_note}")
+                                st.rerun()
+                        with pc_col2:
+                            if st.button("❌ Reject", key=f"pc_reject_{_pc_id}",
+                                         disabled=_self_submitted):
+                                cur.execute(
+                                    "UPDATE production SET status='Rejected', approved_by=?, "
+                                    "approved_at=? WHERE id=?",
+                                    (st.session_state.get("username", ""),
+                                     now_ist().isoformat(timespec="seconds"), _pc_id)
+                                )
+                                conn.commit()
+                                log_audit("LEGACY_CORRECTION_REJECTED", "production", _pc_id,
+                                          f"{_pc['factory']} | {_pc['product']} | rejected")
+                                st.success("Rejected — no FG Stock movement was posted.")
+                                st.rerun()
+        else:
+            st.caption("Admin only.")
 
     with tab_log:
         st.subheader("Production Records")
@@ -9613,6 +10627,15 @@ elif module == "Formulation":
         _fm_tab_labels.append("🧾 Production Instructions")
     if _fm_show_manage:
         _fm_tab_labels.append("✏️ Manage Formulas")
+    # Material Master, Finished Goods Master, and the legacy Material Codes
+    # editor moved here from Stock — Formulation now owns all master data
+    # (this + BOM/versioning), while Stock stays inventory-execution-only.
+    # Same tables (materials_master / finished_goods_master / material_codes),
+    # same helper functions, same write-permission gating as before — only
+    # the tab's location changed, per the master-data-ownership restructure.
+    _fm_tab_labels.append("📇 Material Master")
+    _fm_tab_labels.append("🏷️ Finished Goods Master")
+    _fm_tab_labels.append("🏷️ Material Codes (legacy)")
     _fm_tabs = st.tabs(_fm_tab_labels)
     tab_fm_view = _fm_tabs[0]
     _fm_next_idx = 1
@@ -9624,6 +10647,12 @@ elif module == "Formulation":
     if _fm_show_manage:
         tab_fm_manage = _fm_tabs[_fm_next_idx]
         _fm_next_idx += 1
+    tab_fm_master = _fm_tabs[_fm_next_idx]
+    _fm_next_idx += 1
+    tab_fm_fgmaster = _fm_tabs[_fm_next_idx]
+    _fm_next_idx += 1
+    tab_fm_codes = _fm_tabs[_fm_next_idx]
+    _fm_next_idx += 1
 
     # NOTE: the Material Requirement Calculator ("How much RM do I need for
     # a planned production quantity?") has moved to Production → 📐
@@ -9687,7 +10716,8 @@ elif module == "Formulation":
             # forwards an order (Sales → To Production tab), it lands here,
             # and picking one pre-fills the form below and snapshots the
             # link (sales_order_id) onto the instruction once created.
-            _pi_pending_so = get_sales_orders_pending_production()
+            _pi_pending_so = get_sales_orders_pending_production(
+                restrict_factory=None if _is_admin else _user_factory)
             if not _pi_pending_so.empty:
                 st.markdown("#### 📥 Pending from Sales")
                 st.caption("Forwarded by Sales, waiting for a formula/quantity to be locked in.")
@@ -10049,7 +11079,8 @@ elif module == "Formulation":
                 st.markdown("#### ➕ Add Material Line")
                 al1, al2, al3, al4 = st.columns([3, 1.3, 1, 2])
                 with al1:
-                    _al_mat = st.selectbox("Material", MATERIALS, key="fm_al_mat", format_func=material_label)
+                    _al_mat = st.selectbox("Material", MATERIALS, key="fm_al_mat",
+                                            format_func=formulation_material_selector_label)
                     _al_lab_code = get_lab_code(_al_mat)
                     st.caption(f"Lab Code: **{_al_lab_code or '⚠️ not set in Material Master'}**")
                 with al2:
@@ -10160,645 +11191,7 @@ elif module == "Formulation":
                     st.rerun()
 
 
-elif module == "Sand":
-
-    st.title("🏗️ Sand Usage")
-    tab_entry, tab_log, tab_edit_s = st.tabs(["➕ Log Sand", "📋 Records", "✏️ Edit Record"])
-
-    with tab_entry:
-        st.subheader("New Sand Entry")
-        c1, c2 = st.columns(2)
-        with c1:
-            s_date    = st.date_input("Date", value=today_ist(), key="s_d")
-            s_factory = st.selectbox("Factory", FACTORIES, key="s_f",
-                                      index=FACTORIES.index(factory) if factory in FACTORIES else 0)
-        with c2:
-            s_qty  = st.number_input("Quantity", min_value=0, step=1, key="s_q")
-            s_unit = st.selectbox("Unit", SAND_UNITS, key="s_unit")
-            s_type = st.selectbox("Sand Type", SAND_TYPES, key="s_t")
-
-        if st.button("💾 Save Sand"):
-            if not s_qty:
-                st.warning("Please enter a quantity greater than 0.")
-            else:
-                # Duplicate guard: same date + factory + sand_type
-                dup = pd.read_sql_query(
-                    "SELECT id FROM sand WHERE date=? AND factory=? AND sand_type=?",
-                    conn, params=(str(s_date), s_factory, s_type)
-                )
-                if not dup.empty:
-                    st.warning(
-                        f"⚠️ A **{s_type}** sand entry for **{s_factory}** on **{s_date}** "
-                        f"already exists. Use the ✏️ Edit tab to modify it."
-                    )
-                else:
-                    try:
-                        cur.execute(
-                            "INSERT INTO sand(date,factory,qty,sand_type,unit) VALUES (?,?,?,?,?)",
-                            (str(s_date), s_factory, s_qty, s_type, s_unit)
-                        )
-                        conn.commit()
-                        log_audit("INSERT", "sand", "new",
-                                  f"{s_factory} | {s_type} | {s_qty} {s_unit}")
-                        st.success(f"✅ Saved — {s_qty:,} {s_unit} of {s_type} at {s_factory}")
-                        st.rerun()
-                    except sqlite3.Error as e:
-                        st.error(f"Database error: {e}")
-
-    with tab_log:
-        st.subheader("Sand Records")
-        thismonth = today_ist().strftime("%Y-%m")
-        month_total = sand_df[sand_df["date"].str.startswith(thismonth)]["qty"].sum() if not sand_df.empty else 0
-
-        k1, k2, k3 = st.columns(3)
-        k1.metric("Total (Range)",  f"{int(sand_df['qty'].sum()):,}" if not sand_df.empty else "0")
-        k2.metric("This Month",     f"{int(month_total):,}")
-        k3.metric("Entries",        len(sand_df))
-
-        if sand_df.empty:
-            st.info("No sand records for this factory / date range.")
-        else:
-            if HAS_PLOTLY:
-                sand_ts = sand_df.groupby("date")["qty"].sum().reset_index().sort_values("date")
-                fig_sand = px.bar(sand_ts, x="date", y="qty",
-                                   color_discrete_sequence=["#A8791E"],
-                                   template="plotly_white",
-                                   title="Sand Usage Over Time",
-                                   labels={"date":"Date","qty":"Quantity (units)"})
-                fig_sand.update_layout(height=220, margin=dict(l=10,r=10,t=36,b=10))
-                st.plotly_chart(fig_sand, width='stretch')
-
-            if HAS_PLOTLY and "sand_type" in sand_df.columns:
-                by_type = sand_df.groupby("sand_type")["qty"].sum().reset_index()
-                fig_type = px.pie(by_type, names="sand_type", values="qty",
-                                   hole=0.4,
-                                   color_discrete_sequence=["#A8791E","#1E3A5F",
-                                                             "#145C3C","#6E1423","#5B2C6F"],
-                                   template="plotly_white",
-                                   title="Usage by Sand Type")
-                fig_type.update_layout(height=220, margin=dict(l=10,r=10,t=36,b=10))
-                st.plotly_chart(fig_type, width='stretch')
-
-            filtered_sand = search_filter(sand_df, "Search sand records", key="sand_search")
-            filtered_sand = paginate_df(filtered_sand, key="sand_page")
-            st.dataframe(filtered_sand.drop(columns=["id"], errors="ignore"),
-                         width='stretch', hide_index=True, height=280)
-            delete_row_ui(sand_df, "sand", "sand_type", "sand")
-
-    with tab_edit_s:
-        st.subheader("Edit a Sand Record")
-        if sand_df.empty:
-            st.info("No records to edit in the current date range.")
-        else:
-            opts = {
-                f"ID {r['id']} — {r['sand_type']} ({r['date']})": r["id"]
-                for _, r in sand_df.iterrows()
-            }
-            sel_label = st.selectbox("Select record to edit", list(opts.keys()),
-                                      key="sand_edit_sel")
-            sel_id  = opts[sel_label]
-            sel_row = sand_df[sand_df["id"] == sel_id].iloc[0]
-
-            sc1, sc2 = st.columns(2)
-            with sc1:
-                e_s_date    = st.date_input("Date",
-                    value=pd.to_datetime(sel_row["date"]).date(), key="e_s_d")
-                e_s_factory = st.selectbox("Factory", FACTORIES, key="e_s_f",
-                    index=FACTORIES.index(sel_row["factory"])
-                          if sel_row["factory"] in FACTORIES else 0,
-                    disabled=not _is_admin)
-            with sc2:
-                e_s_qty  = st.number_input("Quantity",
-                    min_value=0, step=1, value=int(sel_row["qty"]), key="e_s_q")
-                _s_cur_unit = sel_row.get("unit", "Bags (50 KG)") or "Bags (50 KG)"
-                e_s_unit = st.selectbox("Unit", SAND_UNITS, key="e_s_unit",
-                    index=SAND_UNITS.index(_s_cur_unit) if _s_cur_unit in SAND_UNITS else 0)
-                e_s_type = st.selectbox("Sand Type", SAND_TYPES, key="e_s_t",
-                    index=SAND_TYPES.index(sel_row["sand_type"])
-                          if sel_row["sand_type"] in SAND_TYPES else 0)
-
-            if st.button("💾 Update Sand Record", key="sand_upd_btn"):
-                if not e_s_qty:
-                    st.warning("Quantity must be greater than 0.")
-                else:
-                    try:
-                        cur.execute(
-                            "UPDATE sand SET date=?,factory=?,qty=?,sand_type=?,unit=? WHERE id=?",
-                            (str(e_s_date), e_s_factory, e_s_qty, e_s_type, e_s_unit, sel_id)
-                        )
-                        conn.commit()
-                        log_audit("UPDATE", "sand", sel_id,
-                                  f"{e_s_factory} | {e_s_type} | {e_s_qty} {e_s_unit}")
-                        st.success("✅ Sand record updated.")
-                        st.rerun()
-                    except sqlite3.Error as e:
-                        st.error(f"Database error: {e}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  STOCK
-# ─────────────────────────────────────────────────────────────────────────────
-elif module == "Stock":
-
-    st.title("🧱 Raw Material Stock")
-    st.caption("Finished Goods stock (produced automatically from Production, consumed by "
-               "Dispatch) is in the **📦 Finished Goods Stock** tab below.")
-
-    # ── Persistent reorder banner — visible on every tab ─────────────────────
-    _fac_for_banner = factory if factory != ALL_FACTORIES else None
-    _banner_query   = (
-        "SELECT material, factory, closing_stock FROM stock s1 "
-        "WHERE id = (SELECT MAX(id) FROM stock s2 "
-        "WHERE s2.material=s1.material AND s2.factory=s1.factory)"
-        + (" AND factory=?" if _fac_for_banner else "")
-    )
-    _banner_df = pd.read_sql_query(
-        _banner_query, conn,
-        params=(_fac_for_banner,) if _fac_for_banner else ()
-    )
-    if not _banner_df.empty:
-        _critical = _banner_df[_banner_df["closing_stock"] < 20]
-        _low      = _banner_df[(_banner_df["closing_stock"] >= 20) &
-                                (_banner_df["closing_stock"] < 50)]
-        if not _critical.empty:
-            _c_lines = ", ".join(
-                f"**{r['material']}** ({r['factory']}) — {int(r['closing_stock'])} units"
-                for _, r in _critical.iterrows()
-            )
-            st.error(f"🔴 **CRITICAL STOCK** — Reorder immediately: {_c_lines}")
-        if not _low.empty:
-            _l_lines = ", ".join(
-                f"**{r['material']}** ({r['factory']}) — {int(r['closing_stock'])} units"
-                for _, r in _low.iterrows()
-            )
-            st.warning(f"🟡 **LOW STOCK** — Plan reorder soon: {_l_lines}")
-        if _critical.empty and _low.empty:
-            st.success("✅ All materials at healthy stock levels")
-
-    tab_entry, tab_log, tab_edit_stk, tab_status, tab_fg, tab_release, tab_master, tab_fgmaster, tab_codes = st.tabs(
-        ["➕ Log Stock", "📋 Records", "✏️ Edit Record", "📦 Current Levels",
-         "🏭 Finished Goods Stock", "🚚 Material Release", "📇 Material Master",
-         "🏷️ Finished Goods Master", "🏷️ Material Codes (legacy)"]
-    )
-
-    with tab_entry:
-        st.subheader("New Stock Entry")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st_date    = st.date_input("Date", value=today_ist(), key="stk_d")
-            st_factory = st.selectbox("Factory", FACTORIES, key="stk_f",
-                                       index=FACTORIES.index(factory) if factory in FACTORIES else 0)
-        with c2:
-            st_material = st.selectbox("Material", MATERIALS, key="stk_m", format_func=lab_code_label)
-            _stk_lab_code = get_lab_code(st_material)
-            if _stk_lab_code:
-                st.text_input("Lab Code", value=_stk_lab_code, key="stk_code_display", disabled=True,
-                              help="From the official Material Master — not editable here.")
-                st_code = _stk_lab_code
-            else:
-                # Material Master is the single source of truth for Lab Codes —
-                # Stock no longer accepts a manually-typed fallback. The material
-                # must be given a Lab Code in Material Master before any stock
-                # can be logged against it.
-                st.error("⚠️ This material has no Lab Code in Material Master. "
-                         "Please update Material Master before entering stock.")
-                st_code = ""
-            st_received = st.number_input("Received (units)", min_value=0, step=1, key="stk_r")
-        with c3:
-            st_used = st.number_input("Used (units)", min_value=0, step=1, key="stk_u")
-            st_unit = st.selectbox(
-                "Unit", ["KG", "Bags", "Litres", "MT", "Barrel", "Units", "Other"], key="stk_unit")
-            prev_row = pd.read_sql_query(
-                "SELECT closing_stock FROM stock WHERE factory=? AND material=? ORDER BY id DESC LIMIT 1",
-                conn, params=(st_factory, st_material)
-            )
-            last_close = int(prev_row.iloc[0, 0]) if not prev_row.empty else 0
-            closing    = last_close + st_received - st_used
-            st.metric("Closing Stock Preview", f"{closing:,}")
-
-        _stock_can_save = _dept_allows("Stores") and bool(_stk_lab_code)
-        if not _dept_allows("Stores"):
-            st.caption("🔒 Only Stores can log RM stock receipt/usage.")
-        elif not _stk_lab_code:
-            st.caption("🔒 Add this material's Lab Code in Material Master before logging stock.")
-        if st.button("💾 Save Stock", disabled=not _stock_can_save):
-            try:
-                # FIX: duplicate-check + insert now run inside _write_lock so
-                # two sessions saving the same date/factory/material at
-                # nearly the same moment can't both pass the "no duplicate
-                # yet" check before either has inserted — the second one now
-                # waits for the first to commit, then correctly sees the
-                # duplicate. recompute_stock_chain() re-derives closing_stock
-                # for the whole (factory, material) ledger from the stored
-                # received/used values afterwards, so the row's closing
-                # balance is always correct regardless of what else was
-                # written concurrently.
-                with _write_lock():
-                    _stk_dup = pd.read_sql_query(
-                        "SELECT id FROM stock WHERE date=? AND factory=? AND material=?",
-                        conn, params=(str(st_date), st_factory, st_material)
-                    )
-                    if not _stk_dup.empty:
-                        _stk_saved = False
-                    else:
-                        cur.execute(
-                            "INSERT INTO stock (date,factory,material,received,used,"
-                            "closing_stock,unit,code) VALUES (?,?,?,?,?,?,?,?)",
-                            (str(st_date), st_factory, st_material, st_received, st_used,
-                             closing, st_unit, st_code.strip())
-                        )
-                        _stk_saved = True
-
-                if not _stk_saved:
-                    st.warning(
-                        f"⚠️ A **{lab_code_label(st_material)}** entry for **{st_factory}** on "
-                        f"**{st_date}** already exists. Use the ✏️ Edit tab to modify it."
-                    )
-                else:
-                    recompute_stock_chain(st_factory, st_material)
-                    log_audit("INSERT", "stock", "new",
-                              f"{st_factory} | {st_material} ({st_code.strip() or 'no code'}) | closing={closing}")
-                    st.success(f"✅ {lab_code_label(st_material)} closing stock: {closing:,} units")
-                    st.rerun()
-            except sqlite3.Error as e:
-                st.error(f"Database error: {e}")
-
-    with tab_log:
-        if stock_df.empty:
-            st.info("No records.")
-        else:
-            _stk_k1, _stk_k2, _stk_k3 = st.columns(3)
-            _stk_k1.metric("Total Entries",   len(stock_df))
-            _stk_k2.metric("Total Received",  f"{int(stock_df['received'].sum()):,} units")
-            _stk_k3.metric("Total Used",      f"{int(stock_df['used'].sum()):,} units")
-            # Display copy with Lab Code in place of the material name (per the
-            # Stock module's display rule) — deletion below still keys off `id`,
-            # never the label text, so this swap is purely cosmetic and safe.
-            # FIX: keep the raw (factory, material) around under a hidden
-            # column so on_delete can recompute the right ledger chain after
-            # a deletion — the visible table still drops it before display.
-            _stock_df_disp = stock_df.copy()
-            _stock_df_disp["_raw_material"] = _stock_df_disp["material"]
-            _stock_df_disp["material"] = _stock_df_disp["material"].apply(lab_code_label)
-            _stock_df_disp = _stock_df_disp.rename(columns={"material": "Lab Code"})
-            filtered_stock = search_filter(_stock_df_disp, "Search stock records", key="stk_search")
-            filtered_stock = paginate_df(filtered_stock, key="stk_page")
-            st.dataframe(filtered_stock.drop(columns=["id", "_raw_material"], errors="ignore"),
-                         width='stretch', hide_index=True, height=320)
-
-            def _on_stock_delete(_row) -> None:
-                # FIX: a deleted row's later chain-mates would otherwise
-                # keep whatever closing_stock they had *including* the
-                # deleted row's received/used — recompute the chain for
-                # the pair the deleted row belonged to.
-                recompute_stock_chain(_row["factory"], _row["_raw_material"])
-
-            delete_row_ui(_stock_df_disp, "stock", "Lab Code", "stock", on_delete=_on_stock_delete)
-
-    with tab_edit_stk:
-        st.subheader("Edit a Stock Record")
-        if stock_df.empty:
-            st.info("No records to edit in the current date range.")
-        else:
-            opts = {
-                f"ID {r['id']} — {lab_code_label(r['material'])} ({r['date']})": r["id"]
-                for _, r in stock_df.iterrows()
-            }
-            sel_label = st.selectbox("Select record to edit", list(opts.keys()),
-                                      key="stk_edit_sel")
-            sel_id  = opts[sel_label]
-            sel_row = stock_df[stock_df["id"] == sel_id].iloc[0]
-
-            skc1, skc2, skc3 = st.columns(3)
-            with skc1:
-                e_st_date    = st.date_input("Date",
-                    value=pd.to_datetime(sel_row["date"]).date(), key="e_stk_d")
-                e_st_factory = st.selectbox("Factory", FACTORIES, key="e_stk_f",
-                    index=FACTORIES.index(sel_row["factory"])
-                          if sel_row["factory"] in FACTORIES else 0,
-                    disabled=not _is_admin)
-            with skc2:
-                e_st_material = st.selectbox("Material", MATERIALS, key="e_stk_m",
-                    index=MATERIALS.index(sel_row["material"])
-                          if sel_row["material"] in MATERIALS else 0,
-                    format_func=lab_code_label)
-                _e_stk_lab_code = get_lab_code(e_st_material)
-                if _e_stk_lab_code:
-                    st.text_input("Lab Code", value=_e_stk_lab_code, key="e_stk_code_display",
-                                  disabled=True,
-                                  help="From the official Material Master — not editable here.")
-                    e_st_code = _e_stk_lab_code
-                else:
-                    # Material Master is the single source of truth for Lab Codes —
-                    # no manual fallback here either.
-                    st.error("⚠️ This material has no Lab Code in Material Master. "
-                             "Please update Material Master before entering stock.")
-                    e_st_code = ""
-                e_st_received = st.number_input("Received (units)",
-                    min_value=0, step=1, value=int(sel_row["received"]), key="e_stk_r")
-            with skc3:
-                e_st_used   = st.number_input("Used (units)",
-                    min_value=0, step=1, value=int(sel_row["used"]), key="e_stk_u")
-                _e_stk_units = ["KG", "Bags", "Litres", "MT", "Barrel", "Units", "Other"]
-                _e_stk_unit_cur = sel_row.get("unit", "") or "KG"
-                e_st_unit = st.selectbox("Unit", _e_stk_units, key="e_stk_unit",
-                    index=_e_stk_units.index(_e_stk_unit_cur) if _e_stk_unit_cur in _e_stk_units else 0)
-                e_st_prev   = pd.read_sql_query(
-                    "SELECT closing_stock FROM stock WHERE factory=? AND material=? "
-                    "AND id < ? ORDER BY id DESC LIMIT 1",
-                    conn, params=(sel_row["factory"], sel_row["material"], sel_id)
-                )
-                e_st_last   = int(e_st_prev.iloc[0, 0]) if not e_st_prev.empty else 0
-                e_st_close  = e_st_last + e_st_received - e_st_used
-                st.metric("New Closing Stock", f"{e_st_close:,}")
-
-            if not _e_stk_lab_code:
-                st.caption("🔒 Add this material's Lab Code in Material Master before updating this record.")
-            if st.button("💾 Update Stock Record", key="stk_upd_btn", disabled=not _e_stk_lab_code):
-                # FIX: remember the pair this row belonged to *before* the
-                # update — needed below to fix up the old chain too, since
-                # factory/material are editable and the row may be moving
-                # to a different (factory, material) ledger entirely.
-                _old_factory, _old_material = sel_row["factory"], sel_row["material"]
-                try:
-                    cur.execute(
-                        "UPDATE stock SET date=?,factory=?,material=?,"
-                        "received=?,used=?,closing_stock=?,unit=?,code=? WHERE id=?",
-                        (str(e_st_date), e_st_factory, e_st_material,
-                         e_st_received, e_st_used, e_st_close, e_st_unit,
-                         e_st_code.strip(), sel_id)
-                    )
-                    conn.commit()
-                    # FIX: this edit can change received/used on a row that
-                    # has later rows chained after it (and/or move the row
-                    # to a different material/factory) — recompute both the
-                    # old chain (rows that used to follow this one) and the
-                    # new chain (rows this one now belongs to) so nothing
-                    # downstream is left showing a stale closing_stock.
-                    recompute_stock_chain(_old_factory, _old_material)
-                    recompute_stock_chain(e_st_factory, e_st_material)
-                    log_audit("UPDATE", "stock", sel_id,
-                              f"{e_st_factory} | {e_st_material} | closing={e_st_close}")
-                    st.success("✅ Stock record updated — downstream closing balances "
-                               "for this material recalculated.")
-                    st.rerun()
-                except sqlite3.Error as e:
-                    st.error(f"Database error: {e}")
-
-    with tab_status:
-        st.subheader("Current Stock Levels (Latest per Material)")
-        # FIX: Replaced f-string SQL injection in stock query with parameterised version.
-        if factory != ALL_FACTORIES:
-            current = pd.read_sql_query(
-                "SELECT material, factory, closing_stock, date, code FROM stock s1 "
-                "WHERE id = (SELECT MAX(id) FROM stock s2 "
-                "WHERE s2.material = s1.material AND s2.factory = s1.factory) "
-                "AND factory = ? ORDER BY material",
-                conn, params=(factory,)
-            )
-        else:
-            current = pd.read_sql_query(
-                "SELECT material, factory, closing_stock, date, code FROM stock s1 "
-                "WHERE id = (SELECT MAX(id) FROM stock s2 "
-                "WHERE s2.material = s1.material AND s2.factory = s1.factory) "
-                "ORDER BY material",
-                conn
-            )
-        if current.empty:
-            st.info("No stock data yet.")
-        else:
-            def stock_status_label(qty: int) -> str:
-                if qty < 20:   return "🔴 Critical"
-                if qty < 50:   return "🟡 Low"
-                if qty < 200:  return "🟢 OK"
-                return "🔵 High"
-            current["Status"] = current["closing_stock"].apply(stock_status_label)
-            # Lab Code is the primary identifier shown here — authoritative code
-            # from the Material Master, falling back to the legacy free-text code
-            # (or the bare name as a last resort) only for items not yet catalogued.
-            current["Lab Code"] = current.apply(
-                lambda r: get_lab_code(r["material"]) or r["code"] or r["material"], axis=1)
-            st.dataframe(
-                current[["Lab Code","factory","closing_stock","date","Status"]]
-                    .rename(columns={
-                        "factory":"Factory",
-                        "closing_stock":"Closing Stock","date":"Last Updated"
-                    }),
-                width='stretch', hide_index=True
-            )
-
-            if not current.empty:
-                st.markdown("---")
-                st.markdown("**Stock Level Visualisation**")
-                max_stock = int(current["closing_stock"].max()) or 1
-                for _, row in current.iterrows():
-                    color = ("#6E1423" if row["closing_stock"] < 20 else
-                             "#A8791E" if row["closing_stock"] < 50 else "#145C3C")
-                    progress_bar(
-                        f"{row['Lab Code']} ({row['factory']})",
-                        row["closing_stock"],
-                        max_stock,
-                        color=color
-                    )
-
-            st.markdown("---")
-            st.markdown("**Open a Material's 360° view**")
-            st.caption("Opening stock, consumption trend, supplier, factory-wise stock, "
-                        "and exhaustion forecast — all in one page.")
-            for _mat in sorted(current["material"].unique()):
-                mrow1, mrow2 = st.columns([5, 1])
-                mrow1.markdown(f"🧱 **{lab_code_label(_mat)}**")
-                if mrow2.button("360° →", key=f"mat360_{_mat}", use_container_width=True):
-                    open_detail_view("material", _mat)
-
-            if HAS_PLOTLY and not current.empty:
-                fig_stk = px.bar(
-                    current.sort_values("closing_stock", ascending=True),
-                    x="closing_stock", y="Lab Code",
-                    orientation="h",
-                    color="closing_stock",
-                    color_continuous_scale=["#6E1423","#D4AF37","#145C3C"],
-                    template="plotly_white",
-                    title="Current Stock by Material",
-                    labels={"closing_stock":"Closing Stock","Lab Code":"Lab Code"}
-                )
-                fig_stk.update_layout(height=max(220, len(current) * 30 + 60),
-                                       margin=dict(l=10,r=10,t=36,b=10),
-                                       showlegend=False)
-                st.plotly_chart(fig_stk, width='stretch')
-
-    with tab_fg:
-        st.subheader("🏭 Finished Goods Stock")
-        st.caption("Derived automatically — Production entries add to it, Dispatch entries "
-                   "subtract from it. Nothing is typed in here directly except manual "
-                   "adjustments below.")
-
-        _fg_fac_clause = " AND factory=?" if factory != ALL_FACTORIES else ""
-        _fg_fac_param  = (factory,) if factory != ALL_FACTORIES else ()
-        _fg_current = pd.read_sql_query(
-            "SELECT factory, product, closing_stock, date FROM fg_stock f1 "
-            "WHERE id = (SELECT MAX(id) FROM fg_stock f2 "
-            "WHERE f2.factory = f1.factory AND f2.product = f1.product)"
-            + _fg_fac_clause + " ORDER BY product",
-            conn, params=_fg_fac_param
-        )
-        if _fg_current.empty:
-            st.info("No Finished Goods stock movements yet — save a Production or Dispatch "
-                    "entry to start the ledger.")
-        else:
-            _fg_current_disp = _fg_current.copy()
-            _fg_current_disp.insert(2, "rm_code", _fg_current_disp["product"].apply(get_fg_code))
-            st.dataframe(
-                _fg_current_disp.rename(columns={
-                    "factory": "Factory", "product": "Product", "rm_code": "RM Code",
-                    "closing_stock": "Closing FG Stock", "date": "Last Movement"
-                }),
-                width='stretch', hide_index=True, height=300
-            )
-            if HAS_PLOTLY:
-                fig_fg = px.bar(
-                    _fg_current.sort_values("closing_stock", ascending=True),
-                    x="closing_stock", y="product", orientation="h",
-                    color="closing_stock",
-                    color_continuous_scale=["#6E1423", "#D4AF37", "#145C3C"],
-                    template="plotly_white", title="Current FG Stock by Product",
-                    labels={"closing_stock": "Closing Stock", "product": "Product"}
-                )
-                fig_fg.update_layout(height=max(220, len(_fg_current) * 30 + 60),
-                                      margin=dict(l=10, r=10, t=36, b=10), showlegend=False)
-                st.plotly_chart(fig_fg, width='stretch')
-
-        st.markdown("---")
-        st.markdown("#### ➕ Manual Adjustment")
-        st.caption("For opening balances, physical count corrections, or damage/write-offs — "
-                   "not for routine production or dispatch, which are captured automatically.")
-        fgc1, fgc2, fgc3 = st.columns(3)
-        with fgc1:
-            fg_adj_factory = st.selectbox("Factory", FACTORIES, key="fg_adj_f",
-                                           index=FACTORIES.index(factory) if factory in FACTORIES else 0)
-            fg_adj_product = st.selectbox("Product", FCSC_PRODUCTS, key="fg_adj_p", format_func=fg_label)
-        with fgc2:
-            fg_adj_custom = st.text_input("Custom name (if 'Other / Custom')", key="fg_adj_p_cust")
-            fg_adj_qty    = st.number_input("Adjustment (+/-)", step=1.0, key="fg_adj_qty",
-                                             help="Positive to add stock, negative to remove.")
-        with fgc3:
-            fg_adj_reason = st.text_input("Reason", key="fg_adj_reason",
-                                           placeholder="e.g. Opening balance, physical count")
-            _fg_adj_final_product = (fg_adj_custom.strip()
-                                      if fg_adj_product == "Other / Custom" and fg_adj_custom.strip()
-                                      else fg_adj_product)
-            if _fg_adj_final_product and _fg_adj_final_product != "Other / Custom":
-                st.metric("Current FG Stock",
-                          f"{get_fg_closing_stock(fg_adj_factory, _fg_adj_final_product):,.2f}")
-        if st.button("💾 Save Adjustment", key="fg_adj_save"):
-            if not _fg_adj_final_product or _fg_adj_final_product == "Other / Custom":
-                st.warning("Please select or enter a product.")
-            elif fg_adj_qty == 0:
-                st.warning("Enter a non-zero adjustment.")
-            else:
-                _fg_new_closing = record_fg_stock_movement(
-                    today_ist(), fg_adj_factory, _fg_adj_final_product,
-                    adjustment=fg_adj_qty, source_module="Manual Adjustment"
-                )
-                log_audit("INSERT", "fg_stock", "adjustment",
-                          f"{fg_adj_factory} | {_fg_adj_final_product} | {fg_adj_qty:+} | {fg_adj_reason}")
-                st.success(f"✅ Adjustment saved — {_fg_adj_final_product} @ {fg_adj_factory} "
-                           f"FG Stock now {_fg_new_closing:,.2f}")
-                st.rerun()
-
-    with tab_release:
-        st.subheader("🚚 Material Release for Production")
-        st.caption(
-            "Production checks with Stores for raw-material and packaging availability before "
-            "a batch can start. This is that checkpoint: Stores confirms materials are ready to "
-            "issue for a Production Instruction — only QC-Approved raw material batches count "
-            "as available. Production cannot start the batch until this is done."
-        )
-
-        _rel_can_release = _dept_allows("Stores")
-        if not _rel_can_release:
-            st.caption("🔒 Only Stores can release materials for production.")
-
-        _rel_pending = list_production_instructions(
-            statuses=["Released to Production", "Acknowledged"]
-        )
-        _rel_pending = _rel_pending[_rel_pending["stores_released"].fillna(0).astype(int) == 0]
-
-        if _rel_pending.empty:
-            st.success("✅ No instructions currently waiting on a Stores material release.")
-        else:
-            for _, _ri in _rel_pending.iterrows():
-                with st.expander(
-                    f"{_ri['instruction_no']} — {fg_label(_ri['product'])} — "
-                    f"{_ri['quantity']:g} {_ri['quantity_unit']} @ {_ri['factory']}"
-                ):
-                    _rel_req = scale_bom_lines(_ri["bom_id"], _ri["quantity"])
-                    if _rel_req.empty:
-                        st.caption("This formula has no material lines on file.")
-                    else:
-                        _rel_check = _rel_req.copy()
-                        _rel_avail = []
-                        for _, _rr in _rel_check.iterrows():
-                            _avail_qty = cur.execute(
-                                "SELECT COALESCE(SUM(quantity),0) FROM rm_batches "
-                                "WHERE material=? AND factory=? AND status='Approved'",
-                                (_rr["material"], _ri["factory"])
-                            ).fetchone()[0]
-                            # Phase B: net off whatever's already reserved against
-                            # OTHER instructions for this same material+factory —
-                            # otherwise two PIs could both show "sufficient" against
-                            # the exact same physical rm_batches and both get released.
-                            _reserved_elsewhere = cur.execute(
-                                f"SELECT COALESCE(SUM({_rm_res_held_expr('rr2')}),0) "
-                                "FROM rm_reservations rr2 "
-                                "JOIN rm_batches rb ON rb.id = rr2.rm_batch_id "
-                                "WHERE rb.material=? AND rb.factory=? AND rr2.status!='Cancelled'",
-                                (_rr["material"], _ri["factory"])
-                            ).fetchone()[0]
-                            _rel_avail.append(max(_avail_qty - _reserved_elsewhere, 0))
-                        _rel_check["qc_approved_available"] = _rel_avail
-                        _rel_check["ok"] = _rel_check["qc_approved_available"] >= _rel_check["required_qty"]
-                        st.dataframe(
-                            _rel_check[["material", "required_qty", "unit", "qc_approved_available", "ok"]]
-                                .rename(columns={"material": "Material", "required_qty": "Required",
-                                                  "unit": "Unit",
-                                                  "qc_approved_available": "Unreserved QC-Approved Available",
-                                                  "ok": "Sufficient?"}),
-                            width='stretch', hide_index=True
-                        )
-                        if not _rel_check["ok"].all():
-                            st.warning("⚠️ One or more materials are short on unreserved QC-Approved "
-                                       "stock — releasing will reserve whatever's actually available "
-                                       "(FIFO) and report any shortfall.")
-                    if st.button("✅ Release Materials for Production", key=f"rel_go_{_ri['id']}",
-                                 disabled=not _rel_can_release):
-                        _rel_ok, _rel_msg = release_stores_materials(int(_ri["id"]))
-                        if _rel_ok:
-                            st.success(f"{_rel_msg}")
-                        else:
-                            st.error(_rel_msg)
-                        st.rerun()
-
-        st.markdown("---")
-        st.caption("Already released — visible for reference:")
-        _rel_done = list_production_instructions()
-        if not _rel_done.empty:
-            _rel_done = _rel_done[_rel_done["stores_released"].fillna(0).astype(int) == 1]
-        if _rel_done.empty:
-            st.caption("None yet.")
-        else:
-            st.dataframe(
-                _rel_done[["instruction_no", "product", "factory", "stores_released_by",
-                            "stores_released_at"]].assign(
-                    product=lambda d: d["product"].apply(fg_label)
-                ).rename(columns={
-                    "instruction_no": "Instruction", "product": "Product", "factory": "Factory",
-                    "stores_released_by": "Released By", "stores_released_at": "Released At"
-                }),
-                width='stretch', hide_index=True, height=220
-            )
-
-    with tab_master:
+    with tab_fm_master:
         st.subheader("📇 Material Master")
         st.caption("The official codification — Raw Materials, Packaging, Labels/Stickers, "
                     "and Process/Intermediate items — sourced from the plant team's "
@@ -11080,7 +11473,7 @@ elif module == "Stock":
             key="mm_export_btn"
         )
 
-    with tab_fgmaster:
+    with tab_fm_fgmaster:
         st.subheader("🏷️ Finished Goods Master")
         st.caption("The official finished-product codification — sourced from the plant team's "
                     "finished_good_codification.xlsx. This is the single source of truth used "
@@ -11242,7 +11635,7 @@ elif module == "Stock":
             key="fgm_export_btn"
         )
 
-    with tab_codes:
+    with tab_fm_codes:
         st.subheader("🏷️ Material Codes (legacy)")
         st.info("Superseded by the **📇 Material Master** tab above, which is now the "
                  "authoritative source. This legacy editor is kept only for any custom/"
@@ -11283,6 +11676,798 @@ elif module == "Stock":
             log_audit("UPDATE", "material_codes", mc_material, f"code={mc_code.strip()}")
             st.success(f"✅ {mc_material} → {mc_code.strip() or '(cleared)'}")
             st.rerun()
+
+elif module == "Sand":
+
+    st.title("🏗️ Sand Usage")
+    tab_entry, tab_log, tab_edit_s = st.tabs(["➕ Log Sand", "📋 Records", "✏️ Edit Record"])
+
+    with tab_entry:
+        st.subheader("New Sand Entry")
+        c1, c2 = st.columns(2)
+        with c1:
+            s_date    = st.date_input("Date", value=today_ist(), key="s_d")
+            s_factory = st.selectbox("Factory", FACTORIES, key="s_f",
+                                      index=FACTORIES.index(factory) if factory in FACTORIES else 0)
+        with c2:
+            s_qty  = st.number_input("Quantity", min_value=0, step=1, key="s_q")
+            s_unit = st.selectbox("Unit", SAND_UNITS, key="s_unit")
+            s_type = st.selectbox("Sand Type", SAND_TYPES, key="s_t")
+
+        if st.button("💾 Save Sand"):
+            if not s_qty:
+                st.warning("Please enter a quantity greater than 0.")
+            else:
+                # Duplicate guard: same date + factory + sand_type
+                dup = pd.read_sql_query(
+                    "SELECT id FROM sand WHERE date=? AND factory=? AND sand_type=?",
+                    conn, params=(str(s_date), s_factory, s_type)
+                )
+                if not dup.empty:
+                    st.warning(
+                        f"⚠️ A **{s_type}** sand entry for **{s_factory}** on **{s_date}** "
+                        f"already exists. Use the ✏️ Edit tab to modify it."
+                    )
+                else:
+                    try:
+                        cur.execute(
+                            "INSERT INTO sand(date,factory,qty,sand_type,unit) VALUES (?,?,?,?,?)",
+                            (str(s_date), s_factory, s_qty, s_type, s_unit)
+                        )
+                        conn.commit()
+                        log_audit("INSERT", "sand", "new",
+                                  f"{s_factory} | {s_type} | {s_qty} {s_unit}")
+                        st.success(f"✅ Saved — {s_qty:,} {s_unit} of {s_type} at {s_factory}")
+                        st.rerun()
+                    except sqlite3.Error as e:
+                        st.error(f"Database error: {e}")
+
+    with tab_log:
+        st.subheader("Sand Records")
+        thismonth = today_ist().strftime("%Y-%m")
+        month_total = sand_df[sand_df["date"].str.startswith(thismonth)]["qty"].sum() if not sand_df.empty else 0
+
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Total (Range)",  f"{int(sand_df['qty'].sum()):,}" if not sand_df.empty else "0")
+        k2.metric("This Month",     f"{int(month_total):,}")
+        k3.metric("Entries",        len(sand_df))
+
+        if sand_df.empty:
+            st.info("No sand records for this factory / date range.")
+        else:
+            if HAS_PLOTLY:
+                sand_ts = sand_df.groupby("date")["qty"].sum().reset_index().sort_values("date")
+                fig_sand = px.bar(sand_ts, x="date", y="qty",
+                                   color_discrete_sequence=["#A8791E"],
+                                   template="plotly_white",
+                                   title="Sand Usage Over Time",
+                                   labels={"date":"Date","qty":"Quantity (units)"})
+                fig_sand.update_layout(height=220, margin=dict(l=10,r=10,t=36,b=10))
+                st.plotly_chart(fig_sand, width='stretch')
+
+            if HAS_PLOTLY and "sand_type" in sand_df.columns:
+                by_type = sand_df.groupby("sand_type")["qty"].sum().reset_index()
+                fig_type = px.pie(by_type, names="sand_type", values="qty",
+                                   hole=0.4,
+                                   color_discrete_sequence=["#A8791E","#1E3A5F",
+                                                             "#145C3C","#6E1423","#5B2C6F"],
+                                   template="plotly_white",
+                                   title="Usage by Sand Type")
+                fig_type.update_layout(height=220, margin=dict(l=10,r=10,t=36,b=10))
+                st.plotly_chart(fig_type, width='stretch')
+
+            filtered_sand = search_filter(sand_df, "Search sand records", key="sand_search")
+            filtered_sand = paginate_df(filtered_sand, key="sand_page")
+            st.dataframe(filtered_sand.drop(columns=["id"], errors="ignore"),
+                         width='stretch', hide_index=True, height=280)
+            delete_row_ui(sand_df, "sand", "sand_type", "sand")
+
+    with tab_edit_s:
+        st.subheader("Edit a Sand Record")
+        if sand_df.empty:
+            st.info("No records to edit in the current date range.")
+        else:
+            opts = {
+                f"ID {r['id']} — {r['sand_type']} ({r['date']})": r["id"]
+                for _, r in sand_df.iterrows()
+            }
+            sel_label = st.selectbox("Select record to edit", list(opts.keys()),
+                                      key="sand_edit_sel")
+            sel_id  = opts[sel_label]
+            sel_row = sand_df[sand_df["id"] == sel_id].iloc[0]
+
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                e_s_date    = st.date_input("Date",
+                    value=pd.to_datetime(sel_row["date"]).date(), key="e_s_d")
+                e_s_factory = st.selectbox("Factory", FACTORIES, key="e_s_f",
+                    index=FACTORIES.index(sel_row["factory"])
+                          if sel_row["factory"] in FACTORIES else 0,
+                    disabled=not _is_admin)
+            with sc2:
+                e_s_qty  = st.number_input("Quantity",
+                    min_value=0, step=1, value=int(sel_row["qty"]), key="e_s_q")
+                _s_cur_unit = sel_row.get("unit", "Bags (50 KG)") or "Bags (50 KG)"
+                e_s_unit = st.selectbox("Unit", SAND_UNITS, key="e_s_unit",
+                    index=SAND_UNITS.index(_s_cur_unit) if _s_cur_unit in SAND_UNITS else 0)
+                e_s_type = st.selectbox("Sand Type", SAND_TYPES, key="e_s_t",
+                    index=SAND_TYPES.index(sel_row["sand_type"])
+                          if sel_row["sand_type"] in SAND_TYPES else 0)
+
+            if st.button("💾 Update Sand Record", key="sand_upd_btn"):
+                if not e_s_qty:
+                    st.warning("Quantity must be greater than 0.")
+                else:
+                    try:
+                        cur.execute(
+                            "UPDATE sand SET date=?,factory=?,qty=?,sand_type=?,unit=? WHERE id=?",
+                            (str(e_s_date), e_s_factory, e_s_qty, e_s_type, e_s_unit, sel_id)
+                        )
+                        conn.commit()
+                        log_audit("UPDATE", "sand", sel_id,
+                                  f"{e_s_factory} | {e_s_type} | {e_s_qty} {e_s_unit}")
+                        st.success("✅ Sand record updated.")
+                        st.rerun()
+                    except sqlite3.Error as e:
+                        st.error(f"Database error: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STOCK
+# ─────────────────────────────────────────────────────────────────────────────
+elif module == "Stock":
+
+    st.title("🧱 Raw Material Stock")
+    st.caption("Finished Goods stock (produced automatically from Production, consumed by "
+               "Dispatch) is in the **📦 Finished Goods Stock** tab below.")
+
+    # ── Persistent reorder banner — visible on every tab ─────────────────────
+    # FIX (P0-1): was reading the legacy `stock` table's closing_stock, which
+    # only ever changes via manual "Log Stock" entry and is NEVER touched by
+    # actual production consumption (production_batch_materials) — so this
+    # banner could keep showing healthy stock for a material that had
+    # already been consumed on the floor. Now computed live from
+    # get_rm_physical_stock() = approved RM receipts − actual production
+    # consumption, the same authoritative source Gap P0-1 already fixed for
+    # the notification bell, dashboard insights, and the low-stock
+    # procurement scan (see get_rm_physical_stock() for the full rationale).
+    _fac_for_banner = factory if factory != ALL_FACTORIES else None
+    _banner_pairs = all_rm_factory_materials()
+    if _fac_for_banner:
+        _banner_pairs = [(f, m) for f, m in _banner_pairs if f == _fac_for_banner]
+    _banner_df = pd.DataFrame(
+        [
+            {"material": _m, "factory": _f,
+             "closing_stock": get_rm_physical_stock(_f, _m)["physical_qty"]}
+            for _f, _m in _banner_pairs
+        ],
+        columns=["material", "factory", "closing_stock"]
+    )
+    if not _banner_df.empty:
+        _critical = _banner_df[_banner_df["closing_stock"] < 20]
+        _low      = _banner_df[(_banner_df["closing_stock"] >= 20) &
+                                (_banner_df["closing_stock"] < 50)]
+        if not _critical.empty:
+            _c_lines = ", ".join(
+                f"**{r['material']}** ({r['factory']}) — {int(r['closing_stock'])} units"
+                for _, r in _critical.iterrows()
+            )
+            st.error(f"🔴 **CRITICAL STOCK** — Reorder immediately: {_c_lines}")
+        if not _low.empty:
+            _l_lines = ", ".join(
+                f"**{r['material']}** ({r['factory']}) — {int(r['closing_stock'])} units"
+                for _, r in _low.iterrows()
+            )
+            st.warning(f"🟡 **LOW STOCK** — Plan reorder soon: {_l_lines}")
+        if _critical.empty and _low.empty:
+            st.success("✅ All materials at healthy stock levels")
+
+    # Material Master / Finished Goods Master / Material Codes (legacy) moved
+    # to Formulation — see the master-data-ownership restructure. Stock now
+    # holds inventory execution only; dropdowns below still read the same
+    # materials_master / finished_goods_master tables via MATERIALS / the
+    # master-lookup helpers, unchanged.
+    tab_entry, tab_log, tab_edit_stk, tab_status, tab_fg, tab_release, tab_adjust = st.tabs(
+        ["➕ Log Stock", "📋 Records", "🔒 Record History", "📦 Current Levels",
+         "🏭 Finished Goods Stock", "🚚 Material Release", "🔒 Stock Adjustments"]
+    )
+
+    with tab_entry:
+        st.subheader("New Stock Entry")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st_date    = st.date_input("Date", value=today_ist(), key="stk_d")
+            st_factory = st.selectbox("Factory", FACTORIES, key="stk_f",
+                                       index=FACTORIES.index(factory) if factory in FACTORIES else 0)
+        with c2:
+            st_material = st.selectbox("Material", MATERIALS, key="stk_m", format_func=lab_code_label)
+            _stk_lab_code = get_lab_code(st_material)
+            if _stk_lab_code:
+                st.text_input("Lab Code", value=_stk_lab_code, key="stk_code_display", disabled=True,
+                              help="From the official Material Master — not editable here.")
+                st_code = _stk_lab_code
+            else:
+                # Material Master is the single source of truth for Lab Codes —
+                # Stock no longer accepts a manually-typed fallback. The material
+                # must be given a Lab Code in Material Master before any stock
+                # can be logged against it.
+                st.error("⚠️ This material has no Lab Code in Material Master. "
+                         "Please update Material Master before entering stock.")
+                st_code = ""
+            st_received = st.number_input("Received (units)", min_value=0, step=1, key="stk_r")
+        with c3:
+            st_used = st.number_input("Used (units)", min_value=0, step=1, key="stk_u")
+            st_unit = st.selectbox(
+                "Unit", ["KG", "Bags", "Litres", "MT", "Barrel", "Units", "Other"], key="stk_unit")
+            prev_row = pd.read_sql_query(
+                "SELECT closing_stock FROM stock WHERE factory=? AND material=? ORDER BY id DESC LIMIT 1",
+                conn, params=(st_factory, st_material)
+            )
+            last_close = int(prev_row.iloc[0, 0]) if not prev_row.empty else 0
+            closing    = last_close + st_received - st_used
+            st.metric("Closing Stock Preview", f"{closing:,}",
+                      delta="⚠️ Negative" if closing < 0 else None)
+
+        # NEW: a negative closing balance almost always means a data-entry
+        # mistake (wrong material/factory picked, a receipt logged earlier
+        # under the wrong date, "Used" entered in the wrong unit) rather
+        # than genuine stock — physical inventory can't go below zero. This
+        # used to save silently either way, so a typo here would corrupt
+        # every downstream closing balance until someone noticed by hand.
+        # Blocked for everyone except admin, who can still override with an
+        # explicit acknowledgement for the rare legitimate case (e.g.
+        # backfilling a receipt that was missed for several days).
+        _stk_negative_ok = True
+        if closing < 0:
+            if _is_admin:
+                _stk_negative_ok = st.checkbox(
+                    "⚠️ I've checked this — proceed with a negative closing "
+                    "stock (e.g. an earlier receipt is being backfilled).",
+                    key="stk_negative_override"
+                )
+                if not _stk_negative_ok:
+                    st.warning("Closing stock would go negative. Confirm the checkbox above to save anyway.")
+            else:
+                _stk_negative_ok = False
+                st.error(
+                    "⚠️ This entry would take closing stock negative — that "
+                    "usually means the material, factory, date, or quantity "
+                    "is wrong. Double-check before saving, or ask an admin "
+                    "to review if this is a genuine backdated correction."
+                )
+
+        _stock_can_save = _dept_allows("Stores") and bool(_stk_lab_code) and _stk_negative_ok
+        if not _dept_allows("Stores"):
+            st.caption("🔒 Only Stores can log RM stock receipt/usage.")
+        elif not _stk_lab_code:
+            st.caption("🔒 Add this material's Lab Code in Material Master before logging stock.")
+        if st.button("💾 Save Stock", disabled=not _stock_can_save):
+            try:
+                # FIX: duplicate-check + insert now run inside _write_lock so
+                # two sessions saving the same date/factory/material at
+                # nearly the same moment can't both pass the "no duplicate
+                # yet" check before either has inserted — the second one now
+                # waits for the first to commit, then correctly sees the
+                # duplicate. recompute_stock_chain() re-derives closing_stock
+                # for the whole (factory, material) ledger from the stored
+                # received/used values afterwards, so the row's closing
+                # balance is always correct regardless of what else was
+                # written concurrently.
+                with _write_lock():
+                    _stk_dup = pd.read_sql_query(
+                        "SELECT id FROM stock WHERE date=? AND factory=? AND material=?",
+                        conn, params=(str(st_date), st_factory, st_material)
+                    )
+                    if not _stk_dup.empty:
+                        _stk_saved = False
+                    else:
+                        cur.execute(
+                            "INSERT INTO stock (date,factory,material,received,used,"
+                            "closing_stock,unit,code) VALUES (?,?,?,?,?,?,?,?)",
+                            (str(st_date), st_factory, st_material, st_received, st_used,
+                             closing, st_unit, st_code.strip())
+                        )
+                        _stk_saved = True
+
+                if not _stk_saved:
+                    st.warning(
+                        f"⚠️ A **{lab_code_label(st_material)}** entry for **{st_factory}** on "
+                        f"**{st_date}** already exists. Use the ✏️ Edit tab to modify it."
+                    )
+                else:
+                    recompute_stock_chain(st_factory, st_material)
+                    log_audit("INSERT", "stock", "new",
+                              f"{st_factory} | {st_material} ({st_code.strip() or 'no code'}) | closing={closing}")
+                    st.success(f"✅ {lab_code_label(st_material)} closing stock: {closing:,} units")
+                    st.rerun()
+            except sqlite3.Error as e:
+                st.error(f"Database error: {e}")
+
+    with tab_log:
+        if stock_df.empty:
+            st.info("No records.")
+        else:
+            _stk_k1, _stk_k2, _stk_k3 = st.columns(3)
+            _stk_k1.metric("Total Entries",   len(stock_df))
+            _stk_k2.metric("Total Received",  f"{int(stock_df['received'].sum()):,} units")
+            _stk_k3.metric("Total Used",      f"{int(stock_df['used'].sum()):,} units")
+            # Display copy with Lab Code in place of the material name (per the
+            # Stock module's display rule) — deletion below still keys off `id`,
+            # never the label text, so this swap is purely cosmetic and safe.
+            # FIX: keep the raw (factory, material) around under a hidden
+            # column so on_delete can recompute the right ledger chain after
+            # a deletion — the visible table still drops it before display.
+            _stock_df_disp = stock_df.copy()
+            _stock_df_disp["_raw_material"] = _stock_df_disp["material"]
+            _stock_df_disp["material"] = _stock_df_disp["material"].apply(lab_code_label)
+            _stock_df_disp = _stock_df_disp.rename(columns={"material": "Lab Code"})
+            filtered_stock = search_filter(_stock_df_disp, "Search stock records", key="stk_search")
+            filtered_stock = paginate_df(filtered_stock, key="stk_page")
+            st.dataframe(filtered_stock.drop(columns=["id", "_raw_material"], errors="ignore"),
+                         width='stretch', hide_index=True, height=320)
+            st.caption(
+                "🔒 Posted RM stock records can no longer be deleted here — deletion is a "
+                "historical mutation, same as editing. Submit a correction via "
+                "**🔒 Stock Adjustments** instead; it stays fully reversible in effect "
+                "(a compensating +/- entry) without erasing the original record."
+            )
+
+    with tab_edit_stk:
+        st.subheader("🔒 RM Stock Records — Posted History (Immutable)")
+        st.info(
+            "**Posted RM stock records are immutable.** Once a receipt or usage entry is "
+            "saved, it can no longer be edited or deleted here — corrections must be "
+            "submitted through **Stock Adjustments**, where a different, authorized "
+            "approver reviews and posts them. This keeps the ledger append-only and "
+            "every balance traceable to a real request, exactly like Finished Goods "
+            "stock already works."
+        )
+        st.caption(
+            "Found a wrong quantity, material, factory, or date on a past entry? "
+            "Go to the **🔒 Stock Adjustments** tab and submit a correction request "
+            "referencing this record's ID below — it will PENDING → get approved/rejected "
+            "→ POST as its own traceable ledger movement, without rewriting history."
+        )
+        if stock_df.empty:
+            st.caption("No records in the current date range.")
+        else:
+            opts = {
+                f"ID {r['id']} — {lab_code_label(r['material'])} ({r['date']})": r["id"]
+                for _, r in stock_df.iterrows()
+            }
+            sel_label = st.selectbox("Look up a record (read-only)", list(opts.keys()),
+                                      key="stk_edit_sel")
+            sel_id  = opts[sel_label]
+            sel_row = stock_df[stock_df["id"] == sel_id].iloc[0]
+            vc1, vc2, vc3, vc4 = st.columns(4)
+            vc1.metric("Record ID", int(sel_id))
+            vc2.metric("Received", f"{sel_row['received']:,.0f}")
+            vc3.metric("Used", f"{sel_row['used']:,.0f}")
+            vc4.metric("Closing Stock (at that time)", f"{sel_row['closing_stock']:,.0f}")
+            st.caption(
+                f"Factory: **{sel_row['factory']}** | Material: **{lab_code_label(sel_row['material'])}** "
+                f"| Date: **{sel_row['date']}** — quote Record ID **{int(sel_id)}** in your "
+                f"adjustment request reason for full traceability."
+            )
+
+    with tab_status:
+        st.subheader("Current Stock Levels (Latest per Material)")
+        # FIX (P0-1): was reading the legacy `stock` table's closing_stock,
+        # which is only ever updated by manual "Log Stock" entry and is
+        # NEVER touched by actual production consumption
+        # (production_batch_materials) — a material fully consumed on the
+        # floor would keep showing its last manually-typed balance here
+        # forever. Now computed live via get_rm_physical_stock() = approved
+        # RM receipts − actual production consumption, the same
+        # authoritative source Gap P0-1 already fixed for the notification
+        # bell, dashboard insights, and the low-stock procurement scan (see
+        # get_rm_physical_stock() for the full rationale). Reservations are
+        # deliberately excluded here — this column is PHYSICAL stock, not
+        # available/ATP stock.
+        _status_pairs = all_rm_factory_materials()
+        if factory != ALL_FACTORIES:
+            _status_pairs = [(f, m) for f, m in _status_pairs if f == factory]
+        current = pd.DataFrame(
+            sorted(
+                (
+                    {"material": _m, "factory": _f,
+                     "closing_stock": get_rm_physical_stock(_f, _m)["physical_qty"]}
+                    for _f, _m in _status_pairs
+                ),
+                key=lambda r: r["material"]
+            ),
+            columns=["material", "factory", "closing_stock"]
+        )
+        if current.empty:
+            st.info("No stock data yet.")
+        else:
+            def stock_status_label(qty: int) -> str:
+                if qty < 20:   return "🔴 Critical"
+                if qty < 50:   return "🟡 Low"
+                if qty < 200:  return "🟢 OK"
+                return "🔵 High"
+            current["Status"] = current["closing_stock"].apply(stock_status_label)
+            # Lab Code is the primary identifier shown here — authoritative code
+            # from the Material Master, falling back to the legacy free-text code
+            # (or the bare name as a last resort) only for items not yet catalogued.
+            current["Lab Code"] = current.apply(
+                lambda r: get_lab_code(r["material"]) or r["material"], axis=1)
+            st.dataframe(
+                current[["Lab Code","factory","closing_stock","Status"]]
+                    .rename(columns={
+                        "factory":"Factory",
+                        "closing_stock":"Closing Stock"
+                    }),
+                width='stretch', hide_index=True
+            )
+
+            if not current.empty:
+                st.markdown("---")
+                st.markdown("**Stock Level Visualisation**")
+                max_stock = int(current["closing_stock"].max()) or 1
+                for _, row in current.iterrows():
+                    color = ("#6E1423" if row["closing_stock"] < 20 else
+                             "#A8791E" if row["closing_stock"] < 50 else "#145C3C")
+                    progress_bar(
+                        f"{row['Lab Code']} ({row['factory']})",
+                        row["closing_stock"],
+                        max_stock,
+                        color=color
+                    )
+
+            st.markdown("---")
+            st.markdown("**Open a Material's 360° view**")
+            st.caption("Opening stock, consumption trend, supplier, factory-wise stock, "
+                        "and exhaustion forecast — all in one page.")
+            for _mat in sorted(current["material"].unique()):
+                mrow1, mrow2 = st.columns([5, 1])
+                mrow1.markdown(f"🧱 **{lab_code_label(_mat)}**")
+                if mrow2.button("360° →", key=f"mat360_{_mat}", use_container_width=True):
+                    open_detail_view("material", _mat)
+
+            if HAS_PLOTLY and not current.empty:
+                fig_stk = px.bar(
+                    current.sort_values("closing_stock", ascending=True),
+                    x="closing_stock", y="Lab Code",
+                    orientation="h",
+                    color="closing_stock",
+                    color_continuous_scale=["#6E1423","#D4AF37","#145C3C"],
+                    template="plotly_white",
+                    title="Current Stock by Material",
+                    labels={"closing_stock":"Closing Stock","Lab Code":"Lab Code"}
+                )
+                fig_stk.update_layout(height=max(220, len(current) * 30 + 60),
+                                       margin=dict(l=10,r=10,t=36,b=10),
+                                       showlegend=False)
+                st.plotly_chart(fig_stk, width='stretch')
+
+    with tab_fg:
+        st.subheader("🏭 Finished Goods Stock")
+        st.caption("Derived automatically — Production entries add to it, Dispatch entries "
+                   "subtract from it. Nothing is typed in here directly except manual "
+                   "adjustments below.")
+
+        _fg_fac_clause = " AND factory=?" if factory != ALL_FACTORIES else ""
+        _fg_fac_param  = (factory,) if factory != ALL_FACTORIES else ()
+        _fg_current = pd.read_sql_query(
+            "SELECT factory, product, closing_stock, date FROM fg_stock f1 "
+            "WHERE id = (SELECT MAX(id) FROM fg_stock f2 "
+            "WHERE f2.factory = f1.factory AND f2.product = f1.product)"
+            + _fg_fac_clause + " ORDER BY product",
+            conn, params=_fg_fac_param
+        )
+        if _fg_current.empty:
+            st.info("No Finished Goods stock movements yet — save a Production or Dispatch "
+                    "entry to start the ledger.")
+        else:
+            _fg_current_disp = _fg_current.copy()
+            _fg_current_disp.insert(2, "rm_code", _fg_current_disp["product"].apply(get_fg_code))
+            st.dataframe(
+                _fg_current_disp.rename(columns={
+                    "factory": "Factory", "product": "Product", "rm_code": "RM Code",
+                    "closing_stock": "Closing FG Stock", "date": "Last Movement"
+                }),
+                width='stretch', hide_index=True, height=300
+            )
+            if HAS_PLOTLY:
+                fig_fg = px.bar(
+                    _fg_current.sort_values("closing_stock", ascending=True),
+                    x="closing_stock", y="product", orientation="h",
+                    color="closing_stock",
+                    color_continuous_scale=["#6E1423", "#D4AF37", "#145C3C"],
+                    template="plotly_white", title="Current FG Stock by Product",
+                    labels={"closing_stock": "Closing Stock", "product": "Product"}
+                )
+                fig_fg.update_layout(height=max(220, len(_fg_current) * 30 + 60),
+                                      margin=dict(l=10, r=10, t=36, b=10), showlegend=False)
+                st.plotly_chart(fig_fg, width='stretch')
+
+        st.markdown("---")
+        st.markdown("#### 🔒 Manual Adjustment — now goes through approval")
+        st.caption(
+            "For opening balances, physical count corrections, or damage/write-offs — "
+            "not for routine production or dispatch, which are captured automatically. "
+            "Manual adjustments no longer post to stock immediately: submit a request in the "
+            "**🔒 Stock Adjustments** tab, and it only changes stock once a different, "
+            "authorized user approves it."
+        )
+
+    with tab_release:
+        st.subheader("🚚 Material Release for Production")
+        st.caption(
+            "Production checks with Stores for raw-material and packaging availability before "
+            "a batch can start. This is that checkpoint: Stores confirms materials are ready to "
+            "issue for a Production Instruction — only QC-Approved raw material batches count "
+            "as available. Production cannot start the batch until this is done."
+        )
+
+        _rel_can_release = _dept_allows("Stores")
+        if not _rel_can_release:
+            st.caption("🔒 Only Stores can release materials for production.")
+
+        _rel_pending = list_production_instructions(
+            statuses=["Released to Production", "Acknowledged"]
+        )
+        _rel_pending = _rel_pending[_rel_pending["stores_released"].fillna(0).astype(int) == 0]
+
+        if _rel_pending.empty:
+            st.success("✅ No instructions currently waiting on a Stores material release.")
+        else:
+            for _, _ri in _rel_pending.iterrows():
+                with st.expander(
+                    f"{_ri['instruction_no']} — {fg_label(_ri['product'])} — "
+                    f"{_ri['quantity']:g} {_ri['quantity_unit']} @ {_ri['factory']}"
+                ):
+                    _rel_req = scale_bom_lines(_ri["bom_id"], _ri["quantity"])
+                    if _rel_req.empty:
+                        st.caption("This formula has no material lines on file.")
+                    else:
+                        _rel_check = _rel_req.copy()
+                        _rel_avail = []
+                        for _, _rr in _rel_check.iterrows():
+                            _avail_qty = cur.execute(
+                                "SELECT COALESCE(SUM(quantity),0) FROM rm_batches "
+                                "WHERE material=? AND factory=? AND status='Approved'",
+                                (_rr["material"], _ri["factory"])
+                            ).fetchone()[0]
+                            # Phase B: net off whatever's already reserved against
+                            # OTHER instructions for this same material+factory —
+                            # otherwise two PIs could both show "sufficient" against
+                            # the exact same physical rm_batches and both get released.
+                            _reserved_elsewhere = cur.execute(
+                                f"SELECT COALESCE(SUM({_rm_res_held_expr('rr2')}),0) "
+                                "FROM rm_reservations rr2 "
+                                "JOIN rm_batches rb ON rb.id = rr2.rm_batch_id "
+                                "WHERE rb.material=? AND rb.factory=? AND rr2.status!='Cancelled'",
+                                (_rr["material"], _ri["factory"])
+                            ).fetchone()[0]
+                            _rel_avail.append(max(_avail_qty - _reserved_elsewhere, 0))
+                        _rel_check["qc_approved_available"] = _rel_avail
+                        _rel_check["ok"] = _rel_check["qc_approved_available"] >= _rel_check["required_qty"]
+                        st.dataframe(
+                            _rel_check[["material", "required_qty", "unit", "qc_approved_available", "ok"]]
+                                .rename(columns={"material": "Material", "required_qty": "Required",
+                                                  "unit": "Unit",
+                                                  "qc_approved_available": "Unreserved QC-Approved Available",
+                                                  "ok": "Sufficient?"}),
+                            width='stretch', hide_index=True
+                        )
+                        if not _rel_check["ok"].all():
+                            st.warning("⚠️ One or more materials are short on unreserved QC-Approved "
+                                       "stock — releasing will reserve whatever's actually available "
+                                       "(FIFO) and report any shortfall.")
+                    if st.button("✅ Release Materials for Production", key=f"rel_go_{_ri['id']}",
+                                 disabled=not _rel_can_release):
+                        _rel_ok, _rel_msg = release_stores_materials(int(_ri["id"]))
+                        if _rel_ok:
+                            st.success(f"{_rel_msg}")
+                        else:
+                            st.error(_rel_msg)
+                        st.rerun()
+
+        st.markdown("---")
+        st.caption("Already released — visible for reference:")
+        _rel_done = list_production_instructions()
+        if not _rel_done.empty:
+            _rel_done = _rel_done[_rel_done["stores_released"].fillna(0).astype(int) == 1]
+        if _rel_done.empty:
+            st.caption("None yet.")
+        else:
+            st.dataframe(
+                _rel_done[["instruction_no", "product", "factory", "stores_released_by",
+                            "stores_released_at"]].assign(
+                    product=lambda d: d["product"].apply(fg_label)
+                ).rename(columns={
+                    "instruction_no": "Instruction", "product": "Product", "factory": "Factory",
+                    "stores_released_by": "Released By", "stores_released_at": "Released At"
+                }),
+                width='stretch', hide_index=True, height=220
+            )
+
+    with tab_adjust:
+        st.subheader("🔒 Stock Adjustment Requests")
+        st.caption(
+            "Controlled workflow for manual FG/RM stock corrections: "
+            "**Request → Pending → Approved/Rejected → Posted**. Creating a request never "
+            "changes stock — only an authorized approver (never the requester) posting the "
+            "approval does that, and it posts to the same stock ledger every other movement "
+            "in this ERP uses."
+        )
+
+        # Who can request vs. approve — mirrors the existing department-scoped
+        # permission architecture (_dept_allows / _is_admin), not a parallel
+        # auth system. Stores owns physical stock counts/corrections
+        # (same gate as the RM "Log Stock" entry above); approval is
+        # restricted to Admin or a full-access ("All"-department) supervisor
+        # account, so a Stores-scoped requester structurally cannot also be
+        # an approver — enforced again in the backend functions regardless.
+        _adj_can_request = _dept_allows("Stores")
+        _adj_can_approve = _is_admin or (_is_supervisor and _user_dept in ("All", "Admin"))
+        _adj_me = st.session_state.get("username", "")
+
+        st.markdown("#### ➕ Submit Adjustment Request")
+        if not _adj_can_request:
+            st.caption("🔒 Only Stores (or Admin/full-access accounts) can request stock adjustments.")
+
+        adjc1, adjc2, adjc3 = st.columns(3)
+        with adjc1:
+            adj_type = st.selectbox("Stock Type", ["FG", "RM"], key="adj_type",
+                                     format_func=lambda v: "Finished Goods" if v == "FG" else "Raw Material")
+            adj_factory = st.selectbox("Factory", FACTORIES, key="adj_f",
+                                        index=FACTORIES.index(factory) if factory in FACTORIES else 0)
+        with adjc2:
+            if adj_type == "FG":
+                adj_product = st.selectbox("Product", FCSC_PRODUCTS, key="adj_p", format_func=fg_label)
+                adj_custom  = st.text_input("Custom name (if 'Other / Custom')", key="adj_p_cust")
+                _adj_material = (adj_custom.strip()
+                                  if adj_product == "Other / Custom" and adj_custom.strip()
+                                  else adj_product)
+                _adj_unit = get_fg_stock_unit_cfg(_adj_material)["stock_unit"] if _adj_material else ""
+            else:
+                adj_material_sel = st.selectbox("Material", MATERIALS, key="adj_m", format_func=lab_code_label)
+                _adj_material = adj_material_sel
+                _adj_unit = ""
+            adj_direction = st.radio("Direction", ["+", "-"], key="adj_dir", horizontal=True,
+                                      format_func=lambda v: "Add (+)" if v == "+" else "Remove (-)")
+        with adjc3:
+            adj_qty = st.number_input("Adjustment Quantity", min_value=0.0, step=1.0, key="adj_qty",
+                                       help="Magnitude only — direction is chosen separately.")
+            adj_reason = st.text_area("Reason *", key="adj_reason",
+                                       placeholder="e.g. Physical count correction, damage write-off",
+                                       height=68)
+            if _adj_material and _adj_material != "Other / Custom":
+                _adj_current = (get_fg_closing_stock(adj_factory, _adj_material) if adj_type == "FG"
+                                 else (lambda r: float(r[0]) if r else 0.0)(
+                                     cur.execute(
+                                         "SELECT closing_stock FROM stock WHERE factory=? AND material=? "
+                                         "ORDER BY id DESC LIMIT 1", (adj_factory, _adj_material)
+                                     ).fetchone()))
+                st.metric("Current Stock (unaffected until posted)", f"{_adj_current:,.2f}")
+
+        if st.button("📤 Submit Adjustment Request", key="adj_submit",
+                      disabled=not _adj_can_request):
+            if not _adj_material or _adj_material == "Other / Custom":
+                st.warning("Please select or enter a product/material.")
+            elif adj_qty <= 0:
+                st.warning("Enter a positive adjustment quantity.")
+            elif not adj_reason.strip():
+                st.warning("A reason is required.")
+            else:
+                try:
+                    _new_req_id = create_stock_adjustment_request(
+                        adj_factory, adj_type, _adj_material, adj_qty, adj_direction,
+                        adj_reason, _adj_me, unit=_adj_unit
+                    )
+                    st.success(
+                        f"✅ Adjustment request **#{_new_req_id}** submitted. "
+                        f"**Stock has NOT changed.** It will only post once a different, "
+                        f"authorized approver approves it below."
+                    )
+                    st.rerun()
+                except (ValueError, RuntimeError) as e:
+                    st.warning(str(e))
+
+        st.markdown("---")
+        st.markdown("#### ⏳ Pending Approval")
+        _adj_pending = pd.read_sql_query(
+            "SELECT * FROM stock_adjustment_requests WHERE status='PENDING' ORDER BY id DESC", conn
+        )
+        if _adj_pending.empty:
+            st.caption("No adjustment requests awaiting approval.")
+        else:
+            for _, _ar in _adj_pending.iterrows():
+                _ar_id = int(_ar["id"])
+                _ar_label = (fg_label(_ar["material"]) if _ar["stock_type"] == "FG"
+                             else lab_code_label(_ar["material"]))
+                with st.expander(
+                    f"#{_ar_id} — {_ar['stock_type']} | {_ar['factory']} | {_ar_label} | "
+                    f"{_ar['direction']}{_ar['quantity']:g} | requested by {_ar['requester']}",
+                    expanded=False
+                ):
+                    st.caption(f"Requested: {_ar['requested_at']}")
+                    st.caption(f"Reason: {_ar['reason']}")
+                    # NEW: shows the approver what closing stock would become
+                    # if they approve this — previously an approver could
+                    # post a large negative adjustment with no visibility
+                    # into whether it would take the material/product
+                    # negative until after it was already posted.
+                    _ar_signed = _ar["quantity"] if _ar["direction"] == "+" else -_ar["quantity"]
+                    if _ar["stock_type"] == "FG":
+                        _ar_prev = get_fg_closing_stock(_ar["factory"], _ar["material"])
+                    else:
+                        _ar_prev_row = cur.execute(
+                            "SELECT closing_stock FROM stock WHERE factory=? AND material=? "
+                            "ORDER BY id DESC LIMIT 1", (_ar["factory"], _ar["material"])
+                        ).fetchone()
+                        _ar_prev = float(_ar_prev_row[0]) if _ar_prev_row else 0.0
+                    _ar_resulting = _ar_prev + _ar_signed
+                    st.metric("Stock after this adjustment", f"{_ar_resulting:,.2f}",
+                              delta="⚠️ Negative" if _ar_resulting < 0 else None)
+                    if _ar_resulting < 0:
+                        st.warning(
+                            "⚠️ Approving this will take closing stock negative. "
+                            "Confirm the quantity/direction with the requester before posting."
+                        )
+                    _ar_self = (_ar["requester"] == _adj_me)
+                    if _ar_self:
+                        st.warning("🔒 You submitted this request — a *different*, authorized "
+                                   "approver must decide it (requester ≠ approver, enforced "
+                                   "on the backend as well as here).")
+                    elif not _adj_can_approve:
+                        st.caption("🔒 Only Admin / full-access accounts can approve or reject.")
+                    _ar_reject_reason = st.text_input(
+                        "Rejection reason (required only if rejecting)",
+                        key=f"adj_rej_reason_{_ar_id}"
+                    )
+                    arc1, arc2 = st.columns(2)
+                    with arc1:
+                        if st.button("✅ Approve & Post", key=f"adj_approve_{_ar_id}",
+                                     disabled=_ar_self or not _adj_can_approve):
+                            _ok, _msg = approve_and_post_stock_adjustment(_ar_id, _adj_me)
+                            (st.success if _ok else st.error)(_msg)
+                            st.rerun()
+                    with arc2:
+                        if st.button("❌ Reject", key=f"adj_reject_{_ar_id}",
+                                     disabled=_ar_self or not _adj_can_approve):
+                            if not _ar_reject_reason.strip():
+                                st.warning("Enter a rejection reason first.")
+                            else:
+                                _ok, _msg = reject_stock_adjustment_request(
+                                    _ar_id, _adj_me, _ar_reject_reason)
+                                (st.success if _ok else st.error)(_msg)
+                                st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### 📜 Adjustment History (Audit / Reconciliation)")
+        _adj_hist = pd.read_sql_query(
+            "SELECT id, stock_type, factory, material, direction, quantity, unit, reason, "
+            "requester, requested_at, status, approver, decision_at, decision_reason, "
+            "posted_at, ledger_ref_id FROM stock_adjustment_requests ORDER BY id DESC", conn
+        )
+        if _adj_hist.empty:
+            st.caption("No adjustment requests on file yet.")
+        else:
+            _adj_hist_disp = _adj_hist.copy()
+            _adj_hist_disp["material"] = _adj_hist_disp.apply(
+                lambda r: fg_label(r["material"]) if r["stock_type"] == "FG" else lab_code_label(r["material"]),
+                axis=1
+            )
+            st.dataframe(
+                _adj_hist_disp.rename(columns={
+                    "id": "Request ID", "stock_type": "Type", "factory": "Factory",
+                    "material": "Product / Material", "direction": "Dir", "quantity": "Qty",
+                    "unit": "Unit", "reason": "Reason", "requester": "Requester",
+                    "requested_at": "Requested At", "status": "Status", "approver": "Approver",
+                    "decision_at": "Decision At", "decision_reason": "Decision Reason",
+                    "posted_at": "Posted At", "ledger_ref_id": "Ledger Ref ID"
+                }),
+                width='stretch', hide_index=True, height=320
+            )
+            st.caption(
+                "Traceability chain for any Posted row: Stock Ledger (fg_stock/stock, "
+                "source_module='STOCK_ADJUSTMENT', source_ref_id = Request ID) → this Request "
+                "ID → Requester → Approver → Reason → Timestamps."
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -13357,12 +14542,20 @@ elif module == "Sales":
 
             if HAS_REPORTLAB:
                 pdf_bytes = generate_invoice_pdf(_inv_row, _cust_dict)
-                st.download_button(
-                    "📥 Download Invoice (PDF)",
-                    data=pdf_bytes,
-                    file_name=f"FCSC_Invoice_{_inv_id:05d}.pdf",
-                    mime="application/pdf",
-                )
+                if pdf_bytes is None:
+                    st.error(
+                        "Can't generate this invoice — your company GSTIN isn't "
+                        "configured yet. Set it in `.streamlit/secrets.toml` under "
+                        "`[company] gstin = \"...\"` (or the COMPANY_GSTIN env var), "
+                        "then restart the app."
+                    )
+                else:
+                    st.download_button(
+                        "📥 Download Invoice (PDF)",
+                        data=pdf_bytes,
+                        file_name=f"FCSC_Invoice_{_inv_id:05d}.pdf",
+                        mime="application/pdf",
+                    )
             else:
                 st.warning("Install `reportlab` (pip install reportlab) to enable PDF invoices.")
 
@@ -13375,7 +14568,10 @@ elif module == "Sales":
 
         _os_id = st.number_input("Order #", min_value=1, step=1, key="os_order_id")
         if st.button("🔍 Look up", key="os_lookup_btn"):
-            result = get_order_status(int(_os_id))
+            result = get_order_status(
+                int(_os_id),
+                restrict_factory=None if _is_admin else _user_factory
+            )
             if result is None:
                 st.error("No order found with that number.")
             else:
@@ -13404,11 +14600,21 @@ elif module == "Sales":
             "Instructions**, which is what actually starts the batch/QC/Stores chain."
         )
 
+        # FIX: previously showed every factory's orders to every viewer here
+        # (see send_sales_order_to_production for the matching backend
+        # fix) — a factory-locked supervisor could not only see but action
+        # ("Send to Production") another plant's order. Filtered to the
+        # active factory, same convention used throughout the rest of this
+        # module; admins viewing "All Factories" still see everything.
         _wo_pipeline_df = pd.read_sql_query(
-            "SELECT * FROM sales_orders WHERE wo_status != 'New' ORDER BY id DESC LIMIT 100", conn
+            "SELECT * FROM sales_orders WHERE wo_status != 'New'"
+            + (" AND factory=?" if factory != ALL_FACTORIES else "") + " ORDER BY id DESC LIMIT 100",
+            conn, params=((factory,) if factory != ALL_FACTORIES else ())
         )
         _wo_new_df = pd.read_sql_query(
-            "SELECT * FROM sales_orders WHERE wo_status='New' OR wo_status IS NULL ORDER BY id DESC", conn
+            "SELECT * FROM sales_orders WHERE (wo_status='New' OR wo_status IS NULL)"
+            + (" AND factory=?" if factory != ALL_FACTORIES else "") + " ORDER BY id DESC",
+            conn, params=((factory,) if factory != ALL_FACTORIES else ())
         )
 
         st.markdown("#### Not yet sent")
@@ -13428,8 +14634,12 @@ elif module == "Sales":
                     )
                 with wc2:
                     if st.button("📤 Send", key=f"wo_send_{_wo['id']}", disabled=not _sales_can_send):
-                        send_sales_order_to_production(int(_wo["id"]))
-                        st.success(f"Order #{_wo['id']:05d} sent to Production.")
+                        _wo_sent_ok = send_sales_order_to_production(
+                            int(_wo["id"]), acting_factory=None if _is_admin else _user_factory)
+                        if _wo_sent_ok:
+                            st.success(f"Order #{_wo['id']:05d} sent to Production.")
+                        else:
+                            st.error("Couldn't send this order — it may belong to a different factory.")
                         st.rerun()
 
         st.markdown("---")
@@ -14372,8 +15582,8 @@ elif module == "Pilot Dashboard":
             else:
                 _final_dept = "Admin" if nu_role == "admin" else nu_dept
                 cur.execute(
-                    "INSERT INTO users (username,password,role,factory,display,department) "
-                    "VALUES (?,?,?,?,?,?)",
+                    "INSERT INTO users (username,password,role,factory,display,department,must_change_password) "
+                    "VALUES (?,?,?,?,?,?,1)",
                     (nu_username, _hash_password(nu_password), nu_role,
                      (nu_factory or None) if nu_role != "admin" else None,
                      nu_display.strip(), _final_dept)
