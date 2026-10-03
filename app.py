@@ -13,6 +13,8 @@ import threading
 import shutil
 import smtplib
 import contextlib
+import math
+import numbers
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from io import BytesIO
@@ -323,6 +325,117 @@ hr { border-top: 1px solid var(--fc-border); margin: 1.1rem 0; }
 </style>
 """, unsafe_allow_html=True)
 
+# ================= ZOHO-STYLE SKIN =================
+# Visual-only layer on top of THEME above (no logic touched): navy app rail +
+# top bar, soft-blue accent, white rounded "panel" cards with a tinted header
+# band, calm canvas, underline tabs, pill status chips. To switch back to the
+# previous look, set ZOHO_SKIN = False.
+ZOHO_SKIN = True
+_MODULE_ICONS = {
+    "Dashboard": "🏠", "My Factory": "🏭", "Daily Log": "📝", "Production": "⚙️",
+    "Formulation": "🧪", "Sand": "⏳", "Stock": "📦", "Procurement": "🛒",
+    "Quality": "✅", "Sales": "🛍️", "Dispatch": "🚚", "Reconciliation": "⚖️",
+    "Cost": "💰", "P&L": "📈", "Analysis": "📊", "Reports": "📑",
+    "Customers": "👥", "Audit Trail": "🔍", "Pilot Dashboard": "🧭",
+}
+if ZOHO_SKIN:
+    st.markdown("""
+<style>
+:root {
+    --zk-navy:#151B30; --zk-navy-2:#1E2640; --zk-navy-hover:#262F50;
+    --zk-blue:#2F6FED; --zk-blue-dark:#2559C4; --zk-blue-soft:#EAF1FE;
+    --zk-canvas:#F3F5F9; --zk-card:#FFFFFF; --zk-head:#F8F9FC;
+    --zk-line:#E6E9F0; --zk-ink:#1B2233; --zk-muted:#7A8499;
+    --fc-accent:#2F6FED; --fc-accent-dark:#2559C4; --fc-accent-soft:#EAF1FE;
+    --fc-blue:#2F6FED; --fc-blue-soft:#EAF1FE;
+    --fc-canvas:#F3F5F9; --fc-radius:12px;
+}
+.stApp { background:var(--zk-canvas) !important; }
+.block-container { max-width:1480px; padding-top:1.4rem !important; }
+
+/* ── top bar ── */
+header[data-testid="stHeader"] {
+    background:var(--zk-navy) !important; height:3rem; border-bottom:1px solid #232B47;
+}
+header[data-testid="stHeader"] * { color:#C9D1E6 !important; }
+.stDeployButton, [data-testid="stDeployButton"] { display:none !important; }
+.stApp:has(.fcsc-puja-scene) header[data-testid="stHeader"] { background:transparent !important; border:0; }
+[data-testid="stAppViewContainer"] > .main, section.main { padding-top:0; }
+
+/* ── left rail ── */
+section[data-testid="stSidebar"] {
+    background:var(--zk-navy) !important; border-right:1px solid #232B47;
+}
+section[data-testid="stSidebar"] div[data-testid="stRadio"] > div[role="radiogroup"] { gap:2px; }
+/* hide the radio dot — the whole row is the control */
+section[data-testid="stSidebar"] div[data-testid="stRadio"] label > div:first-child:not([data-testid="stMarkdownContainer"]) { display:none !important; }
+section[data-testid="stSidebar"] div[data-testid="stRadio"] label {
+    border-radius:10px !important; padding:9px 12px !important;
+    border-left:0 !important; width:100%; transition:background .12s;
+}
+section[data-testid="stSidebar"] div[data-testid="stRadio"] label p { font-size:13.5px !important; font-weight:500; }
+section[data-testid="stSidebar"] div[data-testid="stRadio"] label:hover { background:var(--zk-navy-hover) !important; }
+section[data-testid="stSidebar"] div[data-testid="stRadio"] label:has(input:checked) {
+    background:var(--zk-navy-2) !important; box-shadow:inset 3px 0 0 var(--zk-blue);
+}
+section[data-testid="stSidebar"] div[data-testid="stRadio"] label:has(input:checked) p { color:#FFFFFF !important; font-weight:600 !important; }
+section[data-testid="stSidebar"] .stSelectbox label,
+section[data-testid="stSidebar"] div[data-testid="stRadio"] > label p {
+    font-size:10.5px !important; letter-spacing:.09em; text-transform:uppercase; color:#6F7A96 !important; font-weight:600;
+}
+
+/* ── page title + underline tabs (Business Overview look) ── */
+h1 { font-size:1.65rem !important; color:var(--zk-ink) !important; letter-spacing:-0.02em; margin-bottom:.4rem !important; }
+.stTabs [data-baseweb="tab-list"] { gap:6px; border-bottom:1px solid var(--zk-line); }
+.stTabs [data-baseweb="tab"] { padding:.65rem 1rem; font-size:14px; font-weight:500; color:#4A5470; }
+.stTabs [data-baseweb="tab"]:hover { color:var(--zk-blue); background:transparent; }
+.stTabs [aria-selected="true"] { color:var(--zk-blue) !important; box-shadow:inset 0 -3px 0 var(--zk-blue) !important; font-weight:600 !important; }
+.stTabs [data-baseweb="tab-highlight"] { background:var(--zk-blue) !important; height:3px !important; }
+.stTabs [data-baseweb="tab-border"] { background:var(--zk-line) !important; }
+
+/* ── panels: bordered containers, metrics, expanders, tables ── */
+div[data-testid="stVerticalBlockBorderWrapper"]:has(> div > div[data-testid="stVerticalBlock"]) {
+    background:var(--zk-card); border:1px solid var(--zk-line) !important; border-radius:12px !important;
+    box-shadow:0 1px 3px rgba(21,27,48,.05);
+}
+div[data-testid="metric-container"], div[data-testid="stMetric"] {
+    background:var(--zk-card); border:1px solid var(--zk-line); border-radius:12px;
+    padding:1rem 1.15rem; box-shadow:0 1px 3px rgba(21,27,48,.05);
+}
+div[data-testid="metric-container"] label, div[data-testid="stMetric"] label { color:var(--zk-muted) !important; }
+div[data-testid="metric-container"] div[data-testid="stMetricValue"],
+div[data-testid="stMetric"] div[data-testid="stMetricValue"] {
+    font-family:var(--fc-font-ui) !important; font-weight:600 !important; font-size:1.55rem !important; color:var(--zk-ink) !important;
+}
+div[data-testid="stExpander"] {
+    background:var(--zk-card); border:1px solid var(--zk-line) !important; border-radius:12px !important;
+    box-shadow:0 1px 3px rgba(21,27,48,.04);
+}
+div[data-testid="stExpander"] summary { background:var(--zk-head); padding:.7rem 1rem; }
+div[data-testid="stExpander"] summary:hover { background:#F1F4FA; }
+div[data-testid="stDataFrame"] { border:1px solid var(--zk-line) !important; border-radius:12px !important; background:var(--zk-card); }
+
+/* ── controls ── */
+.stButton > button { background:var(--zk-blue) !important; border-color:var(--zk-blue) !important; border-radius:8px !important; padding:.45rem 1rem; }
+.stButton > button:hover { background:var(--zk-blue-dark) !important; border-color:var(--zk-blue-dark) !important; }
+.stButton > button[kind="secondary"], button[kind="secondary"] {
+    background:var(--zk-card) !important; color:var(--zk-blue) !important; border:1px solid #CBD7F2 !important;
+}
+button[kind="secondary"]:hover { background:var(--zk-blue-soft) !important; border-color:var(--zk-blue) !important; }
+.stTextInput input, .stNumberInput input, .stDateInput input, .stTextArea textarea, div[data-baseweb="select"] > div {
+    border-radius:8px !important; border-color:#D9DEE9 !important; background:#FFFFFF;
+}
+.stTextInput input:focus, .stNumberInput input:focus, .stTextArea textarea:focus {
+    border-color:var(--zk-blue) !important; box-shadow:0 0 0 3px var(--zk-blue-soft) !important;
+}
+*:focus-visible { outline-color:var(--zk-blue) !important; }
+.stAlert, .stSuccess, .stWarning, .stError, .stInfo { border-radius:10px !important; }
+.stInfo { background:#EEF4FF !important; border-left-color:var(--zk-blue) !important; }
+.fc-pill { border-radius:99px; }
+</style>
+""", unsafe_allow_html=True)
+
+
 # ================= DB =================
 # PERF FIX: load()/load_filtered() further down re-run "SELECT * FROM ..."
 # against every table on every single widget interaction, even though
@@ -356,7 +469,24 @@ _data_version = {"v": 0}
 # raw execute()/commit()/rollback() forces all threads to take turns at the
 # C-API boundary, which is cheap (each hold is just one statement) and
 # removes the race entirely.
-_db_lock = threading.Lock()
+#
+# FIX (P0-4, transaction-scoped locking): this used to be a plain
+# threading.Lock held only around each *individual* execute()/commit()
+# call. That protected the C-API from being entered by two threads at the
+# exact same instant, but it did NOT stop thread B's cur.execute() calls
+# from interleaving *between* thread A's statements inside an open
+# "read → calculate → insert → commit" sequence (_write_lock() below) —
+# and because every thread shares the SAME sqlite3.Connection, an
+# interleaved statement from B doesn't even get its own transaction: it
+# silently runs *inside* A's still-open BEGIN IMMEDIATE, so it can be
+# rolled back by A's failure or committed early by A's commit. Promoted to
+# an RLock (reentrant) so _write_lock() can hold it across the *entire*
+# transaction while still letting that same thread's own nested
+# cur.execute()/conn.execute() calls (which also acquire this lock) go
+# through without deadlocking — reentrancy is safe here specifically
+# because the lock is only ever held across statements belonging to ONE
+# logical transaction on ONE thread at a time.
+_db_lock = threading.RLock()
 
 class _TrackingConnection(sqlite3.Connection):
     def execute(self, *args, **kwargs):
@@ -485,14 +615,53 @@ cur = _ThreadLocalCursor(conn)
 # insert" sequence — currently: FG stock movements and RM stock entries.
 @contextlib.contextmanager
 def _write_lock():
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        yield
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+    # FIX (P0-4): BEGIN IMMEDIATE alone only serializes actual disk writes
+    # at the SQLite level — it does nothing to stop another *thread* from
+    # running its own cur.execute() calls against this same shared
+    # sqlite3.Connection while this transaction is still open between here
+    # and conn.commit()/rollback(). Holding _db_lock (now an RLock, see its
+    # definition above) for the full duration of the transaction closes
+    # that gap: a second thread's cur.execute()/conn.execute() (which also
+    # acquire _db_lock) now genuinely wait until this transaction commits
+    # or rolls back, instead of being able to interleave their statements
+    # into it. Reentrant so the read/calculate/insert calls *inside* this
+    # block (made by this same thread) don't deadlock against it.
+    with _db_lock:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
+# FIX: log_audit() used to be defined much further down the file (near the
+# other UI helpers), but it's called from module-level code that runs
+# during login (forced password change, line ~1800s) — long before that
+# point in the script. Streamlit executes this file top-to-bottom on every
+# run, so calling a not-yet-defined function there raised NameError on
+# every first login for a seeded/admin-created account. Defined here
+# instead, right after its only dependencies (conn, cur, now_ist, logger)
+# all exist, so it's available to every call site regardless of position.
+def log_audit(action: str, table: str, record_id: int | str, detail: str = "") -> None:
+    """Write one row to audit_log. Never raises — audit failure must not block the main op."""
+    try:
+        cur.execute(
+            "INSERT INTO audit_log VALUES (NULL,?,?,?,?,?,?)",
+            (
+                now_ist().isoformat(timespec="seconds"),
+                st.session_state.get("username", "system"),
+                action,
+                table,
+                str(record_id),
+                detail,
+            ),
+        )
+        conn.commit()
+    except Exception as e:
+        # FIX: still never raises (audit failure must not block the main
+        # operation) but the failure is now logged instead of vanishing.
+        logger.warning("Audit log write failed: %s", e)
 
 # ================= AUTH =================
 # FIX: Passwords are salted and hashed with hashlib.scrypt (a slow,
@@ -569,11 +738,10 @@ cur.execute("UPDATE users SET department='All'   WHERE role='supervisor' AND (de
 conn.commit()
 
 # -- ADDITIVE MIGRATION: must_change_password flag. FIX: default seeded
-# accounts (admin@fcsc, belda@fcsc, etc. -- see _DEFAULT_USERS below) and
-# every admin-created account had a temporary password that a comment
-# *told* people to change, but nothing enforced it. If someone forgot, or
-# this source file was ever shared/committed anywhere, those credentials
-# work indefinitely. Existing accounts are left at 0 (not retroactively
+# accounts (see the first-run bootstrap block below -- secrets now come from
+# the environment, never from source) and every admin-created account had a
+# temporary password that a comment *told* people to change, but nothing
+# enforced it. If someone forgot, those credentials would work indefinitely. Existing accounts are left at 0 (not retroactively
 # locked out); newly seeded/created accounts below are set to 1 and are
 # blocked from every module until they set their own password.
 try:
@@ -649,29 +817,65 @@ def submit_feedback(username: str, factory: str | None, message: str) -> None:
     )
     conn.commit()
 
-# ── Seed default accounts on first run only ───────────────────────────────────
-# FIX: Plaintext defaults no longer live permanently in source. They're used
-# once, here, to seed the table — after that only the salted hash exists
-# anywhere. ⚠️ CHANGE THESE PASSWORDS immediately via the sidebar "Change My
-# Password" form, which now actually persists (see the sidebar section).
-_DEFAULT_USERS = [
-    ("admin",    "admin@fcsc",    "admin",      None,       "Administrator"),
-    ("belda",    "belda@fcsc",    "supervisor", "Belda",    "Belda Supervisor"),
-    ("mogra",    "mogra@fcsc",    "supervisor", "Mogra",    "Mogra Supervisor"),
-    ("singur",   "singur@fcsc",   "supervisor", "Singur",   "Singur Supervisor"),
-    ("siliguri", "siliguri@fcsc", "supervisor", "Siliguri", "Siliguri Supervisor"),
+# ── First-run account bootstrap (no credentials live in source) ───────────────
+# SECURITY: no password of any kind is embedded in this file. On a brand-new
+# database (empty `users` table) each account below is created ONLY if a
+# bootstrap secret for it has been provided out-of-band, via either:
+#     environment variable   FCSC_BOOTSTRAP_<USERNAME>_PASSWORD
+#                            e.g. FCSC_BOOTSTRAP_ADMIN_PASSWORD
+#     .streamlit/secrets.toml   [bootstrap]
+#                               admin = "..."   belda = "..."   (etc.)
+# Every bootstrapped account starts with must_change_password=1, so the
+# secret works for exactly one login: the user is forced to set a permanent
+# password before anything else renders (login gate below), and the
+# forced-change form refuses to reuse the bootstrap secret. Once the first
+# admin has signed in and changed their password, REMOVE the bootstrap
+# variables from the environment/secrets file — they are inert from then
+# on anyway, because seeding only ever runs against an EMPTY users table, so
+# an existing database is never reset or re-seeded by this code.
+_BOOTSTRAP_ACCOUNTS = [
+    # (username, role, factory, display name)
+    ("admin",    "admin",      None,       "Administrator"),
+    ("belda",    "supervisor", "Belda",    "Belda Supervisor"),
+    ("mogra",    "supervisor", "Mogra",    "Mogra Supervisor"),
+    ("singur",   "supervisor", "Singur",   "Singur Supervisor"),
+    ("siliguri", "supervisor", "Siliguri", "Siliguri Supervisor"),
 ]
+
+def _bootstrap_secret(username: str) -> str | None:
+    """Looks up the out-of-band bootstrap secret for `username` (env var
+    first, then st.secrets['bootstrap']). Returns None if none is configured."""
+    _val = os.environ.get(f"FCSC_BOOTSTRAP_{username.upper()}_PASSWORD")
+    if not _val:
+        try:
+            _sec = st.secrets.get("bootstrap") if hasattr(st.secrets, "get") else None
+            _val = _sec.get(username) if _sec else None
+        except Exception:
+            _val = None  # no secrets file at all — fine, fall through
+    return _val or None
+
 if cur.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
-    for _uname, _pw, _role, _fac, _disp in _DEFAULT_USERS:
+    for _uname, _role, _fac, _disp in _BOOTSTRAP_ACCOUNTS:
+        _pw = _bootstrap_secret(_uname)
+        if not _pw:
+            logger.warning("Bootstrap: no secret configured for '%s' — account not created.", _uname)
+            continue
+        # Legacy supervisor accounts keep department='All' for now, which means
+        # "every department within OWN factory" — never cross-factory (only
+        # Admin is cross-factory; see _factory_allowed() below).
         _dept = "Admin" if _role == "admin" else "All"
-        # FIX: seeded accounts now start with must_change_password=1 — the
-        # documented default credentials only ever work for exactly one
-        # login before the app forces a real password to be set (see the
-        # login gate below).
         cur.execute("INSERT INTO users (username,password,role,factory,display,department,must_change_password) "
                      "VALUES (?,?,?,?,?,?,1)",
                      (_uname, _hash_password(_pw), _role, _fac, _disp, _dept))
     conn.commit()
+    if cur.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+        st.error(
+            "🔒 **No user accounts exist yet, and no bootstrap secret is configured.** "
+            "Set `FCSC_BOOTSTRAP_ADMIN_PASSWORD` in the environment (or `[bootstrap] admin = \"...\"` "
+            "in `.streamlit/secrets.toml`) and restart the app. The first admin login will be "
+            "forced to choose a permanent password."
+        )
+        st.stop()
 
 def get_user(username: str) -> dict | None:
     row = cur.execute(
@@ -721,8 +925,15 @@ def _reset_attempts(username: str) -> None:
     cur.execute("DELETE FROM login_attempts WHERE username = ?", (username,))
     conn.commit()
 
-# Modules blocked for factory supervisors
-SUPERVISOR_BLOCKED = {"Dashboard", "P&L", "Analysis", "Audit Trail", "Pilot Dashboard"}
+# CLEANUP: a `SUPERVISOR_BLOCKED` set used to live here alongside these two
+# lists, but nothing ever read it — the actual admin/supervisor module
+# gating (see `available_modules = ADMIN_MODULES if _is_admin else
+# SUPERVISOR_MODULES` below) has always gone entirely through the two
+# explicit lists here. It had also drifted out of sync with them (missing
+# "Customers"), so keeping it around as unused, stale-looking "documentation"
+# was more likely to mislead a future edit than help one. Module access for
+# supervisors is fully defined by SUPERVISOR_MODULES below; anything in
+# ADMIN_MODULES but not in SUPERVISOR_MODULES is implicitly admin-only.
 ADMIN_MODULES      = ["Dashboard", "Daily Log", "Production", "Formulation", "Sand", "Stock",
                        "Procurement", "Quality", "Sales", "Dispatch", "Reconciliation", "Cost", "P&L", "Analysis",
                        "Reports", "Customers", "Audit Trail", "Pilot Dashboard"]
@@ -755,13 +966,15 @@ def _get_logo_data_uri() -> str | None:
     logger.warning("Logo asset not found. Checked: %s", _candidates)
     return None
 
-# ================= WEATHER (login page) =================
-# NEW: current conditions per factory, shown on the login page. Uses
-# Open-Meteo (free, no API key) — reuses the same `requests` import/flag
-# already used for WhatsApp/SMS above. Degrades the same way as every other
-# optional feature in this app: if `requests` isn't installed or the API
-# call fails for any reason, the login page just skips this section —
-# it must never block someone from logging in.
+# ================= WEATHER (login page + operational advisory) =================
+# NEW: current conditions per factory. Uses Open-Meteo (free, no API key) —
+# reuses the same `requests` import/flag already used for WhatsApp/SMS
+# above. Feeds both the login-page weather strip (render_weather_strip)
+# and the Dashboard / My Factory advisory (render_weather_advisory).
+# Degrades the same way as every other optional feature in this app: if
+# `requests` isn't installed or the API call fails for any reason, the
+# relevant section just skips itself — it must never block someone from
+# logging in.
 
 FACTORY_COORDS = {
     "Belda":    (22.0600, 87.3200),
@@ -789,7 +1002,14 @@ def _weather_icon(code) -> tuple[str, str]:
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_factory_weather(lat: float, lon: float) -> dict | None:
     """Current temp/humidity/wind/visibility/rain-chance for one location.
-    Returns None on any failure — never raises, never blocks login."""
+    Returns None on any failure — never raises, never blocks login. If every
+    factory is coming back unavailable at once, that's almost always the
+    deployment's network (outbound HTTPS to api.open-meteo.com blocked by a
+    corporate firewall/proxy, DNS not resolving, or a TLS-intercepting
+    proxy the request doesn't trust) rather than the query itself — check
+    the app log for the "Weather fetch failed" line this function emits;
+    it now includes the exception class name (Timeout / ConnectionError /
+    SSLError / ...), which is the fastest way to tell those apart."""
     if not HAS_REQUESTS:
         return None
     try:
@@ -803,7 +1023,7 @@ def fetch_factory_weather(lat: float, lon: float) -> dict | None:
                 "timezone": "Asia/Kolkata",
                 "forecast_days": 1,
             },
-            timeout=6,
+            timeout=(5, 10),
         )
         if resp.status_code != 200:
             return None
@@ -833,7 +1053,7 @@ def fetch_factory_weather(lat: float, lon: float) -> dict | None:
             "icon": icon, "label": label,
         }
     except Exception as e:
-        logger.warning("Weather fetch failed for (%s,%s): %s", lat, lon, e)
+        logger.warning("Weather fetch failed for (%s,%s): %s: %s", lat, lon, type(e).__name__, e)
         return None
 
 # ================= WEATHER-BASED OPERATIONAL TIPS =================
@@ -921,19 +1141,6 @@ def show_skeleton_cards(count: int = 5):
                           unsafe_allow_html=True)
     return placeholder
 
-def show_skeleton_lines(count: int = 4):
-    """Renders `count` shimmering line placeholders (for table-like content)
-    into a fresh st.empty() and returns it."""
-    placeholder = st.empty()
-    widths = [96, 88, 92, 80, 90, 85, 94, 78]
-    lines = "".join(
-        f"<div class='fcsc-skel fcsc-skel-line' style='width:{widths[i % len(widths)]}%;'></div>"
-        for i in range(count)
-    )
-    placeholder.markdown(f"{_SKELETON_CSS}{lines}", unsafe_allow_html=True)
-    return placeholder
-
-
 def render_weather_strip() -> None:
     """Row of compact per-factory weather cards for the login page. Each
     card also shows its single highest-priority operational tip inline —
@@ -945,7 +1152,7 @@ def render_weather_strip() -> None:
     st.markdown("""
     <style>
     .fcsc-weather-row { display:flex; gap:10px; flex-wrap:wrap; justify-content:center;
-        max-width:920px; margin:0 auto 0.4rem; }
+        max-width:920px; margin:0 auto 0.4rem; position:relative; z-index:1; }
     .fcsc-weather-card { flex:1; min-width:175px; max-width:215px;
         background:linear-gradient(180deg,#FFFBF2 0%,#FBF3E4 100%);
         border:1px solid #EFE4CC; border-top:3px solid #6E1423;
@@ -1111,174 +1318,20 @@ def render_festival_banner(compact: bool = False) -> None:
     """, unsafe_allow_html=True)
 
 
-# ================= MONSOON SEASON THEME =================
+# ================= MONSOON SEASON ADVISORY =================
 # NEW: a light seasonal treatment for West Bengal's monsoon window (roughly
 # June through September per IMD's normal onset/withdrawal dates for the
-# state). Purely additive — a subtle animated rain overlay behind the login
-# card and a compact advisory banner reusing the same pattern as the
-# festival banner above. Automatically switches itself off outside the
-# monsoon months, so there's nothing to remember to toggle each year.
+# state) — a compact advisory banner reusing the same pattern as the
+# festival banner above, shown on Dashboard / My Factory. Automatically
+# switches itself off outside the monsoon months, so there's nothing to
+# remember to toggle each year. (The animated storm visual that used to run
+# behind the login page has been retired in favour of the Durga Puja login
+# scene below — this section now only covers the operational advisory.)
 MONSOON_MONTHS = {6, 7, 8, 9}
 
 def is_monsoon_season(_today: datetime.date | None = None) -> bool:
     today = _today or today_ist()
     return today.month in MONSOON_MONTHS
-
-_STORM_SCENE_CSS = """
-<style>
-/* Dark stormy sky replaces the usual light canvas behind the login page,
-   only while this scene is mounted (i.e. only on the login page, only in
-   monsoon months) — normal app pages are never touched by this. */
-.stApp { background: linear-gradient(180deg,#211510 0%,#2B1D14 45%,#3A2A1C 100%) !important; }
-
-.fcsc-storm-scene { position: fixed; inset: 0; overflow: hidden; pointer-events: none; z-index: 0; }
-
-/* ── Clouds — soft blurred masses drifting at different depths/speeds ── */
-@keyframes fcsc-cloud-drift {
-    0%   { transform: translateX(-12%); }
-    100% { transform: translateX(12%); }
-}
-.fcsc-cloud {
-    position: absolute; border-radius: 50%; filter: blur(18px);
-    background: radial-gradient(ellipse at 50% 50%, rgba(60,70,95,0.85) 0%, rgba(45,53,74,0.55) 70%, rgba(45,53,74,0) 100%);
-    animation-name: fcsc-cloud-drift;
-    animation-timing-function: ease-in-out;
-    animation-iteration-count: infinite;
-    animation-direction: alternate;
-}
-
-/* ── Lightning — irregular double-flash lighting the whole scene, plus a
-   jagged bolt that flickers near one cloud in rough sync ── */
-@keyframes fcsc-lightning-flash {
-    0%, 100% { opacity: 0; }
-    91%      { opacity: 0; }
-    92%      { opacity: 0.85; }
-    93%      { opacity: 0.1; }
-    94%      { opacity: 0.6; }
-    95.5%    { opacity: 0; }
-}
-.fcsc-lightning-flash {
-    position: absolute; inset: 0;
-    background: radial-gradient(ellipse at 30% 15%, rgba(226,236,255,0.9) 0%, rgba(226,236,255,0.15) 45%, rgba(226,236,255,0) 75%);
-    animation: fcsc-lightning-flash linear infinite;
-}
-@keyframes fcsc-bolt-flicker {
-    0%, 100% { opacity: 0; }
-    91.5%    { opacity: 0; }
-    92%      { opacity: 1; }
-    93%      { opacity: 0.2; }
-    94%      { opacity: 0.9; }
-    95.5%    { opacity: 0; }
-}
-.fcsc-bolt {
-    position: absolute; top: 6%; left: 26%; width: 90px; height: 220px;
-    filter: drop-shadow(0 0 8px rgba(210,228,255,0.9));
-    animation: fcsc-bolt-flicker linear infinite;
-}
-
-/* ── Rain — angled, wind-driven streaks ── */
-@keyframes fcsc-rain-fall {
-    0%   { transform: translate(-60px,-120%); opacity: 0; }
-    12%  { opacity: 0.55; }
-    88%  { opacity: 0.4; }
-    100% { transform: translate(60px,1000%); opacity: 0; }
-}
-.fcsc-raindrop {
-    position: absolute; top: -10%; width: 1.5px; height: 90px;
-    background: linear-gradient(180deg,
-        rgba(190,210,235,0) 0%, rgba(190,210,235,0.55) 50%, rgba(190,210,235,0) 100%);
-    animation-name: fcsc-rain-fall;
-    animation-timing-function: linear;
-    animation-iteration-count: infinite;
-}
-
-/* ── Trees — silhouettes along the bottom edge, swaying in the wind ── */
-@keyframes fcsc-tree-sway {
-    0%, 100% { transform: rotate(-3.5deg); }
-    50%      { transform: rotate(4deg); }
-}
-.fcsc-tree-row { position: absolute; bottom: 0; left: 0; width: 100%; height: 190px; }
-.fcsc-tree {
-    position: absolute; bottom: 0; transform-origin: bottom center;
-    animation-name: fcsc-tree-sway;
-    animation-timing-function: ease-in-out;
-    animation-iteration-count: infinite;
-    opacity: 0.9;
-}
-</style>
-"""
-
-def render_monsoon_storm_scene(drop_count: int = 70, cloud_count: int = 5, tree_count: int = 7) -> None:
-    """Renders a full animated thunderstorm scene behind the login card —
-    dark sky, drifting clouds, flickering lightning, wind-angled rain, and
-    swaying tree silhouettes along the bottom edge. Deterministic
-    pseudo-scatter (no `random` import needed) so layout is stable across
-    reruns. No-ops entirely outside monsoon months."""
-    if not is_monsoon_season():
-        return
-
-    # Clouds: varying width/blur/height/speed for a rough sense of depth.
-    clouds = []
-    for i in range(cloud_count):
-        left     = (i * 23) % 90
-        top      = 2 + (i * 7) % 14
-        width    = 260 + (i % 3) * 90
-        height   = 70 + (i % 2) * 30
-        duration = 34 + (i % 4) * 9
-        clouds.append(
-            f"<div class='fcsc-cloud' style='left:{left}%; top:{top}%; "
-            f"width:{width}px; height:{height}px; "
-            f"animation-duration:{duration}s;'></div>"
-        )
-
-    # Lightning: whole-scene flash + one jagged bolt, both on a long loop so
-    # strikes feel irregular rather than metronomic.
-    lightning = (
-        "<div class='fcsc-lightning-flash' style='animation-duration:9s;'></div>"
-        "<svg class='fcsc-bolt' style='animation-duration:9s;' viewBox='0 0 40 100' "
-        "xmlns='http://www.w3.org/2000/svg'>"
-        "<polygon points='22,0 6,52 18,52 10,100 34,40 20,40' fill='#E5EAEF'/>"
-        "</svg>"
-    )
-
-    # Rain: angled streaks driven by wind, denser/faster than a light shower.
-    drops = []
-    for i in range(drop_count):
-        left     = (i * 17) % 110 - 5
-        duration = 0.9 + (i % 6) * 0.18
-        delay    = (i % 9) * 0.3
-        drops.append(
-            f"<span class='fcsc-raindrop' style='left:{left}%; "
-            f"animation-duration:{duration:.2f}s; animation-delay:{delay:.2f}s;'></span>"
-        )
-
-    # Trees: simple silhouettes, staggered size/sway timing along the
-    # bottom edge so the row reads as a natural tree-line, not a repeat tile.
-    trees = []
-    for i in range(tree_count):
-        left     = 2 + i * (96 / max(tree_count - 1, 1))
-        h        = 130 + (i % 3) * 22
-        duration = 2.6 + (i % 4) * 0.5
-        delay    = (i % 5) * 0.35
-        trees.append(
-            f"<svg class='fcsc-tree' style='left:{left:.1f}%; height:{h}px; "
-            f"animation-duration:{duration:.2f}s; animation-delay:{delay:.2f}s;' "
-            f"viewBox='0 0 60 130' xmlns='http://www.w3.org/2000/svg'>"
-            f"<rect x='27' y='78' width='6' height='52' fill='#1C120D'/>"
-            f"<ellipse cx='30' cy='45' rx='27' ry='34' fill='#1C120D'/>"
-            f"<ellipse cx='16' cy='62' rx='16' ry='20' fill='#1C120D'/>"
-            f"<ellipse cx='44' cy='62' rx='16' ry='20' fill='#1C120D'/>"
-            f"</svg>"
-        )
-
-    st.markdown(
-        f"{_STORM_SCENE_CSS}"
-        f"<div class='fcsc-storm-scene'>"
-        f"{''.join(clouds)}{lightning}{''.join(drops)}"
-        f"<div class='fcsc-tree-row'>{''.join(trees)}</div>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
 
 def render_monsoon_banner(compact: bool = False) -> None:
     """Seasonal advisory banner shown only during the monsoon window.
@@ -1306,6 +1359,380 @@ def render_monsoon_banner(compact: bool = False) -> None:
         <div style='font-size:12px;color:#8C7B62;margin-top:2px;'>{detail}</div>
     </div>
     """, unsafe_allow_html=True)
+
+
+# ================= DURGA PUJA LOGIN SCENE =================
+# NEW: replaces the old seasonal monsoon storm visual behind the login card
+# (see MONSOON SEASON ADVISORY above — that section now only covers the
+# in-app operational banner; the animated background itself is gone).
+#
+# This is a cinematic, layered "Kolkata Puja evening" atmosphere built
+# entirely from CSS gradients, blurred shapes and keyframe animations —
+# no JS, no WebGL, no external images/fonts. That choice is deliberate:
+# Streamlit's st.markdown(unsafe_allow_html=True) injects HTML via
+# innerHTML, and <script> tags added that way are never executed by the
+# browser, so a "real" mouse-tracked 3D camera would need
+# streamlit.components.v1.html (a sandboxed iframe) — which this project
+# doesn't use anywhere else, can't easily sit as a transparent full-page
+# backdrop behind native Streamlit widgets, and would add real complexity
+# for a login page whose #1 requirement is "must never get in the way of
+# signing in". A layered parallax illusion (distant skyline drifting
+# slower than the string lights, particles drifting slower still) reads
+# as depth without any of that risk, matches the exact technique already
+# used for the old rain/lightning scene, and costs nothing on rerun since
+# the whole thing is mounted once and then animates purely in CSS.
+#
+# Reduced-motion / low-end devices: the global
+# `@media (prefers-reduced-motion: reduce) { animation: none !important }`
+# rule defined at the very top of this file already disables every
+# animation below for users/OSes that request it — nothing extra needed
+# here. Browsers also already throttle CSS animations in background tabs
+# on their own, so there's no need for JS visibility-change plumbing.
+# ================= DURGA PUJA LOGIN SCENE =================
+# NEW: replaces the old seasonal monsoon storm visual behind the login card
+# (see MONSOON SEASON ADVISORY above — that section now only covers the
+# in-app operational banner; the animated background itself is gone).
+#
+# v2 — brighter and more overtly festive than the first pass (bright
+# saffron-to-crimson evening instead of near-black, plus rangoli corner
+# motifs and a toran/chandmala light-and-bead hanging along the top edge)
+# after feedback that the first version read as too dark/subtle to feel
+# like Durga Puja at a glance.
+#
+# Still entirely CSS gradients, blurred shapes and keyframe animations —
+# no JS, no WebGL, no external images/fonts. That choice is deliberate:
+# Streamlit's st.markdown(unsafe_allow_html=True) injects HTML via
+# innerHTML, and <script> tags added that way are never executed by the
+# browser, so a "real" mouse-tracked 3D camera would need
+# streamlit.components.v1.html (a sandboxed iframe) — which this project
+# doesn't use anywhere else, can't easily sit as a transparent full-page
+# backdrop behind native Streamlit widgets, and would add real complexity
+# for a login page whose #1 requirement is "must never get in the way of
+# signing in". A layered parallax illusion (distant skyline drifting
+# slower than the lights, particles drifting slower still, rangoli
+# rotating slower still) reads as depth without any of that risk, and
+# costs nothing on rerun since the whole thing is mounted once and then
+# animates purely in CSS.
+#
+# Reduced-motion / low-end devices: the global
+# `@media (prefers-reduced-motion: reduce) { animation: none !important }`
+# rule defined at the very top of this file already disables every
+# animation below for users/OSes that request it — nothing extra needed
+# here. Browsers also already throttle CSS animations in background tabs
+# on their own, so there's no need for JS visibility-change plumbing.
+_PUJA_SCENE_CSS = """
+<style>
+/* Bright saffron-to-crimson Puja-evening gradient replaces the usual light
+   canvas behind the login page only (mounted only by show_login_page) —
+   normal app pages are never touched by this. */
+.stApp { background: radial-gradient(ellipse 130% 90% at 50% 0%,
+             #F0532E 0%, #D9301F 24%, #A81B2C 50%, #7A1220 72%, #4A0D18 100%) !important; }
+
+.fcsc-puja-scene { position: fixed; inset: 0; overflow: hidden; pointer-events: none; z-index: 0; }
+
+/* ── Layer 1: distant Kolkata skyline — far background, very slow parallax drift ── */
+@keyframes fcsc-puja-skyline-drift {
+    0%   { transform: translateX(-3%); }
+    100% { transform: translateX(3%); }
+}
+.fcsc-puja-skyline {
+    position: absolute; left: -5%; right: -5%; bottom: 0; height: 30%;
+    display: flex; align-items: flex-end; gap: 1.4%;
+    filter: blur(1.5px); opacity: 0.35; mix-blend-mode: multiply;
+    animation-name: fcsc-puja-skyline-drift;
+    animation-duration: 95s;
+    animation-timing-function: ease-in-out;
+    animation-iteration-count: infinite;
+    animation-direction: alternate;
+}
+.fcsc-puja-bldg { background: #4A0D18; border-radius: 1px 1px 0 0; }
+
+/* ── Layer 2: pandal silhouette + ambient bloom — subtle, breathing glow ── */
+@keyframes fcsc-puja-glow-breathe {
+    0%, 100% { opacity: 0.55; }
+    50%      { opacity: 0.9; }
+}
+.fcsc-puja-glow {
+    position: absolute; left: 50%; bottom: 6%; width: 52%; height: 42%;
+    transform: translateX(-50%);
+    background: radial-gradient(ellipse at 50% 100%, rgba(255,214,130,0.4) 0%, rgba(212,175,55,0.18) 45%, rgba(212,175,55,0) 75%);
+    filter: blur(8px);
+    animation: fcsc-puja-glow-breathe 10s ease-in-out infinite;
+}
+.fcsc-puja-pandal { position: absolute; left: 50%; bottom: 5%; transform: translateX(-50%); opacity: 0.5; filter: blur(0.5px); }
+
+/* ── Layer 3: rangoli corner motifs — large, faint, barely-perceptible rotation ── */
+@keyframes fcsc-puja-rangoli-spin {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+}
+.fcsc-puja-rangoli-wrap { position: absolute; pointer-events: none; }
+.fcsc-puja-rangoli { animation-name: fcsc-puja-rangoli-spin; animation-timing-function: linear; animation-iteration-count: infinite; }
+
+/* ── Layer 4: toran / chandmala — hanging bead-and-medallion valance along the top edge ── */
+@keyframes fcsc-puja-sway {
+    0%, 100% { transform: rotate(-2deg); }
+    50%      { transform: rotate(2deg); }
+}
+.fcsc-puja-toran-string {
+    position: absolute; top: 0; left: 3%; right: 3%; height: 2px;
+    background: linear-gradient(90deg, transparent, #D4AF37 8%, #D4AF37 92%, transparent);
+    opacity: 0.8;
+}
+.fcsc-puja-chandmala {
+    position: absolute; top: 0; transform-origin: top center;
+    animation-name: fcsc-puja-sway;
+    animation-timing-function: ease-in-out;
+    animation-iteration-count: infinite;
+}
+
+/* ── Layer 5: string / hanging lights — bright bulbs, gentle pulse, never rapid ── */
+@keyframes fcsc-puja-light-pulse {
+    0%, 100% { opacity: 0.55; transform: scale(0.9); }
+    50%      { opacity: 1;    transform: scale(1.15); }
+}
+.fcsc-puja-lightline { position: absolute; top: 3%; left: 0; width: 100%; height: 60px; }
+.fcsc-puja-bulb {
+    position: absolute; width: 9px; height: 9px; border-radius: 50%;
+    background: radial-gradient(circle, #FFFBEA 0%, #FFD666 45%, rgba(255,214,102,0) 100%);
+    box-shadow: 0 0 12px 3px rgba(255,214,102,0.75);
+    animation-name: fcsc-puja-light-pulse;
+    animation-timing-function: ease-in-out;
+    animation-iteration-count: infinite;
+}
+
+/* ── Layer 6: diyas — bright warm glow near the bottom edge, slow flicker ── */
+@keyframes fcsc-puja-diya-flicker {
+    0%, 100% { opacity: 0.65; }
+    45%      { opacity: 0.95; }
+    55%      { opacity: 0.75; }
+    80%      { opacity: 1; }
+}
+.fcsc-puja-diya {
+    position: absolute; bottom: 2%; width: 20px; height: 20px; border-radius: 50%;
+    background: radial-gradient(circle, rgba(255,235,180,0.95) 0%, rgba(255,153,51,0.7) 50%, rgba(255,153,51,0) 100%);
+    filter: blur(2px);
+    animation-name: fcsc-puja-diya-flicker;
+    animation-timing-function: ease-in-out;
+    animation-iteration-count: infinite;
+}
+
+/* ── Layer 7: floating particles — incense/dust/bokeh, slow drift upward ── */
+@keyframes fcsc-puja-particle-float {
+    0%   { transform: translate(0, 0);      opacity: 0; }
+    12%  { opacity: 0.6; }
+    88%  { opacity: 0.35; }
+    100% { transform: translate(18px, -92vh); opacity: 0; }
+}
+.fcsc-puja-particle {
+    position: absolute; bottom: 0; border-radius: 50%;
+    background: radial-gradient(circle, rgba(255,244,214,0.9) 0%, rgba(255,244,214,0) 70%);
+    animation-name: fcsc-puja-particle-float;
+    animation-timing-function: linear;
+    animation-iteration-count: infinite;
+}
+
+/* ── Layer 8: shiuli petals — sparse, slow diagonal drift with gentle rotation ── */
+@keyframes fcsc-puja-petal-drift {
+    0%   { transform: translate(0, -8vh) rotate(0deg);      opacity: 0; }
+    10%  { opacity: 0.85; }
+    90%  { opacity: 0.6; }
+    100% { transform: translate(-90px, 90vh) rotate(140deg); opacity: 0; }
+}
+.fcsc-puja-petal {
+    position: absolute; top: 0; width: 9px; height: 9px; border-radius: 50% 50% 50% 0;
+    background: linear-gradient(135deg, #FFFBF2 0%, #FF9F1C 130%);
+    animation-name: fcsc-puja-petal-drift;
+    animation-timing-function: ease-in-out;
+    animation-iteration-count: infinite;
+}
+
+/* ── Layer 9: vignette — darkens just behind the card for readability, corners stay bright so the rangoli/toran read clearly ── */
+.fcsc-puja-vignette {
+    position: absolute; inset: 0;
+    background: radial-gradient(ellipse 46% 62% at 50% 40%, rgba(15,8,5,0.5) 0%, rgba(15,8,5,0.2) 55%, rgba(15,8,5,0) 80%);
+}
+
+/* ── Alpana-inspired accent strip along the very bottom edge — static ── */
+.fcsc-puja-alpana {
+    position: absolute; left: 0; right: 0; bottom: 0; height: 4px; opacity: 0.75;
+    background: repeating-linear-gradient(90deg,
+        #FFD666 0px, #FFD666 6px, transparent 6px, transparent 12px,
+        #FFFBF2 12px, #FFFBF2 15px, transparent 15px, transparent 21px,
+        #D4AF37 21px, #D4AF37 27px, transparent 27px, transparent 33px);
+}
+
+@media (max-width: 640px) {
+    /* Smaller screens: thin the scene out rather than reflow it — fewer
+       particles/petals/lights/chandmala render (see Python below), and the
+       skyline + rangoli layers are dropped since they read as noise at
+       that width. */
+    .fcsc-puja-skyline { display: none; }
+    .fcsc-puja-rangoli-wrap { display: none; }
+}
+</style>
+"""
+
+def _puja_rangoli_svg(uid: str, size: int = 300) -> str:
+    """A gold-line mandala/rangoli motif: concentric dashed rings plus an
+    8-fold ring of petal shapes, built from plain SVG so it costs nothing
+    but a handful of vector nodes (no image asset)."""
+    petals = []
+    for i in range(8):
+        angle = i * 45
+        petals.append(
+            f"<g transform='rotate({angle} 150 150)'>"
+            f"<path d='M150,150 Q172,88 150,34 Q128,88 150,150 Z' fill='none' stroke='#FFD666' stroke-width='1.4' opacity='0.75'/>"
+            f"<circle cx='150' cy='48' r='4.5' fill='#FFD666' opacity='0.7'/>"
+            f"</g>"
+        )
+    rings = (
+        "<circle cx='150' cy='150' r='142' fill='none' stroke='#FFD666' stroke-width='1' stroke-dasharray='3 7' opacity='0.5'/>"
+        "<circle cx='150' cy='150' r='98' fill='none' stroke='#D4AF37' stroke-width='1' opacity='0.45'/>"
+        "<circle cx='150' cy='150' r='30' fill='none' stroke='#FFD666' stroke-width='1.6' opacity='0.75'/>"
+        "<circle cx='150' cy='150' r='8' fill='#FFD666' opacity='0.65'/>"
+    )
+    return (
+        f"<svg class='fcsc-puja-rangoli' id='{uid}' width='{size}' height='{size}' "
+        f"viewBox='0 0 300 300' xmlns='http://www.w3.org/2000/svg'>{rings}{''.join(petals)}</svg>"
+    )
+
+def render_puja_scene() -> None:
+    """Renders the layered, bright Durga-Puja evening backdrop behind the
+    login card: a saffron-to-crimson sky, a distant Kolkata skyline, a
+    softly glowing pandal silhouette, rotating rangoli motifs in the
+    corners, a toran/chandmala light-and-bead valance along the top edge,
+    a gently pulsing string of lights, flickering diyas, slow floating
+    particles, and sparse drifting shiuli petals — all pure CSS keyframe
+    animation, mounted once, so it never triggers a Streamlit rerun.
+    Deterministic pseudo-scatter (no `random` import needed) so layout is
+    stable across reruns, matching the pattern this file already uses for
+    its other generated scenes."""
+
+    # Skyline: a row of narrow silhouette "buildings" of varying height.
+    bldg_count = 16
+    buildings = []
+    for i in range(bldg_count):
+        width  = 22 + (i % 4) * 9
+        height = 40 + (i * 13) % 60
+        buildings.append(f"<div class='fcsc-puja-bldg' style='width:{width}px; height:{height}%;'></div>")
+
+    # Pandal silhouette: a simple layered arch/dome suggestion — kept small
+    # and indistinct on purpose (never a literal idol, never dominant).
+    pandal_svg = (
+        "<svg width='220' height='150' viewBox='0 0 220 150' xmlns='http://www.w3.org/2000/svg'>"
+        "<path d='M20,150 L20,70 Q20,20 110,10 Q200,20 200,70 L200,150 Z' fill='#4A0D18'/>"
+        "<path d='M60,150 L60,90 Q110,70 160,90 L160,150 Z' fill='#7A1220'/>"
+        "<circle cx='110' cy='16' r='6' fill='#4A0D18'/>"
+        "</svg>"
+    )
+
+    # Rangoli motifs: two large, faint, very-slow-rotating mandalas tucked
+    # into opposite corners so they read at a glance without competing
+    # with the login card for attention.
+    rangoli = (
+        f"<div class='fcsc-puja-rangoli-wrap' style='top:-70px; left:-70px; opacity:0.28;'>"
+        f"{_puja_rangoli_svg('rgl1', 320)}</div>"
+        f"<div class='fcsc-puja-rangoli-wrap' style='bottom:-90px; right:-90px; opacity:0.24;'>"
+        f"{_puja_rangoli_svg('rgl2', 360)}</div>"
+    )
+    # Both spin, but at very different (and very long) periods so the
+    # relative motion never lines up into an obvious loop.
+    rangoli = rangoli.replace("id='rgl1'", "id='rgl1' style='animation-duration:150s;'")
+    rangoli = rangoli.replace("id='rgl2'", "id='rgl2' style='animation-duration:210s;'")
+
+    # Toran / chandmala: a horizontal string just below the top edge with
+    # graduated bead-and-medallion hangings of varying drop length, like a
+    # festive door valance — the "chandmala" look requested.
+    chand_count = 9
+    chandmala = []
+    for i in range(chand_count):
+        left     = 4 + i * (92 / (chand_count - 1))
+        drop     = 55 + (i % 3) * 22
+        duration = 4.0 + (i % 4) * 0.6
+        delay    = (i % 5) * 0.4
+        chandmala.append(
+            f"<div class='fcsc-puja-chandmala' style='left:{left:.1f}%; "
+            f"animation-duration:{duration:.2f}s; animation-delay:{delay:.2f}s;'>"
+            f"<svg width='34' height='{drop}' viewBox='0 0 34 {drop}' xmlns='http://www.w3.org/2000/svg'>"
+            f"<line x1='17' y1='0' x2='17' y2='{drop-16}' stroke='#D4AF37' stroke-width='1.3' opacity='0.85'/>"
+            f"<circle cx='17' cy='{drop-11}' r='8.5' fill='none' stroke='#FFD666' stroke-width='1.5'/>"
+            f"<circle cx='17' cy='{drop-11}' r='3.8' fill='#FF9F1C'/>"
+            f"<circle cx='17' cy='{drop-1}' r='2.2' fill='#8B1E1E'/>"
+            f"</svg></div>"
+        )
+
+    # String lights: bulbs spaced along a shallow catenary-ish curve.
+    bulb_count = 22
+    bulbs = []
+    for i in range(bulb_count):
+        left     = (i * (100 / (bulb_count - 1)))
+        sag      = 10 * abs((i / (bulb_count - 1)) - 0.5) * 2  # low at ends, near 0 mid-curve
+        top      = 4 + sag
+        duration = 3.2 + (i % 5) * 0.5
+        delay    = (i % 7) * 0.4
+        bulbs.append(
+            f"<span class='fcsc-puja-bulb' style='left:{left:.1f}%; top:{top:.1f}px; "
+            f"animation-duration:{duration:.2f}s; animation-delay:{delay:.2f}s;'></span>"
+        )
+
+    # Diyas: scattered along the bottom edge, staggered flicker so they
+    # never pulse in unison.
+    diya_count = 14
+    diyas = []
+    for i in range(diya_count):
+        left     = 2 + (i * 7) % 96
+        duration = 3.0 + (i % 4) * 0.7
+        delay    = (i % 6) * 0.5
+        diyas.append(
+            f"<span class='fcsc-puja-diya' style='left:{left}%; "
+            f"animation-duration:{duration:.2f}s; animation-delay:{delay:.2f}s;'></span>"
+        )
+
+    # Floating particles: small varied sizes, long slow rise, staggered start.
+    particle_count = 18
+    particles = []
+    for i in range(particle_count):
+        left     = (i * 13) % 100
+        size     = 2 + (i % 3)
+        duration = 13 + (i % 6) * 2.2
+        delay    = (i % 9) * 1.6
+        particles.append(
+            f"<span class='fcsc-puja-particle' style='left:{left}%; width:{size}px; height:{size}px; "
+            f"animation-duration:{duration:.1f}s; animation-delay:{delay:.1f}s;'></span>"
+        )
+
+    # Shiuli petals: sparse, long duration + wide delay spread so only one
+    # or two are ever visible at once — never reads as snow/rainfall.
+    petal_count = 8
+    petals = []
+    for i in range(petal_count):
+        left     = 6 + (i * 12) % 88
+        duration = 19 + (i % 4) * 3.5
+        delay    = (i * 3.1) % 22
+        petals.append(
+            f"<span class='fcsc-puja-petal' style='left:{left}%; "
+            f"animation-duration:{duration:.1f}s; animation-delay:{delay:.1f}s;'></span>"
+        )
+
+    st.markdown(
+        f"{_PUJA_SCENE_CSS}"
+        f"<div class='fcsc-puja-scene'>"
+        f"<div class='fcsc-puja-skyline'>{''.join(buildings)}</div>"
+        f"<div class='fcsc-puja-glow'></div>"
+        f"<div class='fcsc-puja-pandal'>{pandal_svg}</div>"
+        f"{rangoli}"
+        f"<div class='fcsc-puja-toran-string'></div>"
+        f"{''.join(chandmala)}"
+        f"<div class='fcsc-puja-lightline'>{''.join(bulbs)}</div>"
+        f"{''.join(diyas)}"
+        f"{''.join(particles)}"
+        f"{''.join(petals)}"
+        f"<div class='fcsc-puja-vignette'></div>"
+        f"<div class='fcsc-puja-alpana'></div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
 
 # ================= NOTIFICATION BELL =================
@@ -1403,7 +1830,7 @@ def render_notification_bell(is_admin: bool, user_factory: str | None) -> None:
                 (st.warning if n["severity"] == "warning" else st.info)(f"{n['icon']} {n['text']}")
 
     if hasattr(st, "popover"):
-        with st.popover(label, use_container_width=True):
+        with st.popover(label, width='stretch'):
             _render_body()
     else:
         with st.expander(label, expanded=False):
@@ -1550,7 +1977,7 @@ def render_global_search(is_admin: bool, user_factory: str | None,
             placeholder="🔍 Search customers, materials, batches, sales orders, vendors…"
         )
     with sc2:
-        st.button("Search", key="global_search_btn", use_container_width=True)
+        st.button("Search", key="global_search_btn", width='stretch')
 
     q = (query or "").strip()
     if len(q) < 2:
@@ -1576,10 +2003,10 @@ def render_global_search(is_admin: bool, user_factory: str | None,
                     # parent module to go hunting for the record themselves.
                     _detail_map = {"Customer": "customer", "Material": "material", "Batch": "batch"}
                     if r["category"] in _detail_map:
-                        if st.button("Open 360° →", key=f"gs_open_{i}_{r['module']}", use_container_width=True):
+                        if st.button("Open 360° →", key=f"gs_open_{i}_{r['module']}", width='stretch'):
                             open_detail_view(_detail_map[r["category"]], r["label"])
                     elif r["module"] in available_modules:
-                        if st.button("Open →", key=f"gs_open_{i}_{r['module']}", use_container_width=True):
+                        if st.button("Open →", key=f"gs_open_{i}_{r['module']}", width='stretch'):
                             st.session_state["module_radio"] = r["module"]
                             st.rerun()
             st.markdown("<hr style='margin:6px 0 2px;border-color:#EFE4CC;'>", unsafe_allow_html=True)
@@ -1587,7 +2014,7 @@ def render_global_search(is_admin: bool, user_factory: str | None,
 
 def show_login_page() -> None:
     """Renders the full-screen login form and halts execution until authenticated."""
-    render_monsoon_storm_scene()
+    render_puja_scene()
     st.markdown("""
     <style>
     section[data-testid="stSidebar"] { display: none; }
@@ -1779,9 +2206,11 @@ def show_login_page() -> None:
         </div>
         """, unsafe_allow_html=True)
 
-    # ── Festival/holiday + monsoon banners, then weather strip — below the login card ──
+    # ── Festival/holiday banner, then per-factory weather strip — below the login card ──
+    # (the monsoon rain advisory banner that used to run here stays removed
+    # along with the old monsoon visual; it still appears, compact, on
+    # Dashboard / My Factory — shout if you want that back on login too)
     render_festival_banner()
-    render_monsoon_banner()
     st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
     render_weather_strip()
 
@@ -1817,6 +2246,8 @@ if st.session_state.get("must_change_password"):
             st.error("New password must be at least 6 characters.")
         elif _fpw_new != _fpw_new2:
             st.error("Passwords do not match.")
+        elif _bootstrap_secret(st.session_state.username) == _fpw_new:
+            st.error("Choose a password different from the temporary bootstrap password.")
         else:
             cur.execute(
                 "UPDATE users SET password = ?, must_change_password = 0 WHERE username = ?",
@@ -1853,20 +2284,76 @@ _is_admin     = _role == "admin"
 _is_supervisor = _role == "supervisor"
 
 # ── Departmental ownership shortcut ─────────────────────────────────────────
-# _user_dept is "Admin" for the admin account, "All" for any pre-existing
-# factory-supervisor account (preserves their current full access exactly),
-# or one of RD/QC/Production/Stores/Sales/Dispatch for a newly-created
-# department-scoped account. _dept_allows(...) is the single gate used
-# throughout the app for write actions that Section 6 of the architecture
-# spec restricts to a specific department -- admins and 'All' accounts
-# always pass; a department-scoped account only passes for its own
-# department(s). This never restricts *reading/viewing* data, only the
-# specific save/approve/issue actions that are explicitly gated with it.
+# ACCESS MODEL (two independent axes — BOTH are enforced in the backend):
+#
+#   FACTORY axis    Admin                → every factory
+#                   anyone else          → ONLY their own factory (_user_factory)
+#   DEPARTMENT axis Admin                → every department
+#                   "All" (legacy        → every department, but ONLY inside
+#                    supervisor)           their own factory. "All" NEVER implies
+#                                          cross-factory access.
+#                   RD/QC/Production/    → that one department, own factory only
+#                   Stores/Sales/Dispatch
+#
+# _user_dept is "Admin" for the admin account, "All" for the pre-existing
+# factory-supervisor accounts (kept temporarily, not yet migrated to
+# individual departments), or one of RD/QC/Production/Stores/Sales/Dispatch.
+#
+# _dept_allows(...) answers the DEPARTMENT question only. _factory_allowed() /
+# assert_factory_access() answer the FACTORY question. Every privileged
+# service function must ask both — UI gating (disabled buttons, locked
+# selectboxes) is usability only; the backend is the security boundary.
 _user_dept = st.session_state.get("department") or ("Admin" if _is_admin else "All")
 def _dept_allows(*allowed_depts: str) -> bool:
+    """Department axis. Admin and legacy 'All' pass every department gate
+    (for 'All', within its own factory — see _factory_allowed())."""
     if _is_admin or _user_dept == "All":
         return True
     return _user_dept in allowed_depts
+
+def _factory_allowed(factory: str | None) -> bool:
+    """Factory axis. Only Admin is cross-factory. Everyone else — including
+    the legacy 'All' department — may touch only records of their own
+    factory. A non-admin with no factory on file, or a record with no
+    factory, is denied (fail closed)."""
+    if _is_admin:
+        return True
+    return bool(factory) and bool(_user_factory) and factory == _user_factory
+
+def assert_factory_access(factory: str | None) -> None:
+    """Raises PermissionError unless the current user may act on `factory`.
+    Use in code paths that have no (ok, message) return channel; service
+    functions that do return one use _factory_allowed()/_factory_error_for()
+    and return the failure instead, so the UI shows a message, not a crash."""
+    if not _factory_allowed(factory):
+        raise PermissionError("Cross-factory access denied.")
+
+_CROSS_FACTORY_MSG = "Cross-factory access denied — this record belongs to a different factory."
+_FACTORY_SCOPED_TABLES = ("production_instructions", "production_batches", "rm_batches",
+                          "sales_orders", "sales")
+def _factory_error_for(table: str, rec_id: int) -> str | None:
+    """Record-based factory check: looks up the record's OWN factory and
+    returns an error message if the current user may not act on it. Returns
+    None when allowed OR when the record doesn't exist (the caller reports
+    'not found' itself, exactly as before)."""
+    assert table in _FACTORY_SCOPED_TABLES, f"Not a factory-scoped table: {table}"
+    row = cur.execute(f"SELECT factory FROM {table} WHERE id=?", (rec_id,)).fetchone()
+    if row is None:
+        return None
+    return None if _factory_allowed(row[0]) else _CROSS_FACTORY_MSG
+
+def _factory_choices() -> list[str]:
+    """Factory options a selector may offer the current user."""
+    return list(FACTORIES) if _is_admin else ([_user_factory] if _user_factory else [])
+
+def _effective_factory_filter(fac_filter: str | None) -> str | None:
+    """Reporting/reconciliation scope. None/'All' means 'every factory' ONLY for
+    Admin; anyone else is always pinned to their own factory regardless of what
+    the caller passed (an impossible value if they have no factory, so the
+    query matches nothing rather than everything)."""
+    if _is_admin:
+        return fac_filter
+    return _user_factory or "__NO_FACTORY__"
 
 # ================= TABLES =================
 cur.executescript("""
@@ -2153,6 +2640,25 @@ CREATE TABLE IF NOT EXISTS ncr_capa (
 """)
 conn.commit()
 
+# FIX (P0-8): audit trail for every QC-exception recovery transition
+# (authorise_batch_recovery()). One row per transition: who, when, why, from/to
+# status and which NCR(s) were closed with it.
+cur.executescript("""
+CREATE TABLE IF NOT EXISTS batch_recovery_log (
+    id                  INTEGER PRIMARY KEY,
+    production_batch_id INTEGER NOT NULL,
+    batch_no            TEXT,
+    action              TEXT NOT NULL,
+    from_status         TEXT NOT NULL,
+    to_status           TEXT NOT NULL,
+    reason              TEXT NOT NULL,
+    ncr_ids             TEXT DEFAULT '',
+    actor               TEXT,
+    created_at          TEXT
+);
+""")
+conn.commit()
+
 # ── NEW: Bill of Materials / Formulation ───────────────────────────────────────
 # One product can have several BOM versions over time (formula revisions);
 # only one is ever "active" at once — enforced in _activate_bom() below, not
@@ -2264,7 +2770,26 @@ conn.commit()
 #     unit used historically). Without a per-product pack weight, those two
 #     can't be combined in one ledger — this table is the single place that
 #     conversion factor lives, editable by an admin.
+# FIX (P0-10): a failed migration used to be downgraded to a warning and startup
+# carried on against a half-migrated schema. Now any migration failure other than
+# "column already exists" STOPS the app before any page renders, and every column
+# a migration promised is re-verified against the real schema at the end of the
+# migration phase (see _verify_schema_and_stamp() below).
+_EXPECTED_COLUMNS: list[tuple[str, str]] = []
+SCHEMA_VERSION = 2   # bump whenever a new migration is added to this file  (v2: P0-36 qty triggers)
+
+def _migration_fatal(what: str, err: Exception | str) -> None:
+    logger.error("FATAL migration failure — %s: %s", what, err)
+    st.error(
+        f"🛑 Startup halted: database migration failed ({what}): {err}. "
+        "The application will not run against a partially-migrated database. "
+        "Restore the latest backup or fix the cause (locked/corrupt DB, disk space, "
+        "permissions), then restart."
+    )
+    st.stop()
+
 def _safe_add_column(table: str, coldef: str) -> None:
+    _EXPECTED_COLUMNS.append((table, coldef.split()[0]))
     try:
         cur.execute(f"ALTER TABLE {table} ADD COLUMN {coldef}")
         conn.commit()
@@ -2272,18 +2797,9 @@ def _safe_add_column(table: str, coldef: str) -> None:
         if "duplicate column name" in str(e).lower():
             pass  # column already exists — additive migration is idempotent
         else:
-            # Some other ALTER failure (locked db, bad syntax, etc.) —
-            # don't silently hide it, but don't crash the whole app either.
-            st.warning(f"Migration warning on {table}.{coldef}: {e}")
+            _migration_fatal(f"{table}.{coldef}", e)
     except sqlite3.DatabaseError as e:
-        # Covers corruption ("disk image is malformed"), closed-connection
-        # errors, etc. — anything outside plain OperationalError that was
-        # previously escaping this try/except and crashing the app.
-        st.error(
-            f"Database error while migrating {table}.{coldef}: {e}. "
-            "The database file may be corrupted or unavailable — check "
-            "'Manage app' logs for details."
-        )
+        _migration_fatal(f"{table}.{coldef}", e)
 
 _safe_add_column("fg_stock", "movement_type TEXT DEFAULT 'Entry'")
 _safe_add_column("production_batches", "quantity REAL")
@@ -2391,6 +2907,46 @@ CREATE TABLE IF NOT EXISTS material_unit_factors (
 """)
 conn.commit()
 
+# ── Weight-unit helpers (moved up: must be defined before the material-unit
+# engine below, which calls convert_weight_qty() at runtime) ──
+# FIX (P0-1 / unit-consistency): weight-unit-only conversion, independent of
+# the sidebar's per-session `unit` global above — used wherever a quantity in
+# one *weight* unit (KG/MT/...) needs to be compared against or combined with
+# a quantity in another weight unit, regardless of what the session's display
+# unit happens to be set to right now (e.g. reconciling a Production Batch's
+# recorded output against the Production Instruction's required quantity).
+# Deliberately narrow: only converts between recognised WEIGHT units. Packed
+# units (Bags/Pieces/Drums) are never guessed here — those require a
+# per-product pack weight (see convert_batch_qty_to_fg_unit), and mixing a
+# packed count with a weight is a real unit mismatch, not something this
+# helper should silently paper over.
+_WEIGHT_UNIT_TO_KG = {
+    "kg": 1.0, "kilogram": 1.0, "kilograms": 1.0,
+    "mt": 1000.0, "tonne": 1000.0, "tonnes": 1000.0, "ton": 1000.0, "tons": 1000.0,
+    "g": 0.001, "gram": 0.001, "grams": 0.001,
+}
+
+def _normalize_unit_label(u: str) -> str:
+    return (u or "").strip().lower()
+
+def units_equivalent(unit_a: str, unit_b: str) -> bool:
+    """True if two unit labels denote the same unit, tolerant of case and a
+    trailing plural 's' (e.g. 'Bag' vs 'Bags', 'MT' vs 'mt')."""
+    a, b = _normalize_unit_label(unit_a), _normalize_unit_label(unit_b)
+    return a == b or a.rstrip("s") == b.rstrip("s")
+
+def convert_weight_qty(qty: float, from_unit: str, to_unit: str) -> float | None:
+    """Converts `qty` from `from_unit` to `to_unit` when both are recognised
+    weight units. Returns None (never a guessed number) if either unit isn't
+    a recognised weight unit, or if `qty` is None — the caller must treat
+    None as 'not convertible' and surface that, not substitute 1.0."""
+    if qty is None:
+        return None
+    fu, tu = _normalize_unit_label(from_unit), _normalize_unit_label(to_unit)
+    if fu not in _WEIGHT_UNIT_TO_KG or tu not in _WEIGHT_UNIT_TO_KG:
+        return None
+    return float(qty) * _WEIGHT_UNIT_TO_KG[fu] / _WEIGHT_UNIT_TO_KG[tu]
+
 DEFAULT_MATERIAL_BASE_UNIT = "KG"
 
 def get_material_base_unit(material: str) -> str:
@@ -2422,7 +2978,14 @@ def get_material_unit_factor(material: str, unit: str) -> float | None:
         "SELECT factor_to_base FROM material_unit_factors WHERE material=? AND lower(unit)=?",
         (material, su)
     ).fetchone()
-    return row[0] if row else None
+    if row:
+        return row[0]
+    # FIX (P0-9): pure weight-to-weight conversions (MT<->KG<->g) are physical
+    # constants, not guesses, so they don't need a per-material row. Packed /
+    # volumetric units (Bags, Drums, Litres, Barrel...) still need an explicit
+    # factor and still return None -> the caller must block, never assume 1.0.
+    _w = convert_weight_qty(1.0, unit, get_material_base_unit(material))
+    return _w
 
 def set_material_unit_factor(material: str, unit: str, factor_to_base: float, updated_by: str) -> None:
     cur.execute(
@@ -2757,6 +3320,36 @@ conn.commit()
 _safe_add_column("sales_orders", "wo_status TEXT DEFAULT 'New'")
 _safe_add_column("sales_orders", "instruction_id INTEGER")
 _safe_add_column("production_instructions", "sales_order_id INTEGER")
+# FIX (P0-1): DB-level backstop for "one active Production Instruction per
+# Sales Order". The authoritative check lives in create_production_instruction()
+# (inside one _write_lock() transaction); this partial unique index makes a
+# duplicate impossible even via a direct/legacy code path. Cancelled PIs are
+# excluded so an order can be re-issued after a cancellation. If historical
+# duplicates already exist the index cannot be built — that is logged loudly
+# and the in-code guard still applies; clean the duplicates, then restart.
+# FIX: a Short Closed instruction is terminal (it no longer solicits production),
+# so it must not block re-issuing the order for the unproduced balance. An index
+# created by an earlier version excluded only 'Cancelled', and CREATE ... IF NOT
+# EXISTS would silently keep that old definition -- so drop it if it is stale.
+try:
+    _ux_sql = cur.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='ux_pi_one_active_per_so'"
+    ).fetchone()
+    if _ux_sql and _ux_sql[0] and "Short Closed" not in _ux_sql[0]:
+        cur.execute("DROP INDEX ux_pi_one_active_per_so")
+        conn.commit()
+except sqlite3.Error:
+    logger.warning("Could not inspect/drop stale ux_pi_one_active_per_so index.")
+try:
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_pi_one_active_per_so "
+        "ON production_instructions(sales_order_id) "
+        "WHERE sales_order_id IS NOT NULL AND status NOT IN ('Cancelled','Short Closed')"
+    )
+    conn.commit()
+except sqlite3.IntegrityError:
+    logger.warning("ux_pi_one_active_per_so NOT created: duplicate active Production "
+                   "Instructions already exist for some Sales Order. Resolve them, then restart.")
 _safe_add_column("production_instructions", "stores_released INTEGER DEFAULT 0")
 _safe_add_column("production_instructions", "stores_released_by TEXT")
 _safe_add_column("production_instructions", "stores_released_at TEXT")
@@ -2849,6 +3442,102 @@ _safe_add_column("fg_stock", "production_batch_id INTEGER")
 _safe_add_column("rm_reservations", "released_by TEXT")
 _safe_add_column("rm_reservations", "released_at TEXT")
 _safe_add_column("rm_reservations", "released_reason TEXT")
+
+# -- ADDITIVE MIGRATION (Phase 1 — lock the transaction chain) --------------
+# Closes the specific gaps an architecture review flagged as P0 for the live
+# ERP: Stores could mark a shortfall "released" as if it were complete,
+# Dispatch could save without ever selecting a QC-cleared batch (so batch
+# and Sales-Order quantities were never actually decremented anywhere), and
+# a Sales Order was flipped to 'Completed' the moment Production finished
+# making it — even if nothing had shipped yet. Every column below is
+# additive/default-safe; historical rows just read as "not yet tracked"
+# under the new fields, exactly like every other migration in this file.
+#  - production_instructions.stores_release_status: 'Pending' | 'Partial' |
+#    'Full'. Replaces treating stores_released=1 as ambiguous between "fully
+#    reserved" and "partially reserved, Stores clicked Release anyway".
+#    stores_released stays 1 ONLY for 'Full' from now on — every existing
+#    gate in the app that already checks stores_released (e.g.
+#    create_production_batch's Phase-B guard) therefore keeps blocking
+#    production on a shortfall without needing to change.
+#  - production_batches.dispatched_qty: running total of what's actually
+#    been shipped against this batch's actual output (`quantity`), so
+#    Dispatch can enforce "can't ship more than this specific batch has"
+#    instead of only checking the factory+product FG-stock bucket.
+#  - sales.sales_order_id: the missing SO<->Dispatch link (Section 25/26) —
+#    set automatically from the selected batch's Production Instruction when
+#    one exists, so Ordered/Dispatched/Balance can be computed exactly.
+#  - sales_orders.dispatched_qty: running total actually dispatched against
+#    this order — this, not Produced, is what should ever set wo_status to
+#    'Completed' (Section 8).
+#  - sales_orders.production_status: 'Pending' | 'In Production' |
+#    'Production Complete' — kept deliberately separate from wo_status
+#    (Order Fulfillment Status) so "Production finished making it" and "the
+#    customer actually has it" can no longer be conflated into one field.
+_safe_add_column("production_instructions", "stores_release_status TEXT DEFAULT 'Pending'")
+cur.execute(
+    "UPDATE production_instructions SET stores_release_status='Full' "
+    "WHERE stores_released=1 AND (stores_release_status IS NULL OR stores_release_status='Pending')"
+)
+conn.commit()
+_safe_add_column("production_batches", "dispatched_qty REAL DEFAULT 0")
+# ── P0-36 (DB backstop): impossible numeric states are refused by SQLite itself ──
+# The service layer produces the useful messages; these triggers only guarantee that
+# no code path — present or future, including raw SQL — can persist a negative / NULL
+# material usage or a negative output/planned quantity. (NaN binds as NULL, so it is
+# caught too.) They fire on new writes only; existing rows are never rewritten.
+cur.executescript("""
+CREATE TRIGGER IF NOT EXISTS trg_pbm_qty_used_ins
+BEFORE INSERT ON production_batch_materials
+WHEN NEW.qty_used IS NULL OR NEW.qty_used < 0 OR NEW.qty_used > 1e15
+BEGIN SELECT RAISE(ABORT, 'production_batch_materials.qty_used must be a number >= 0'); END;
+CREATE TRIGGER IF NOT EXISTS trg_pbm_qty_used_upd
+BEFORE UPDATE OF qty_used ON production_batch_materials
+WHEN NEW.qty_used IS NULL OR NEW.qty_used < 0 OR NEW.qty_used > 1e15
+BEGIN SELECT RAISE(ABORT, 'production_batch_materials.qty_used must be a number >= 0'); END;
+CREATE TRIGGER IF NOT EXISTS trg_pb_qty_ins
+BEFORE INSERT ON production_batches
+WHEN (NEW.quantity IS NOT NULL AND (NEW.quantity < 0 OR NEW.quantity > 1e15))
+  OR (NEW.planned_qty IS NOT NULL AND (NEW.planned_qty < 0 OR NEW.planned_qty > 1e15))
+BEGIN SELECT RAISE(ABORT, 'production_batches.quantity / planned_qty must be >= 0'); END;
+CREATE TRIGGER IF NOT EXISTS trg_pb_qty_upd
+BEFORE UPDATE OF quantity, planned_qty ON production_batches
+WHEN (NEW.quantity IS NOT NULL AND (NEW.quantity < 0 OR NEW.quantity > 1e15))
+  OR (NEW.planned_qty IS NOT NULL AND (NEW.planned_qty < 0 OR NEW.planned_qty > 1e15))
+BEGIN SELECT RAISE(ABORT, 'production_batches.quantity / planned_qty must be >= 0'); END;
+""")
+conn.commit()
+
+_safe_add_column("sales", "sales_order_id INTEGER")
+_safe_add_column("sales_orders", "dispatched_qty REAL DEFAULT 0")
+_safe_add_column("sales_orders", "production_status TEXT DEFAULT 'Pending'")
+
+# -- ADDITIVE MIGRATION (P0-2: Sales Order has no unit) -----------------------
+# sales_orders.qty was a bare INTEGER — "10" with no way to tell whether the
+# customer ordered 10 MT, 10 Bags or 10 KG. Every downstream comparison
+# (dispatch-vs-SO balance in create_dispatch(), reporting) silently assumed
+# whatever unit the reader had in mind. ordered_unit fixes that going
+# forward; for existing rows there is no way to recover what unit was
+# actually meant at entry time, so they're backfilled to each product's
+# already-configured canonical FG stock unit (fg_product_unit.stock_unit,
+# falling back to the same 'Bags' default used everywhere else in the app
+# — see DEFAULT_FG_STOCK_UNIT) on the same reasoning already used for FG
+# Stock itself: "Qty" historically meant the de-facto FG stock unit.
+# ASSUMPTION: if your historical Sales Orders were actually entered in a
+# different unit (e.g. always MT regardless of product), update
+# ordered_unit for those rows manually before relying on it.
+_safe_add_column("sales_orders", "ordered_unit TEXT DEFAULT ''")
+cur.execute(
+    "UPDATE sales_orders SET ordered_unit = COALESCE("
+    "  (SELECT stock_unit FROM fg_product_unit WHERE fg_product_unit.product = sales_orders.product),"
+    "  'Bags'"
+    ") WHERE ordered_unit IS NULL OR ordered_unit = ''"
+)
+conn.commit()
+cur.execute(
+    "UPDATE sales_orders SET production_status='Production Complete' "
+    "WHERE wo_status='Completed' AND (production_status IS NULL OR production_status='Pending')"
+)
+conn.commit()
 
 
 def get_user_prefs(username: str) -> dict | None:
@@ -4298,10 +4987,19 @@ SCOPE_ACTIVE   = "Active Factory"
 SCOPE_ALL      = "All Factories"
 
 FACTORIES      = ["Belda", "Mogra", "Singur", "Siliguri"]
+# P0-1/3: what a factory <selectbox> may offer THIS user — every factory for Admin,
+# only their own for everyone else (incl. legacy "All" accounts). Usability only:
+# the backend re-checks via _factory_allowed() / assert_factory_access().
+_FAC_CHOICES   = _factory_choices()
 COST_CATS      = ["Raw Materials", "Labour", "Utilities", "Rent / Lease",
                    "Maintenance", "Marketing", "Logistics", "Salaries", "Other"]
 SAND_TYPES     = ["M-Sand", "River Sand", "Fine Sand", "Coarse Sand", "Other"]
 SAND_UNITS     = ["Bags (50 KG)", "Metric Tonnes", "Cubic Feet", "Cubic Metres", "Kilograms", "Loads"]
+# FIX (P0-2): shared vocabulary for any FG-related unit selector (Sales
+# Order, FG Stock Unit Settings, Production Batch output, Dispatch) so the
+# same string ("MT", "Bags", ...) always means the same thing everywhere
+# and can be safely converted via convert_fg_qty_between_units() below.
+FG_UNIT_OPTIONS = ["Bags", "Pieces", "Drums", "KG", "MT"]
 GST_RATES      = [5.0, 12.0, 18.0, 28.0]
 # ── NEW: Material Master (official codification, single source of truth) ─────
 # Every module that lets a user pick a raw material should build its dropdown
@@ -4569,7 +5267,8 @@ BATCH_STATUS_FLOW = [
     "FG QC Passed",         # awaiting Packing QC
     "Packing QC Passed",    # awaiting Dispatch QC (PDI)
     "Dispatch Approved",    # PDI done — cleared to dispatch
-    "Dispatched",           # left the factory
+    "Partially Dispatched", # PHASE 1: some, but not all, of this batch has shipped
+    "Dispatched",           # fully shipped — left the factory
 ]
 BATCH_STATUS_HOLD = {
     "Process QC Passed":  "On Hold",     # Process QC fail
@@ -4692,11 +5391,18 @@ def paginate_df(df: pd.DataFrame, page_size: int = 50,
     return df.iloc[(page - 1) * page_size: page * page_size]
 
 def delete_row_ui(df: pd.DataFrame, table: str,
-                  label_col: str, key_prefix: str, on_delete=None) -> None:
+                  label_col: str, key_prefix: str, on_delete=None, delete_fn=None) -> None:
     """Renders an expander with two-step confirmation before deleting a row.
     `on_delete`, if given, is called with the full row (as it was *before*
     deletion) right after the DELETE commits — used by Production/Dispatch to
     reverse the linked FG stock movement so nothing is orphaned (Sections 7/8).
+
+    `delete_fn(record_id, reason) -> (ok, message)`, if given, REPLACES the
+    generic delete-then-callback flow: it must perform the whole deletion —
+    including every reversal — in ONE transaction (see delete_dispatch()).
+    Use it for any inventory/financial transaction; the generic
+    delete + on_delete path commits the delete BEFORE the reversals run, so
+    a failure between them leaves the state half-reversed.
 
     P0-2 hardening: an audit flagged that hard deletion of transactional
     records had no permission gate at all — any user who could see a
@@ -4756,6 +5462,15 @@ def delete_row_ui(df: pd.DataFrame, table: str,
                 if st.button("✅ Yes, delete it", key=f"{key_prefix}_del_confirm",
                              disabled=not reason.strip()):
                     rid = options[chosen]
+                    if delete_fn is not None:
+                        _d_ok, _d_msg = delete_fn(int(rid), reason.strip())
+                        st.session_state[armed_key] = False
+                        if _d_ok:
+                            st.success(_d_msg)
+                            st.rerun()
+                        else:
+                            st.error(_d_msg)
+                        return
                     _row_before = df[df["id"] == rid].iloc[0] if "id" in df.columns else None
                     try:
                         cur.execute(f"DELETE FROM {table} WHERE id = ?", (rid,))
@@ -4825,13 +5540,26 @@ def recompute_stock_chain(factory: str, material: str) -> None:
     # `adjustment` column. adjustment defaults to 0 for every pre-existing
     # row, so this is a no-op for all historical data.
     rows = cur.execute(
-        "SELECT id, received, used, adjustment FROM stock WHERE factory=? AND material=? "
+        "SELECT id, received, used, adjustment, unit FROM stock WHERE factory=? AND material=? "
         "ORDER BY date ASC, id ASC",
         (factory, material)
     ).fetchall()
-    running = 0
-    for rid, received, used, adjustment in rows:
-        running += (received or 0) - (used or 0) + (adjustment or 0)
+    # FIX (P0-9): each row's quantities are converted into the material's BASE
+    # unit before being chained, so 100 KG + 50 Bags can never be summed as 150.
+    # A blank unit is read as the base unit (same rule as get_rm_physical_stock).
+    # New rows can no longer be saved without a usable factor (see the Log Stock
+    # save gate); a legacy row with no factor is added as entered and logged, so
+    # history isn't silently rewritten.
+    _base = get_material_base_unit(material)
+    running = 0.0
+    for rid, received, used, adjustment, _u in rows:
+        _f = get_material_unit_factor(material, _u or _base)
+        if _f is None:
+            logger.warning("stock row %s (%s/%s): no conversion factor for unit %r -> %s; "
+                           "added unconverted", rid, factory, material, _u, _base)
+            _f = 1.0
+        running += ((received or 0) - (used or 0) + (adjustment or 0)) * _f
+        running = round(running, 4)
         cur.execute("UPDATE stock SET closing_stock=? WHERE id=?", (running, rid))
     conn.commit()
 
@@ -4854,26 +5582,6 @@ def detail_back_button(label: str = "← Back") -> None:
     if st.button(label, key="_detail_view_back_btn"):
         close_detail_view()
         st.rerun()
-
-def log_audit(action: str, table: str, record_id: int | str, detail: str = "") -> None:
-    """Write one row to audit_log. Never raises — audit failure must not block the main op."""
-    try:
-        cur.execute(
-            "INSERT INTO audit_log VALUES (NULL,?,?,?,?,?,?)",
-            (
-                now_ist().isoformat(timespec="seconds"),
-                st.session_state.get("username", "system"),
-                action,
-                table,
-                str(record_id),
-                detail,
-            ),
-        )
-        conn.commit()
-    except Exception as e:
-        # FIX: still never raises (audit failure must not block the main
-        # operation) but the failure is now logged instead of vanishing.
-        logger.warning("Audit log write failed: %s", e)
 
 # ================= PROCUREMENT ENGINE =================
 # NEW: Low-stock detection → email alert → tracked purchase workflow.
@@ -5121,13 +5829,19 @@ def get_material_code(material: str) -> str:
     ).fetchone()
     return row[0] if row else ""
 
-def set_material_code(material: str, code: str) -> None:
+def set_material_code(material: str, code: str) -> tuple[bool, str]:
+    # FIX (P0-6): enforced here too, not just by disabling the button in
+    # the caller — security should live in the backend function, matching
+    # the pattern already used for e.g. acknowledge_production_instruction.
+    if not _dept_allows("RD"):
+        return False, "Only R&D (or Admin) can set material codes."
     cur.execute(
         "INSERT INTO material_codes VALUES (?,?) "
         "ON CONFLICT(material) DO UPDATE SET code=excluded.code",
         (material, code.strip())
     )
     conn.commit()
+    return True, "Saved."
 
 # ── NEW: Vendor master ──────────────────────────────────────────────────────
 # Pre-loaded from the factory's own historical raw-material stock records
@@ -5561,6 +6275,13 @@ def create_bom_header(product: str, version: str, formula_code: str, batch_size:
     product until approve_bom() is called on it, and approve_bom() now
     refuses unless the formulation passes validation (Section 6). Existing
     older versions are left completely untouched by this call."""
+    # FIX (P0-6): the UI disabled this action for non-RD accounts
+    # (_pi_can_create / _fm_can_create = _dept_allows("RD")) but the
+    # function itself enforced nothing, so a direct/duplicate call could
+    # bypass the button. Enforced here too, matching the pattern already
+    # used by acknowledge_production_instruction.
+    if not _dept_allows("RD"):
+        return False, "Only R&D (or Admin) can create a formulation.", None
     if not product:
         return False, "Select a product.", None
     if not batch_size or batch_size <= 0:
@@ -5588,6 +6309,10 @@ def add_bom_line(bom_id: int, material: str, percent: float, unit: str,
     percent is of the header's Formulation Size (batch_size); qty_per_batch
     is derived and kept in sync so every existing reader of qty_per_batch
     keeps working unchanged."""
+    # Backend gate (P0-2): BOM edits belong to R&D. The UI already hides this
+    # for other departments, but the UI is usability only.
+    if not _dept_allows("RD"):
+        return False, "Only R&D (or Admin) can edit a formulation.", None
     bom = get_bom(bom_id)
     if bom is None:
         return False, "Formulation not found.", None
@@ -5631,6 +6356,8 @@ def update_bom_line(line_id: int, material: str, percent: float, unit: str,
     bom_lines.id — this is the ✏️ Edit action (Section 3): e.g. correcting
     Cement from 25% to 22% updates that one row rather than creating a
     duplicate line or requiring the whole formulation to be redone."""
+    if not _dept_allows("RD"):
+        return False, "Only R&D (or Admin) can edit a formulation."
     line = get_bom_line(line_id)
     if line is None:
         return False, "Material line not found."
@@ -5664,6 +6391,8 @@ def delete_bom_line(line_id: int) -> tuple[bool, str]:
     formulation header, never the Material Master entry, never Stock, never
     historical production batches (which snapshot their own bom_id and are
     untouched by later edits to that bom's lines)."""
+    if not _dept_allows("RD"):
+        return False, "Only R&D (or Admin) can edit a formulation."
     line = get_bom_line(line_id)
     if line is None:
         return False, "Material line not found."
@@ -5730,6 +6459,10 @@ def approve_bom(bom_id: int, product: str) -> tuple[bool, str]:
     formulation size. Enforced here (not just disabling the UI button) so
     it can't be bypassed, since an Approved formulation becomes the basis
     for Production Instructions."""
+    # Backend gate (P0-2): approval is a QC decision (matches the UI's
+    # _fm_can_approve = _dept_allows("QC")).
+    if not _dept_allows("QC"):
+        return False, "Only QC (or Admin) can approve a formulation."
     _v = bom_validation(bom_id)
     if not _v["is_valid"]:
         return False, ("🔴 Formulation is not valid and cannot be approved:\n- " +
@@ -5938,12 +6671,117 @@ def compare_formula_vs_actual(batch_id: int) -> tuple[pd.DataFrame, str | None]:
 PI_STATUSES = ["Draft", "Released to Production", "Acknowledged",
                "In Production", "Completed", "On Hold", "Cancelled"]
 
+# FIX (P0-3 / document-numbering race): generate_instruction_no() and
+# generate_batch_no() used to do a plain "SELECT COUNT(*) ... ; return
+# count+1" — a classic check-then-act race. Two Streamlit sessions calling
+# either function at the same moment can both read the same COUNT before
+# either has inserted its row, and both mint the IDENTICAL instruction_no /
+# batch_no. The table's UNIQUE-by-convention numbering isn't even enforced
+# by a real UNIQUE constraint, so this doesn't just fail loudly — it can
+# silently produce two different rows sharing what's supposed to be a
+# unique document number.
+#
+# sequence_counters is a generic per-key atomic counter (same pattern
+# already used for invoice_counters/get_or_create_invoice_number above,
+# generalised so any document series can use it). _next_sequence() does the
+# read-then-increment entirely inside _write_lock() (BEGIN IMMEDIATE), so a
+# second concurrent caller simply waits for the first one's transaction to
+# commit before it can read — the two calls can never observe the same
+# "next" value.
+cur.execute("""
+CREATE TABLE IF NOT EXISTS sequence_counters (
+    counter_key TEXT PRIMARY KEY,
+    next_seq    INTEGER NOT NULL DEFAULT 1
+)
+""")
+conn.commit()
+
+# FIX (P0-10): end of the migration phase. (1) refuse to run older code against a
+# newer database; (2) verify every column any _safe_add_column() promised really
+# exists; (3) only then stamp the schema version. Any failure stops startup.
+def _verify_schema_and_stamp() -> None:
+    try:
+        cur.execute("CREATE TABLE IF NOT EXISTS schema_meta ("
+                    "key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")
+        conn.commit()
+        _row = cur.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
+        _db_ver = int(_row[0]) if _row and str(_row[0]).isdigit() else 0
+        if _db_ver > SCHEMA_VERSION:
+            _migration_fatal("schema version",
+                             f"database is at schema v{_db_ver} but this build only knows v{SCHEMA_VERSION} "
+                             "— deploy the matching (newer) build instead of running old code on it")
+        _missing = []
+        for _t, _c in _EXPECTED_COLUMNS:
+            _cols = {r[1] for r in cur.execute(f"PRAGMA table_info({_t})").fetchall()}
+            if _c not in _cols:
+                _missing.append(f"{_t}.{_c}")
+        if _missing:
+            _migration_fatal("schema verification", "missing column(s): " + ", ".join(_missing))
+        cur.execute(
+            "INSERT INTO schema_meta (key,value,updated_at) VALUES ('schema_version',?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (str(SCHEMA_VERSION), now_ist().isoformat(timespec="seconds"))
+        )
+        conn.commit()
+    except sqlite3.DatabaseError as e:
+        _migration_fatal("schema verification", e)
+
+_verify_schema_and_stamp()
+
+def _next_sequence(counter_key: str, seed_count_sql: str | None = None,
+                    seed_count_params: tuple = ()) -> int:
+    """Atomically allocates and returns the next integer for `counter_key`.
+
+    The first time a given counter_key is requested (no row for it yet),
+    it's seeded from `seed_count_sql` — a COUNT(*) of documents already
+    using this key's prefix — so numbering picks up after whatever was
+    already issued under the old COUNT()-based scheme instead of
+    restarting at 1 and colliding with real historical documents. Every
+    later call for the same key just reads/increments the stored counter,
+    never re-counts the table.
+
+    KNOWN LIMITATION (same as approve_and_post_stock_adjustment() above,
+    see its docstring for the full explanation): on a truly simultaneous
+    collision, the losing call can surface as a plain sqlite3
+    OperationalError instead of just waiting its turn. Caught narrowly here,
+    same as there, so that rare case is a clear "please retry" instead of an
+    unhandled crash — it never results in two callers getting the same
+    number (exactly one write ever lands; the other raises/retries).
+    """
+    try:
+        with _write_lock():
+            row = cur.execute(
+                "SELECT next_seq FROM sequence_counters WHERE counter_key=?", (counter_key,)
+            ).fetchone()
+            if row is None:
+                _seed = 0
+                if seed_count_sql:
+                    _seed = cur.execute(seed_count_sql, seed_count_params).fetchone()[0] or 0
+                seq = _seed + 1
+            else:
+                seq = row[0]
+            cur.execute(
+                "INSERT INTO sequence_counters (counter_key, next_seq) VALUES (?,?) "
+                "ON CONFLICT(counter_key) DO UPDATE SET next_seq=excluded.next_seq",
+                (counter_key, seq + 1)
+            )
+            return seq
+    except sqlite3.OperationalError as e:
+        if "transaction" in str(e).lower():
+            raise RuntimeError(
+                "Another document number was being allocated at the same instant — "
+                "please try again."
+            ) from e
+        raise
+
 def generate_instruction_no() -> str:
     _prefix = f"PI-{today_ist().strftime('%Y')}-"
-    _count = cur.execute(
-        "SELECT COUNT(*) FROM production_instructions WHERE instruction_no LIKE ?", (f"{_prefix}%",)
-    ).fetchone()[0]
-    return f"{_prefix}{_count + 1:05d}"
+    _seq = _next_sequence(
+        f"instruction_no:{_prefix}",
+        "SELECT COUNT(*) FROM production_instructions WHERE instruction_no LIKE ?",
+        (f"{_prefix}%",)
+    )
+    return f"{_prefix}{_seq:05d}"
 
 def create_production_instruction(product: str, bom_id: int, quantity: float,
                                    quantity_unit: str, factory: str, planned_date,
@@ -5960,6 +6798,22 @@ def create_production_instruction(product: str, bom_id: int, quantity: float,
     fulfil a specific Sales Order that was forwarded to Production (see
     send_sales_order_to_production()). When set, the linked sales order is
     stamped 'Instruction Created' so Sales can see it's moving."""
+    # FIX (P0-6): enforced here too — the UI already gates this behind
+    # _pi_can_create = _dept_allows("RD"), but the function itself didn't
+    # check anything.
+    if not _dept_allows("RD"):
+        return None, "Only R&D (or Admin) can create a Production Instruction."
+    # Factory axis (P0-1) + PI is the AUTHORITATIVE manufacturing-factory
+    # assignment (P0-10): the factory chosen here decides where the order is
+    # made, independent of sales_orders.factory (legacy "responsible plant").
+    if factory not in FACTORIES:
+        return None, "Select a valid manufacturing factory."
+    if not _factory_allowed(factory):
+        return None, _CROSS_FACTORY_MSG
+    if sales_order_id:
+        _so_fe = _factory_error_for("sales_orders", sales_order_id)
+        if _so_fe:
+            return None, _so_fe
     bom = get_bom(bom_id)
     if bom is None:
         return None, "Selected formula could not be found."
@@ -5969,50 +6823,145 @@ def create_production_instruction(product: str, bom_id: int, quantity: float,
         return None, "Selected formula does not belong to the selected product."
     if not quantity or quantity <= 0:
         return None, "Quantity to produce must be greater than zero."
-    instruction_no = generate_instruction_no()
-    cur.execute(
-        "INSERT INTO production_instructions "
-        "(instruction_no,product,bom_id,formula_version,formula_code,quantity,quantity_unit,"
-        "factory,planned_date,priority,notes,status,created_by,created_at,updated_at,"
-        "sales_order_id) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,'Draft',?,?,?,?)",
-        (instruction_no, product, bom_id, bom["version"], bom["formula_code"], quantity,
-         quantity_unit, factory, str(planned_date), priority, notes.strip(),
-         st.session_state.get("username", "system"), _now_iso(), _now_iso(), sales_order_id)
-    )
-    pi_id = cur.lastrowid
-    conn.commit()
+    # Number is allocated BEFORE the write lock: generate_instruction_no() opens its
+    # own _write_lock(), which cannot nest inside the one below. (A rejected
+    # attempt can therefore leave a gap in the PI number series — harmless.)
+    try:
+        instruction_no = generate_instruction_no()
+    except RuntimeError as e:
+        return None, str(e)
+    _so_stamp_detail = None
+    with _write_lock():
+        if sales_order_id:
+            # FIX (P0-1): SO -> PI is enforced server-side, atomically with the
+            # insert: SO must be 'Sent to Production' -> no active PI exists ->
+            # PI qty <= SO quantity -> create PI + stamp SO, one transaction.
+            _so = cur.execute(
+                "SELECT product, qty, COALESCE(ordered_unit,''), COALESCE(wo_status,'New'), "
+                "COALESCE(dispatched_qty,0) FROM sales_orders WHERE id=?", (sales_order_id,)
+            ).fetchone()
+            if _so is None:
+                return None, "Linked Sales Order not found."
+            _so_product, _so_qty, _so_unit, _so_wo, _so_disp = _so
+            _active_pi = cur.execute(
+                "SELECT instruction_no, status FROM production_instructions "
+                "WHERE sales_order_id=? AND status NOT IN ('Cancelled','Short Closed') LIMIT 1", (sales_order_id,)
+            ).fetchone()
+            if _active_pi:
+                return None, (f"Sales Order #{sales_order_id} already has an active Production "
+                              f"Instruction ({_active_pi[0]}, {_active_pi[1]}). Cancel it first "
+                              "if it must be re-issued.")
+            # 'Instruction Created' with NO active PI = the earlier PI was cancelled.
+            if _so_wo not in ("Sent to Production", "Instruction Created"):
+                return None, (f"Sales Order #{sales_order_id} is '{_so_wo}' — only an order that "
+                              "Sales has sent to Production can receive a Production Instruction.")
+            if _so_product and _so_product != product:
+                return None, (f"Sales Order #{sales_order_id} is for {fg_label(_so_product)}, "
+                              f"not {fg_label(product)}.")
+            _so_remaining = float(_so_qty or 0) - float(_so_disp or 0)
+            _pi_qty_so_unit = float(quantity)
+            if _so_unit and not units_equivalent(quantity_unit, _so_unit):
+                _pi_qty_so_unit, _exact, _cnote = convert_fg_qty_between_units(
+                    float(quantity), quantity_unit, _so_unit, product)
+                if not _exact:
+                    return None, (f"Cannot reliably compare {quantity:g} {quantity_unit} with the "
+                                  f"Sales Order's {_so_unit}: {_cnote} Enter the quantity in "
+                                  f"{_so_unit}.")
+            if _pi_qty_so_unit > _so_remaining + 1e-6:
+                return None, (f"Quantity {quantity:g} {quantity_unit} exceeds Sales Order "
+                              f"#{sales_order_id}'s remaining quantity "
+                              f"({_so_remaining:g} {_so_unit or quantity_unit}).")
+        try:
+            cur.execute(
+                "INSERT INTO production_instructions "
+                "(instruction_no,product,bom_id,formula_version,formula_code,quantity,quantity_unit,"
+                "factory,planned_date,priority,notes,status,created_by,created_at,updated_at,"
+                "sales_order_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,'Draft',?,?,?,?)",
+                (instruction_no, product, bom_id, bom["version"], bom["formula_code"], quantity,
+                 quantity_unit, factory, str(planned_date), priority, notes.strip(),
+                 st.session_state.get("username", "system"), _now_iso(), _now_iso(), sales_order_id)
+            )
+        except sqlite3.IntegrityError:
+            return None, (f"Sales Order #{sales_order_id} already has an active Production "
+                          "Instruction (created concurrently).")
+        pi_id = cur.lastrowid
+        if sales_order_id:
+            # NOTE: sales_orders.factory is deliberately NOT touched — it is a
+            # legacy "responsible plant" tag (see get_manufacturing_factory()).
+            cur.execute(
+                "UPDATE sales_orders SET wo_status='Instruction Created', instruction_id=? WHERE id=?",
+                (pi_id, sales_order_id)
+            )
+            _so_stamp_detail = f"Instruction Created — {instruction_no}"
+    # committed — audit lines only after the transaction (log_audit commits)
     log_audit("INSERT", "production_instructions", pi_id,
               f"{instruction_no} | {product} | {quantity:g}{quantity_unit} @ {factory}")
-    if sales_order_id:
-        cur.execute(
-            "UPDATE sales_orders SET wo_status='Instruction Created', instruction_id=? WHERE id=?",
-            (pi_id, sales_order_id)
-        )
-        conn.commit()
-        log_audit("UPDATE", "sales_orders", sales_order_id,
-                  f"Instruction Created — {instruction_no}")
+    if _so_stamp_detail:
+        log_audit("UPDATE", "sales_orders", sales_order_id, _so_stamp_detail)
     return pi_id, instruction_no
 
-def release_production_instruction(pi_id: int) -> None:
+def release_production_instruction(pi_id: int) -> tuple[bool, str]:
+    # FIX (P0-6): enforced here too — the UI already gates this behind
+    # _pi_can_create = _dept_allows("RD"), but the function itself didn't
+    # check anything, so a direct/duplicate call could bypass it.
+    if not _dept_allows("RD"):
+        return False, "Only R&D (or Admin) can release a Production Instruction."
+    _fe = _factory_error_for("production_instructions", pi_id)
+    if _fe:
+        return False, _fe
+    # FIX (P0-2): the only legal source status is 'Draft'. The conditional
+    # UPDATE + rowcount check makes the transition atomic, so a stale/direct
+    # call can never move Completed / Cancelled / Short Closed / In Production
+    # (or an already-released PI) back to 'Released to Production'.
     cur.execute(
         "UPDATE production_instructions SET status='Released to Production', released_by=?,"
-        " released_at=?, updated_at=? WHERE id=?",
+        " released_at=?, updated_at=? WHERE id=? AND status='Draft'",
         (st.session_state.get("username", "system"), _now_iso(), _now_iso(), pi_id)
     )
+    _did_release = cur.rowcount > 0
     conn.commit()
+    if not _did_release:
+        _st = cur.execute("SELECT status FROM production_instructions WHERE id=?",
+                          (pi_id,)).fetchone()
+        return False, (f"Only a Draft instruction can be released — this one is "
+                       f"'{_st[0] if _st else 'not found'}'.")
     log_audit("UPDATE", "production_instructions", pi_id, "Released to Production")
+    return True, "Released to Production."
 
-def acknowledge_production_instruction(pi_id: int) -> None:
+def acknowledge_production_instruction(pi_id: int) -> tuple[bool, str]:
+    """FIX (P0-2): acknowledgement is Production's confirmation that it has
+    seen and accepted a released instruction — enforced here, not just by
+    disabling the button, so a direct/duplicate call can't bypass it. Also
+    fixes Gap-55 (silent audit): the UPDATE's rowcount is checked before
+    logging, so a no-op call (wrong department, wrong status, already
+    acknowledged) never writes an audit line claiming it happened."""
+    if not _dept_allows("Production"):
+        return False, "Only Production can acknowledge a Production Instruction."
+    _fe = _factory_error_for("production_instructions", pi_id)
+    if _fe:
+        return False, _fe
     cur.execute(
         "UPDATE production_instructions SET status='Acknowledged', updated_at=? "
         "WHERE id=? AND status='Released to Production'",
         (_now_iso(), pi_id)
     )
+    _did_update = cur.rowcount > 0
     conn.commit()
-    log_audit("UPDATE", "production_instructions", pi_id, "Acknowledged by Production")
+    if not _did_update:
+        return False, "This instruction is no longer 'Released to Production' — nothing to acknowledge."
+    log_audit("UPDATE", "production_instructions", pi_id,
+              f"Acknowledged by Production ({st.session_state.get('username', 'system')})")
+    return True, "Acknowledged."
 
-def cancel_production_instruction(pi_id: int, reason: str = "") -> None:
+def cancel_production_instruction(pi_id: int, reason: str = "") -> tuple[bool, str]:
+    # FIX (P0-6): enforced here too, same reasoning as
+    # release_production_instruction above.
+    if not _dept_allows("RD"):
+        return False, "Only R&D (or Admin) can cancel a Production Instruction."
+    _fe = _factory_error_for("production_instructions", pi_id)
+    if _fe:
+        return False, _fe
     cur.execute(
         "UPDATE production_instructions SET status='Cancelled', updated_at=? "
         "WHERE id=? AND status NOT IN ('In Production','Completed','Short Closed')",
@@ -6030,6 +6979,8 @@ def cancel_production_instruction(pi_id: int, reason: str = "") -> None:
             pi_id, st.session_state.get("username", "system"),
             f"Instruction cancelled. {reason}".strip()
         )
+    return (True, "Cancelled.") if _did_cancel else \
+           (False, "This instruction can no longer be cancelled (already in production/completed).")
 
 def _mark_instruction_in_production(pi_id: int, production_batch_id: int) -> None:
     """Records that at least one Production Batch now exists for this PI.
@@ -6056,8 +7007,18 @@ def _mark_instruction_in_production(pi_id: int, production_batch_id: int) -> Non
         "SELECT sales_order_id FROM production_instructions WHERE id=?", (pi_id,)
     ).fetchone()
     if _pi_row and _pi_row[0]:
+        # FIX (P0-8): this used to write wo_status='In Production' — the
+        # Order FULFILMENT status — straight from a production event. That
+        # field now only ever moves on Dispatch (see create_dispatch()).
+        # What Production starting a batch actually tells us is the
+        # PRODUCTION side of the order, tracked separately here so it can
+        # never again flip wo_status (and therefore never again race with,
+        # or get overwritten by, Dispatch's own status updates). Never
+        # downgrades a production_status that's already moved further on
+        # (e.g. a later load's creation shouldn't reset it).
         cur.execute(
-            "UPDATE sales_orders SET wo_status='In Production' WHERE id=? AND wo_status != 'Completed'",
+            "UPDATE sales_orders SET production_status='In Production' "
+            "WHERE id=? AND production_status NOT IN ('Production Complete')",
             (_pi_row[0],)
         )
         conn.commit()
@@ -6077,7 +7038,42 @@ def get_pi_progress(pi_id: int) -> dict | None:
         "created_at FROM production_batches WHERE production_instruction_id=? ORDER BY id",
         conn, params=(pi_id,)
     )
-    produced = float(batches["actual_qty"].fillna(0).sum()) if not batches.empty else 0.0
+    # FIX (P0-1 / unit-consistency): create_production_batch() now enforces
+    # that every NEW batch against a PI is stored in the PI's own unit (or
+    # auto-converted into it), so this loop is mainly a safety net for
+    # batches created before that enforcement existed. Never sum a mismatched
+    # unit as if it were the PI's unit — convert weight-compatible units
+    # (KG<->MT etc.) on the fly for this read, and if a batch's unit can't be
+    # reconciled at all, exclude it from `produced` and surface it via
+    # `unreconciled_batches` instead of silently letting it skew Produced/
+    # Remaining for the whole instruction.
+    pi_unit = pi["quantity_unit"]
+    produced = 0.0
+    unreconciled_batches = []
+    if not batches.empty:
+        for _, _b in batches.iterrows():
+            # FIX (P0-7/8): a batch that has been formally Scrapped (authorised,
+            # terminal — see authorise_batch_recovery) yields no usable output, so
+            # it stops counting toward Produced and the quantity can be re-made.
+            # On Hold / Rejected / Rework / Dispatch Blocked batches are still
+            # recoverable, so they keep holding their quantity (prevents
+            # overproduction if they are later recovered).
+            if _b["status"] == "Scrapped":
+                continue
+            _qty = _b["actual_qty"]
+            if _qty is None or pd.isna(_qty):
+                continue
+            _bunit = _b["quantity_unit"]
+            if units_equivalent(_bunit, pi_unit):
+                produced += float(_qty)
+                continue
+            _converted = convert_weight_qty(float(_qty), _bunit, pi_unit)
+            if _converted is not None:
+                produced += _converted
+            else:
+                unreconciled_batches.append(
+                    {"batch_no": _b["batch_no"], "quantity": float(_qty), "quantity_unit": _bunit}
+                )
     required = float(pi["quantity"] or 0)
     remaining = max(0.0, required - produced)
     cap = get_production_capacity(pi["product"])
@@ -6088,9 +7084,10 @@ def get_pi_progress(pi_id: int) -> dict | None:
         "required": required,
         "produced": produced,
         "remaining": remaining,
-        "unit": pi["quantity_unit"],
+        "unit": pi_unit,
         "capacity": cap,
         "next_planned_load": min(cap["capacity"], remaining) if cap and remaining > 0 else remaining,
+        "unreconciled_batches": unreconciled_batches,
     }
 
 def recompute_pi_completion(pi_id: int) -> bool:
@@ -6108,17 +7105,39 @@ def recompute_pi_completion(pi_id: int) -> bool:
         return False
     if progress["produced"] + 1e-9 < progress["required"]:
         return False
+    # FIX (P0-7): "produced quantity complete" is NOT "instruction complete". Every
+    # linked (non-scrapped) batch must have cleared all QC stages including PDI —
+    # i.e. be Dispatch Approved or already (partially) dispatched — and there must
+    # be at least one. A batch still awaiting QC, or sitting On Hold / Rejected /
+    # Rework / Dispatch Blocked, keeps the PI open until it is resolved (passed
+    # after re-inspection, or scrapped and re-made).
+    _resolved = ("Dispatch Approved", "Partially Dispatched", "Dispatched")
+    _live = [b for b in progress["batches"].to_dict("records") if b["status"] != "Scrapped"]
+    if not _live or any(b["status"] not in _resolved for b in _live):
+        return False
     cur.execute(
-        "UPDATE production_instructions SET status='Completed', updated_at=? WHERE id=?",
+        "UPDATE production_instructions SET status='Completed', updated_at=? "
+        "WHERE id=? AND status IN ('Released to Production','Acknowledged','In Production')",
         (_now_iso(), pi_id)
     )
+    if cur.rowcount == 0:
+        conn.rollback()
+        return False
     conn.commit()
     log_audit("UPDATE", "production_instructions", pi_id,
               f"Completed — Produced {progress['produced']:g} >= Required {progress['required']:g} "
               f"{progress['unit']} across {progress['batch_count']} batch(es)")
     if pi["sales_order_id"]:
+        # FIX (P0-8): this used to set the linked Sales Order's wo_status
+        # straight to 'Completed' the instant Production finished making the
+        # required quantity — even though nothing had shipped yet, and QC/
+        # Dispatch hadn't touched any of the batches. wo_status ("has the
+        # customer actually got it?") now only ever moves via create_dispatch()
+        # below. Production finishing is recorded on its own axis,
+        # production_status, which never sets wo_status to Completed.
         cur.execute(
-            "UPDATE sales_orders SET wo_status='Completed' WHERE id=?", (pi["sales_order_id"],)
+            "UPDATE sales_orders SET production_status='Production Complete' WHERE id=?",
+            (pi["sales_order_id"],)
         )
         conn.commit()
     # Gap G-02 fix: a PI can legitimately complete (Produced >= Required)
@@ -6146,11 +7165,15 @@ def short_close_production_instruction(pi_id: int, reason: str, user: str) -> tu
     shortage or a discontinued run is exactly the case where a real chunk
     of reserved-but-unused material would otherwise stay locked out of
     every other instruction's FIFO pool forever."""
+    if not _is_admin:
+        return False, "Only Admin can short-close a Production Instruction."
     if not reason.strip():
         return False, "A reason is required to short-close a Production Instruction."
     pi = get_production_instruction(pi_id)
     if pi is None:
         return False, "Production Instruction not found."
+    if not _factory_allowed(pi["factory"]):
+        return False, _CROSS_FACTORY_MSG
     if pi["status"] in ("Draft", "Cancelled", "Completed", "Short Closed"):
         return False, f"Cannot short-close an instruction that is already {pi['status']}."
     cur.execute(
@@ -6193,6 +7216,18 @@ def set_production_capacity(product: str, capacity: float, capacity_unit: str, u
 # 'Instruction Created' via create_production_instruction above); the rest
 # of the chain (In Production / Completed) is propagated automatically by
 # the functions above as the linked batch progresses.
+def get_manufacturing_factory(so_id: int) -> str | None:
+    """P0-10: the manufacturing factory of record for a Sales Order is the
+    factory on its (latest non-cancelled) Production Instruction — R&D /
+    an authorised planner decides it there. sales_orders.factory is only a
+    legacy "responsible plant" tag and is NOT authoritative. Returns None if
+    no Production Instruction exists for the order yet."""
+    row = cur.execute(
+        "SELECT factory FROM production_instructions WHERE sales_order_id=? "
+        "AND status!='Cancelled' ORDER BY id DESC LIMIT 1", (so_id,)
+    ).fetchone()
+    return row[0] if row else None
+
 def send_sales_order_to_production(so_id: int, acting_factory: str | None = None) -> bool:
     """FIX: previously any Sales-department account could forward ANY
     factory's sales order into production — the UI listed every factory's
@@ -6202,6 +7237,12 @@ def send_sales_order_to_production(so_id: int, acting_factory: str | None = None
     order is only forwarded if it actually belongs to that factory. Admins
     (acting_factory=None) can still forward any order, matching their
     existing full access elsewhere. Returns False (no-op) if blocked."""
+    if not _dept_allows("Sales"):
+        return False
+    # Backend-enforced (P0-1): a non-admin is ALWAYS pinned to their own
+    # factory here, whatever `acting_factory` the caller passed (or omitted).
+    if not _is_admin:
+        acting_factory = _user_factory
     if acting_factory is not None:
         _match = cur.execute(
             "SELECT 1 FROM sales_orders WHERE id=? AND factory=?", (so_id, acting_factory)
@@ -6217,6 +7258,102 @@ def send_sales_order_to_production(so_id: int, acting_factory: str | None = None
         log_audit("UPDATE", "sales_orders", so_id, "Sent to Production")
     return bool(n)
 
+# ── Sales Order lifecycle locking (P0-7) ────────────────────────────────────
+#   New                          → fully editable
+#   Sent to Production           → commercial fields LOCKED (customer, product,
+#                                  qty, unit, price, GST, HSN, factory);
+#                                  only date / sales rep / customer GSTIN editable
+#   PI created/released, In Production, Partially Dispatched, Completed,
+#   or ANY dispatch/PI linked    → completely LOCKED
+# Once an order has been handed to Production, its commercial identity is the
+# basis of a PI, batches and dispatches; overwriting it in place would let
+# dispatched_qty exceed the ordered qty, change the unit under a shipped
+# order, or leave a PI/batch pointing at a different product. Corrections
+# after hand-off must go through an amendment / cancel-and-replace flow
+# (not built yet) — never an in-place overwrite.
+_SO_COMMERCIAL_LOCKED_FIELDS = ("customer", "product", "qty", "ordered_unit",
+                                "unit_price", "gst_rate", "hsn_code")
+
+def get_so_lock_level(so_id: int) -> tuple[str, str]:
+    """Returns (level, reason): level is 'open' | 'commercial' | 'full'."""
+    row = cur.execute(
+        "SELECT wo_status, production_status, instruction_id, COALESCE(dispatched_qty,0) "
+        "FROM sales_orders WHERE id=?", (so_id,)
+    ).fetchone()
+    if row is None:
+        return "full", "Sales Order not found."
+    wo, ps, inst, disp = row
+    wo = wo or "New"
+    if inst or cur.execute(
+            "SELECT 1 FROM production_instructions WHERE sales_order_id=? LIMIT 1", (so_id,)).fetchone():
+        return "full", "A Production Instruction exists for this order."
+    if (disp or 0) > 0 or cur.execute(
+            "SELECT 1 FROM sales WHERE sales_order_id=? LIMIT 1", (so_id,)).fetchone():
+        return "full", "This order has dispatches against it."
+    if wo not in ("New", "Sent to Production"):
+        return "full", f"Order is '{wo}'."
+    if ps not in (None, "", "Pending"):
+        return "full", f"Production status is '{ps}'."
+    if wo == "Sent to Production":
+        return "commercial", "Order has been sent to Production."
+    return "open", ""
+
+def update_sales_order(so_id: int, *, date_val, customer: str, sales_rep: str, product: str,
+                        unit_price: float, qty: float, gstin: str, hsn_code: str,
+                        gst_rate: float, ordered_unit: str) -> tuple[bool, str]:
+    """The ONLY way to edit a Sales Order in place. Enforces Sales department
+    + factory ownership + the lifecycle lock above, all inside one
+    transaction (lock check and UPDATE cannot be split by a concurrent
+    hand-off). sales_orders.factory is never changed here (P0-10: it is a
+    legacy tag; the PI owns the manufacturing factory)."""
+    if not _dept_allows("Sales"):
+        return False, "Only Sales (or Admin) can edit a Sales Order."
+    _fe = _factory_error_for("sales_orders", so_id)
+    if _fe:
+        return False, _fe
+    if not customer.strip() or not product:
+        return False, "Customer and product are required."
+    if not sales_rep.strip():
+        return False, "Sales representative is required."
+    with _write_lock():
+        _lvl, _why = get_so_lock_level(so_id)
+        cur.execute("SELECT * FROM sales_orders WHERE id=?", (so_id,))
+        _r = cur.fetchone()
+        if _r is None:
+            return False, "Sales Order not found."
+        _cur_row = dict(zip([d[0] for d in cur.description], _r, strict=True))
+        if _lvl == "full":
+            return False, (f"🔒 Sales Order #{so_id} is fully locked — {_why} It can no longer be "
+                           "edited in place; request an amendment / cancel-and-replace instead.")
+        _new = {"customer": customer.strip(), "product": product, "qty": qty,
+                "ordered_unit": ordered_unit, "unit_price": unit_price,
+                "gst_rate": gst_rate, "hsn_code": hsn_code.strip()}
+        if _lvl == "commercial":
+            _changed = []
+            for _f in _SO_COMMERCIAL_LOCKED_FIELDS:
+                _old_v, _new_v = _cur_row.get(_f), _new[_f]
+                if _f in ("qty", "unit_price", "gst_rate"):
+                    _diff = abs(float(_old_v or 0) - float(_new_v or 0)) > 1e-9
+                else:
+                    _diff = (str(_old_v or "").strip() != str(_new_v or "").strip())
+                if _diff:
+                    _changed.append(_f)
+            if _changed:
+                return False, (f"🔒 Commercial fields are locked once an order is sent to Production "
+                               f"({_why}). Not editable: {', '.join(_changed)}. Only date, sales rep "
+                               "and customer GSTIN can still be changed.")
+        cur.execute(
+            "UPDATE sales_orders SET date=?,customer=?,sales_rep=?,product=?,unit_price=?,qty=?,"
+            "total=?,gstin=?,hsn_code=?,gst_rate=?,ordered_unit=? WHERE id=?",
+            (str(date_val), customer.strip(), sales_rep.strip(), product, unit_price, qty,
+             round(qty * unit_price, 2), gstin.strip(), hsn_code.strip(), gst_rate,
+             ordered_unit, so_id)
+        )
+    log_audit("UPDATE", "sales_orders", so_id,
+              f"{_cur_row.get('factory')} | {product} | {customer.strip()} | {sales_rep.strip()} | "
+              f"{qty:g} {ordered_unit} @ {unit_price:g} | lock level was '{_lvl}'")
+    return True, "Sales order updated."
+
 def get_sales_orders_pending_production(restrict_factory: str | None = None) -> pd.DataFrame:
     """Sales Orders that have been forwarded to Production but don't yet
     have a Production Instruction issued against them. FIX: previously
@@ -6224,6 +7361,7 @@ def get_sales_orders_pending_production(restrict_factory: str | None = None) -> 
     Sales "To Production" and Formulation "Production Instructions" call
     sites, both updated to pass the viewer's own factory when they aren't
     admin, matching the isolation enforced everywhere else in the app."""
+    restrict_factory = _user_factory if not _is_admin else restrict_factory
     if restrict_factory:
         return pd.read_sql_query(
             "SELECT * FROM sales_orders WHERE wo_status='Sent to Production' AND factory=? "
@@ -6253,59 +7391,121 @@ def release_stores_materials(pi_id: int) -> tuple[bool, str]:
     partial reservation still returns ok=True with a shortfall message —
     Stores can see and act on what's short rather than the release silently
     doing nothing."""
+    # Backend gate (P0-2): only Stores may reserve/release raw material, and
+    # only for a PI manufactured in the caller's own factory (P0-1).
+    if not _dept_allows("Stores"):
+        return False, "Only Stores (or Admin) can release materials for production."
     pi = get_production_instruction(pi_id)
     if pi is None:
         return False, f"Production Instruction id {pi_id} not found."
+    if not _factory_allowed(pi["factory"]):
+        return False, _CROSS_FACTORY_MSG
 
-    req = scale_bom_lines(pi["bom_id"], pi["quantity"])
-    shortfalls: list[str] = []
+    if pi["status"] in ("Cancelled", "Completed", "Short Closed"):
+        return False, (f"This instruction is '{pi['status']}' — materials cannot be "
+                       "reserved or released for it.")
 
-    if not req.empty:
-        for _, line in req.iterrows():
-            material = line["material"]
-            required_qty = float(line["required_qty"] or 0)
-            _already = cur.execute(
-                "SELECT COALESCE(SUM(reserved_qty),0) FROM rm_reservations "
-                "WHERE production_instruction_id=? AND material=? AND status NOT IN ('Cancelled','Released')",
-                (pi_id, material)
-            ).fetchone()[0]
-            still_needed = required_qty - (_already or 0)
-            if still_needed <= 1e-9:
-                continue
-            _batches = cur.execute(
-                "SELECT id, quantity FROM rm_batches WHERE material=? AND factory=? "
-                "AND status='Approved' ORDER BY received_date ASC, id ASC",
-                (material, pi["factory"])
-            ).fetchall()
-            for rb_id, rb_qty in _batches:
-                if still_needed <= 1e-9:
-                    break
-                _held = cur.execute(
-                    f"SELECT COALESCE(SUM({_RM_RES_HELD_EXPR}),0) FROM rm_reservations "
-                    "WHERE rm_batch_id=? AND status!='Cancelled'", (rb_id,)
-                ).fetchone()[0]
-                _avail = (rb_qty or 0) - (_held or 0)
-                if _avail <= 1e-9:
+    # FIX (P0-4): "read reservations -> compute available -> INSERT reservation"
+    # and the final stores_released update now run inside ONE _write_lock()
+    # transaction (BEGIN IMMEDIATE + _db_lock held throughout). Two Stores users
+    # releasing different PIs at the same instant can no longer both read the
+    # same availability and both reserve it: the second waits, then sees the
+    # first one's reservation. There are deliberately no conn.commit() calls
+    # inside the block — the context manager commits once, at the end, so
+    # reservations and the Full/Partial status land together or not at all.
+    with _write_lock():
+        # Re-read the PI inside the lock so a concurrent cancel/close is seen.
+        _st_now = cur.execute("SELECT status FROM production_instructions WHERE id=?",
+                              (pi_id,)).fetchone()
+        if _st_now is None or _st_now[0] in ("Cancelled", "Completed", "Short Closed"):
+            return False, (f"This instruction is '{_st_now[0] if _st_now else 'not found'}' — "
+                           "materials cannot be reserved or released for it.")
+        req = scale_bom_lines(pi["bom_id"], pi["quantity"])
+        shortfalls: list[str] = []
+        if not req.empty:
+            for _, line in req.iterrows():
+                material = line["material"]
+                required_qty = float(line["required_qty"] or 0)
+                # FIX (P0-9): every quantity in this loop is compared in the material's
+                # BASE unit. The BOM line's unit, each RM batch's own unit and each
+                # existing reservation's unit are all converted through the conversion
+                # engine; a missing factor blocks that material (reported as a
+                # shortfall) rather than mixing units. Reservations are STORED in the
+                # RM batch's own unit, so the per-batch figures the Production screen
+                # and consumption check use stay in one consistent unit.
+                _lf = get_material_unit_factor(material, line["unit"])
+                if _lf is None:
+                    shortfalls.append(f"{material}: no conversion factor for BOM unit "
+                                      f"'{line['unit']}' — set it in Material Master")
                     continue
-                _take = min(_avail, still_needed)
-                cur.execute(
-                    "INSERT INTO rm_reservations (production_instruction_id,rm_batch_id,material,"
-                    "factory,reserved_qty,unit,consumed_qty,status,created_by,created_at) "
-                    "VALUES (?,?,?,?,?,?,0,'Reserved',?,?)",
-                    (pi_id, rb_id, material, pi["factory"], round(_take, 4), line["unit"],
-                     st.session_state.get("username", "system"), _now_iso())
-                )
-                still_needed -= _take
-            if still_needed > 1e-9:
-                shortfalls.append(f"{material}: short by {still_needed:.3f} {line['unit']}")
-        conn.commit()
+                _req_base = required_qty * _lf
+                _already_base, _bad = 0.0, False
+                for _rq, _ru in cur.execute(
+                        "SELECT reserved_qty, unit FROM rm_reservations "
+                        "WHERE production_instruction_id=? AND material=? "
+                        "AND status NOT IN ('Cancelled','Released')", (pi_id, material)).fetchall():
+                    _rf = get_material_unit_factor(material, _ru or line["unit"])
+                    if _rf is None:
+                        _bad = True
+                        break
+                    _already_base += (_rq or 0) * _rf
+                if _bad:
+                    shortfalls.append(f"{material}: an existing reservation is in a unit with no "
+                                      "conversion factor — set it in Material Master")
+                    continue
+                still_needed = _req_base - _already_base
+                if still_needed <= 1e-9:
+                    continue
+                _batches = cur.execute(
+                    "SELECT id, quantity, unit FROM rm_batches WHERE material=? AND factory=? "
+                    "AND status='Approved' ORDER BY received_date ASC, id ASC",
+                    (material, pi["factory"])
+                ).fetchall()
+                for rb_id, rb_qty, rb_unit in _batches:
+                    if still_needed <= 1e-9:
+                        break
+                    _bf = get_material_unit_factor(material, rb_unit)
+                    if _bf is None or _bf <= 0:
+                        continue      # can't safely count this lot; never assume 1.0
+                    _held_base, _held_bad = 0.0, False
+                    for _hq, _hc, _hs, _hu in cur.execute(
+                            "SELECT reserved_qty, consumed_qty, status, unit FROM rm_reservations "
+                            "WHERE rm_batch_id=? AND status!='Cancelled'", (rb_id,)).fetchall():
+                        _hf = get_material_unit_factor(material, _hu or rb_unit)
+                        if _hf is None:
+                            _held_bad = True
+                            break
+                        _held_base += ((_hc if _hs == "Released" else _hq) or 0) * _hf
+                    if _held_bad:
+                        continue
+                    _avail_base = (rb_qty or 0) * _bf - _held_base
+                    if _avail_base <= 1e-9:
+                        continue
+                    _take_base = min(_avail_base, still_needed)
+                    cur.execute(
+                        "INSERT INTO rm_reservations (production_instruction_id,rm_batch_id,material,"
+                        "factory,reserved_qty,unit,consumed_qty,status,created_by,created_at) "
+                        "VALUES (?,?,?,?,?,?,0,'Reserved',?,?)",
+                        (pi_id, rb_id, material, pi["factory"], round(_take_base / _bf, 4), rb_unit,
+                         st.session_state.get("username", "system"), _now_iso())
+                    )
+                    still_needed -= _take_base
+                if still_needed > 1e-9:
+                    shortfalls.append(f"{material}: short by {still_needed / _lf:.3f} {line['unit']}")
 
-    cur.execute(
-        "UPDATE production_instructions SET stores_released=1, stores_released_by=?,"
-        " stores_released_at=?, updated_at=? WHERE id=?",
-        (st.session_state.get("username", "system"), _now_iso(), _now_iso(), pi_id)
-    )
-    conn.commit()
+        # FIX (P0-4, earlier): a shortfall used to still set stores_released=1 —
+        # Production could then start on materials that were only PARTIALLY
+        # reserved. stores_released is only 1 when EVERY material line was fully
+        # reserved; a shortfall records 'Partial' and keeps Production blocked
+        # until Stores tops up (this function is idempotent per material).
+        _fully_reserved = not shortfalls
+        cur.execute(
+            "UPDATE production_instructions SET stores_released=?, stores_release_status=?,"
+            " stores_released_by=?, stores_released_at=?, updated_at=? WHERE id=?",
+            (1 if _fully_reserved else 0, "Full" if _fully_reserved else "Partial",
+             st.session_state.get("username", "system"), _now_iso(), _now_iso(), pi_id)
+        )
+    # committed — audit / messages only after the transaction
 
     if req.empty:
         log_audit("UPDATE", "production_instructions", pi_id,
@@ -6313,12 +7513,49 @@ def release_stores_materials(pi_id: int) -> tuple[bool, str]:
         return True, "Released — this formula has no material lines on file, nothing to reserve."
 
     log_audit("UPDATE", "production_instructions", pi_id,
-              f"Materials released by Stores — FIFO reserved against {len(req)} material line(s)"
-              + (f"; SHORTFALLS: {'; '.join(shortfalls)}" if shortfalls else ""))
+              f"Stores release attempted — FIFO reserved against {len(req)} material line(s)"
+              + (f"; SHORTFALLS (release NOT complete): {'; '.join(shortfalls)}" if shortfalls else "; fully released"))
     if shortfalls:
-        return True, ("⚠️ Released with shortfalls — QC-Approved stock ran out before the full "
-                       "requirement could be reserved: " + "; ".join(shortfalls))
+        return True, ("⚠️ NOT released — QC-Approved stock ran out before the full requirement "
+                       "could be reserved, so Production cannot start yet: " + "; ".join(shortfalls) +
+                       ". Receive/approve more stock and click Release again once the shortfall is covered.")
     return True, "✅ Materials released — full requirement reserved via FIFO against QC-Approved batches."
+
+class _ReservationConsumptionError(Exception):
+    """Raised inside a write-lock transaction to force a full rollback."""
+
+def _consume_rm_reservations_locked(pi_id: int, rm_batch_id: int, qty_used: float) -> None:
+    """FIX (P0-6): strict, NON-committing version of _consume_rm_reservations().
+    Must only be called inside an open _write_lock() transaction — it never
+    commits, so the reservation draw-down lands (or rolls back) together with
+    the production batch and its material rows. Unlike the legacy function it
+    asserts that the FULL quantity was drawn from this PI's reservation rows and
+    raises _ReservationConsumptionError otherwise, so a mismatch can never be
+    silently absorbed into a committed batch."""
+    if qty_used <= 0:
+        return
+    remaining = qty_used
+    _rows = cur.execute(
+        "SELECT id, reserved_qty, consumed_qty FROM rm_reservations "
+        "WHERE production_instruction_id=? AND rm_batch_id=? AND status='Reserved' ORDER BY id",
+        (pi_id, rm_batch_id)
+    ).fetchall()
+    for res_id, reserved_qty, consumed_qty in _rows:
+        if remaining <= 1e-9:
+            break
+        _room = (reserved_qty or 0) - (consumed_qty or 0)
+        if _room <= 1e-9:
+            continue
+        _draw = min(_room, remaining)
+        _new_consumed = round((consumed_qty or 0) + _draw, 4)
+        _new_status = "Consumed" if _new_consumed >= (reserved_qty or 0) - 1e-9 else "Reserved"
+        cur.execute("UPDATE rm_reservations SET consumed_qty=?, status=? WHERE id=?",
+                    (_new_consumed, _new_status, res_id))
+        remaining -= _draw
+    if remaining > 1e-6:
+        raise _ReservationConsumptionError(
+            f"RM batch id {rm_batch_id}: {remaining:g} of the {qty_used:g} used is not covered by "
+            "this instruction's reservation — nothing was saved.")
 
 def _consume_rm_reservations(pi_id: int, rm_batch_id: int, qty_used: float) -> None:
     """Draws down qty_used from this PI's active reservation(s) against a
@@ -6386,6 +7623,9 @@ def release_rm_reservations(pi_id: int, user: str, reason: str) -> tuple[bool, s
     is a safe no-op that returns ok=True with a "nothing to release" note,
     exactly like release_stores_materials()'s own idempotency guarantee.
     """
+    _fe = _factory_error_for("production_instructions", pi_id)
+    if _fe:
+        return False, _fe
     _rows = cur.execute(
         "SELECT id, material, reserved_qty, consumed_qty FROM rm_reservations "
         "WHERE production_instruction_id=? AND status='Reserved'",
@@ -6459,6 +7699,14 @@ def raise_ncr(source_stage: str, reference_id: int, batch_no: str, description: 
 # ── Stage 1: Incoming Material (Stores) ─────────────────────────────────────
 def create_rm_batch(supplier: str, po_reference: str, material: str, batch_no: str,
                      quantity: float, unit: str, factory: str, received_date) -> int:
+    assert_factory_access(factory)   # P0-1 — raises PermissionError on cross-factory
+    # FIX (P0-9): an RM receipt in a unit that can't be converted to the material's
+    # base unit would put an unqualified number into stock/reservations. Block it.
+    if get_material_unit_factor(material, unit) is None:
+        raise ValueError(
+            f"No conversion factor on file from '{unit}' to {material}'s base unit "
+            f"({get_material_base_unit(material)}). Set it in Stock → 📇 Material Master → "
+            "⚖️ Unit Conversion Factors, then log the receipt again.")
     cur.execute(
         "INSERT INTO rm_batches VALUES (NULL,?,?,?,?,?,?,?,?,?,?,?)",
         (supplier, po_reference, material, batch_no, quantity, unit, factory,
@@ -6470,17 +7718,45 @@ def create_rm_batch(supplier: str, po_reference: str, material: str, batch_no: s
     return rm_id
 
 # ── Stage 2: Incoming QC ─────────────────────────────────────────────────────
+_RM_QC_EXPECTED_STATUS = "Awaiting QC"
+
 def record_incoming_inspection(rm_batch_id: int, appearance: str, colour: str, moisture: str,
-                                particle_size: str, remarks: str, decision: str, inspector: str) -> int:
+                                particle_size: str, remarks: str, decision: str,
+                                inspector: str) -> tuple[bool, int | str]:
+    """FIX (P0-14/15/16): server-side QC state guard. Previously this simply
+    inserted an inspection and overwrote status unconditionally — the UI
+    only *displayed* batches at 'Awaiting QC', it never actually enforced
+    it, so a duplicate/out-of-order/direct call could re-inspect and flip an
+    already-Approved or already-Rejected RM batch. The UPDATE below only
+    succeeds (rowcount=1) if the batch is still genuinely 'Awaiting QC';
+    every side effect (NCR, Supplier Return Note, audit log) only fires
+    after that's confirmed, so a rejected duplicate call has zero effect on
+    the database. Enforces the QC department itself too, not just the
+    button, for the same reason."""
     assert decision in ("Pass", "Fail")
+    if not _dept_allows("QC"):
+        return False, "Only QC can record an incoming inspection decision."
+    _fe = _factory_error_for("rm_batches", rm_batch_id)
+    if _fe:
+        return False, _fe
+    new_status = "Approved" if decision == "Pass" else "Rejected"
+    cur.execute(
+        "UPDATE rm_batches SET status=? WHERE id=? AND status=?",
+        (new_status, rm_batch_id, _RM_QC_EXPECTED_STATUS)
+    )
+    if cur.rowcount == 0:
+        _cur_status = cur.execute("SELECT status FROM rm_batches WHERE id=?", (rm_batch_id,)).fetchone()
+        return False, (
+            f"Cannot record an incoming inspection — this RM batch is "
+            f"'{_cur_status[0] if _cur_status else 'not found'}', not '{_RM_QC_EXPECTED_STATUS}'. "
+            f"It may already have been inspected."
+        )
     cur.execute(
         "INSERT INTO incoming_inspection VALUES (NULL,?,?,?,?,?,?,?,?,?)",
         (rm_batch_id, appearance, colour, moisture, particle_size, remarks,
          decision, inspector, _now_iso())
     )
     insp_id = cur.lastrowid
-    new_status = "Approved" if decision == "Pass" else "Rejected"
-    cur.execute("UPDATE rm_batches SET status=? WHERE id=?", (new_status, rm_batch_id))
     conn.commit()
     _rm = cur.execute("SELECT material, batch_no FROM rm_batches WHERE id=?", (rm_batch_id,)).fetchone()
     log_audit("UPDATE", "rm_batches", rm_batch_id, f"Incoming QC: {decision}")
@@ -6490,15 +7766,139 @@ def record_incoming_inspection(rm_batch_id: int, appearance: str, colour: str, m
         conn.commit()
         raise_ncr("Incoming", insp_id, _rm[1] if _rm else "",
                    f"Incoming QC failed for {_rm[0] if _rm else 'material'} (batch {_rm[1] if _rm else ''}): {remarks}")
-    return insp_id
+    return True, insp_id
 
 # ── Stage 3: Production Batch ────────────────────────────────────────────────
 def generate_batch_no(factory: str) -> str:
     _prefix = f"FCSC-{factory[:3].upper()}-{today_ist().strftime('%Y%m%d')}"
-    _count = cur.execute(
-        "SELECT COUNT(*) FROM production_batches WHERE batch_no LIKE ?", (f"{_prefix}%",)
-    ).fetchone()[0]
-    return f"{_prefix}-{_count + 1:03d}"
+    # FIX (P0-3 / document-numbering race): see _next_sequence() above —
+    # was "SELECT COUNT(*) ...; return count+1", the same check-then-act
+    # race as generate_instruction_no().
+    _seq = _next_sequence(
+        f"batch_no:{_prefix}",
+        "SELECT COUNT(*) FROM production_batches WHERE batch_no LIKE ?",
+        (f"{_prefix}%",)
+    )
+    return f"{_prefix}-{_seq:03d}"
+
+# ── P0-36: production-batch input / material-integrity guard ────────────────
+# create_production_batch() used to trust its caller for every number it wrote.
+# A negative qty_used was skipped by the reservation check and by the reservation
+# draw-down (both only look at qty > 0) yet was still INSERTed into
+# production_batch_materials — and get_rm_physical_stock() SUBTRACTS that table,
+# so a negative usage manufactured stock out of thin air. A duplicated RM id inserted
+# two material rows and drew the same reservation down twice. These helpers make the
+# invariants explicit; the same checks run once before the transaction (friendly,
+# early errors, no batch number burned) and AGAIN inside it (authoritative).
+def _is_real_number(v) -> bool:
+    return isinstance(v, numbers.Real) and not isinstance(v, bool) and math.isfinite(float(v))
+
+def _rm_label(rid) -> str:
+    return f"RM-{int(rid):05d}" if isinstance(rid, numbers.Integral) else str(rid)
+
+def _validate_production_batch_inputs(rm_batch_ids, qty_used_map, quantity, quantity_unit,
+                                       planned_qty, is_pi_batch: bool):
+    """Pure input validation (no DB). Returns (rm_ids, usage, quantity, planned_qty, error).
+    Invariants: RM ids unique; qty_used_map covers exactly the listed RM ids; every qty_used
+    is finite and >= 0; planned_qty is None or finite >= 0; actual output is finite and >= 0 —
+    and for a PI-driven batch, present, > 0 and carrying a unit."""
+    if not isinstance(rm_batch_ids, (list, tuple)):
+        return None, None, None, None, "Raw-material batch list is invalid."
+    ids: list[int] = []
+    for rid in rm_batch_ids:
+        if not isinstance(rid, numbers.Integral) or isinstance(rid, bool):
+            return None, None, None, None, f"Invalid raw-material batch id: {rid!r}."
+        ids.append(int(rid))
+    _dups = sorted({r for r in ids if ids.count(r) > 1})
+    if _dups:
+        return None, None, None, None, (
+            "The same raw-material batch is listed more than once ("
+            + ", ".join(_rm_label(r) for r in _dups) + ") — each RM batch may appear only once "
+            "per production batch, otherwise its reservation would be drawn down twice.")
+    if not isinstance(qty_used_map, dict):
+        return None, None, None, None, "Quantity-used map is invalid."
+    usage: dict[int, float] = {}
+    for k, v in qty_used_map.items():
+        if not isinstance(k, numbers.Integral) or isinstance(k, bool):
+            return None, None, None, None, f"Invalid raw-material batch id in quantities: {k!r}."
+        usage[int(k)] = v
+    _extra = sorted(set(usage) - set(ids))
+    if _extra:
+        return None, None, None, None, (
+            "Quantity supplied for raw-material batch(es) that are not in this batch's list: "
+            + ", ".join(_rm_label(r) for r in _extra) + ".")
+    for rid in ids:
+        if rid not in usage:
+            return None, None, None, None, (
+                f"No quantity used was given for {_rm_label(rid)} — enter 0 explicitly if it "
+                "was not used.")
+        if not _is_real_number(usage[rid]):
+            return None, None, None, None, f"Quantity used for {_rm_label(rid)} must be a finite number."
+        if float(usage[rid]) < 0:
+            return None, None, None, None, (
+                f"Quantity used for {_rm_label(rid)} cannot be negative ({float(usage[rid]):g}).")
+        usage[rid] = float(usage[rid])
+    if planned_qty is not None:
+        if not _is_real_number(planned_qty) or float(planned_qty) < 0:
+            return None, None, None, None, "Planned quantity must be a finite number that is not negative."
+        planned_qty = float(planned_qty)
+    if quantity is not None and (not _is_real_number(quantity) or float(quantity) < 0):
+        return None, None, None, None, "Actual output quantity must be a finite number that is not negative."
+    if is_pi_batch:
+        if quantity is None or float(quantity) <= 0:
+            return None, None, None, None, (
+                "Actual output quantity is required (and must be greater than zero) for a batch "
+                "created from a Production Instruction — completion, FG stock and dispatch are all "
+                "driven by it.")
+        if not isinstance(quantity_unit, str) or not quantity_unit.strip():
+            return None, None, None, None, "Actual output unit is required for a batch created from a Production Instruction."
+    if quantity is not None:
+        quantity = float(quantity)
+    return ids, usage, quantity, planned_qty, ""
+
+def _check_rm_lots_usable(rm_ids: list[int], factory: str) -> str:
+    """Every RM lot must exist, be QC-Approved and belong to `factory`. '' = ok."""
+    for rid in rm_ids:
+        _r = cur.execute("SELECT status, factory FROM rm_batches WHERE id=?", (rid,)).fetchone()
+        if not _r:
+            return f"{_rm_label(rid)} does not exist."
+        if _r[0] != "Approved":
+            return f"RM batch id {rid} is not QC-Approved — cannot be used in production."
+        if _r[1] != factory:
+            return (f"RM batch id {rid} belongs to {_r[1]}, not {factory} — raw material "
+                    f"cannot be drawn across factories.")
+    return ""
+
+def _check_pi_material_integrity(pi_id: int, bom_id, rm_ids: list[int], usage: dict) -> str:
+    """For a PI-driven batch: every RM lot must (a) be a material in THIS PI's formula,
+    (b) actually hold a reservation for THIS PI, and (c) have enough unconsumed reservation
+    for the quantity used. Zero-quantity rows are NOT exempt from (a)/(b). '' = ok."""
+    _bom_mats = {canonical_material(r[0]) for r in cur.execute(
+        "SELECT material FROM bom_lines WHERE bom_id=?", (bom_id,)).fetchall()}
+    for rid in rm_ids:
+        _m = cur.execute("SELECT material FROM rm_batches WHERE id=?", (rid,)).fetchone()
+        _mat = _m[0] if _m else None
+        if _bom_mats and canonical_material(_mat or "") not in _bom_mats:
+            return (f"{_rm_label(rid)} ({_mat}) is not part of this instruction's formula — it "
+                    f"cannot be consumed against it.")
+        _held = cur.execute(
+            "SELECT COUNT(*) FROM rm_reservations WHERE production_instruction_id=? AND rm_batch_id=? "
+            "AND status IN ('Reserved','Consumed')", (pi_id, rid)).fetchone()[0]
+        if not _held:
+            return (f"{_rm_label(rid)} ({_mat}) is not reserved for this instruction — only "
+                    f"material Stores has reserved against it can be used.")
+        _used = usage[rid]
+        if _used <= 0:
+            continue
+        _avail = cur.execute(
+            "SELECT COALESCE(SUM(reserved_qty - consumed_qty), 0) FROM rm_reservations "
+            "WHERE production_instruction_id=? AND rm_batch_id=? AND status='Reserved'",
+            (pi_id, rid)).fetchone()[0]
+        if _used > _avail + 1e-6:
+            return (f"Cannot use {_used:g} of {_mat} ({_rm_label(rid)}) — only {_avail:g} is still "
+                    f"reserved for this instruction against that specific batch. Ask Stores to "
+                    f"release more, or reduce the quantity used.")
+    return ""
 
 def create_production_batch(product: str, formula: str, factory: str, operator: str,
                              machine: str, shift: str, rm_batch_ids: list[int],
@@ -6517,11 +7917,27 @@ def create_production_batch(product: str, formula: str, factory: str, operator: 
     locked to that instruction's exact snapshotted formula version — NOT
     the product's currently-active BOM, which may have moved on since the
     instruction was issued (Section 4/11). Otherwise falls back to the old
-    behaviour of snapshotting whatever BOM is active right now."""
-    for rid in rm_batch_ids:
-        _status = cur.execute("SELECT status FROM rm_batches WHERE id=?", (rid,)).fetchone()
-        if not _status or _status[0] != "Approved":
-            return None, f"RM batch id {rid} is not QC-Approved — cannot be used in production."
+    behaviour of snapshotting whatever BOM is active right now.
+
+    FIX (P0-3): department enforcement lives HERE, not just on the calling
+    button, so a batch can only ever be created by Production (or Admin/All)
+    regardless of which screen the call comes from."""
+    if not _dept_allows("Production"):
+        return None, "Only Production can create a production batch."
+    # Factory axis (P0-1): the caller must belong to the batch's factory —
+    # this is NOT the same as the batch/PI factory match checked below.
+    if not _factory_allowed(factory):
+        return None, _CROSS_FACTORY_MSG
+    # P0-36: hard numeric / identity invariants BEFORE anything else touches the DB (and before a
+    # batch number is allocated, so a rejected call burns no sequence number).
+    rm_batch_ids, qty_used_map, quantity, planned_qty, _verr = _validate_production_batch_inputs(
+        rm_batch_ids, qty_used_map, quantity, quantity_unit, planned_qty,
+        is_pi_batch=production_instruction_id is not None)
+    if _verr:
+        return None, _verr
+    _lot_err = _check_rm_lots_usable(rm_batch_ids, factory)
+    if _lot_err:
+        return None, _lot_err
 
     # Server-side enforcement for PI-driven batches (this was previously only
     # a UI-level filter, not a real guarantee — an audit correctly flagged
@@ -6558,117 +7974,277 @@ def create_production_batch(product: str, formula: str, factory: str, operator: 
                 f"RM reservation to draw from. Ask Stores to release it first (Stock → 🚚 "
                 f"Material Release)."
             )
-        # Reservation-quantity enforcement: reject outright rather than
-        # silently capping — silently capping let recorded physical usage
-        # drift ahead of what was actually reserved, with nothing to catch
-        # the discrepancy.
-        for rid in rm_batch_ids:
-            _used = qty_used_map.get(rid, 0)
-            if _used <= 0:
-                continue
-            _avail = cur.execute(
-                "SELECT COALESCE(SUM(reserved_qty - consumed_qty), 0) FROM rm_reservations "
-                "WHERE production_instruction_id=? AND rm_batch_id=? AND status='Reserved'",
-                (production_instruction_id, rid)
-            ).fetchone()[0]
-            if _used > _avail + 1e-6:
-                _mat_row = cur.execute("SELECT material FROM rm_batches WHERE id=?", (rid,)).fetchone()
-                _mat_name = _mat_row[0] if _mat_row else f"RM batch {rid}"
-                return None, (
-                    f"Cannot use {_used:g} of {_mat_name} (RM-{rid:05d}) — only {_avail:g} is "
-                    f"reserved for {_pi['instruction_no']} against that specific batch. Ask "
-                    f"Stores to release more, or reduce the quantity used."
-                )
+        # Reservation-quantity enforcement: reject outright rather than silently capping — silently
+        # capping let recorded physical usage drift ahead of what was actually reserved. P0-36: also
+        # requires each RM lot to be in this PI's formula and reserved for it (even at qty 0).
+        _mat_err = _check_pi_material_integrity(production_instruction_id, _pi["bom_id"],
+                                                rm_batch_ids, qty_used_map)
+        if _mat_err:
+            return None, _mat_err
 
-    batch_no = generate_batch_no(factory)
+        # FIX (P0-1 / unit-consistency): get_pi_progress() sums this batch's
+        # `quantity` directly against the PI's `quantity` to compute
+        # Produced/Remaining — that arithmetic is only valid if every batch
+        # against a PI is recorded in the SAME unit as the PI itself. This
+        # used to be left entirely to whatever the operator picked in the
+        # "Output Unit" dropdown (Bags/Pieces/Drums/KG/MT), with nothing
+        # checking it matched the instruction — a batch logged in KG against
+        # a PI in MT silently corrupted Produced/Remaining for that whole
+        # instruction. Enforced here (not just in the UI) so no call site —
+        # present or future — can create a unit-inconsistent batch. Matching
+        # units are accepted as-is; a KG<->MT-style mismatch is auto-
+        # converted into the PI's unit before storage; anything else
+        # (e.g. a packed unit that doesn't match the PI's unit) is rejected
+        # outright rather than silently stored wrong.
+        if quantity is not None and quantity > 0:
+            _pi_unit = _pi["quantity_unit"]
+            if not units_equivalent(quantity_unit, _pi_unit):
+                _converted = convert_weight_qty(quantity, quantity_unit, _pi_unit)
+                if _converted is None:
+                    return None, (
+                        f"Output unit '{quantity_unit}' doesn't match this instruction's unit "
+                        f"({_pi_unit}) and can't be safely converted between them. Record this "
+                        f"batch's output in {_pi_unit} (or a compatible weight unit) so it can be "
+                        f"reconciled against {_pi['instruction_no']}'s required quantity."
+                    )
+                quantity = _converted
+            quantity_unit = _pi_unit
+
+    # Batch number allocated BEFORE the write lock (generate_batch_no() opens its
+    # own _write_lock(), which cannot nest inside the one below).
+    try:
+        batch_no = generate_batch_no(factory)
+    except RuntimeError as e:
+        return None, str(e)
     if production_instruction_id is not None:
         _pi = get_production_instruction(production_instruction_id)
         _bom_id = _pi["bom_id"] if _pi else None
     else:
         _active_bom = get_active_bom(product)
         _bom_id = _active_bom["id"] if _active_bom else None
-    cur.execute(
-        "INSERT INTO production_batches "
-        "(batch_no,product,formula,factory,operator,machine,shift,status,created_at,"
-        "quantity,quantity_unit,bom_id,production_instruction_id,planned_qty) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (batch_no, product, formula, factory, operator, machine, shift,
-         "Production Started", _now_iso(), quantity, quantity_unit, _bom_id,
-         production_instruction_id, planned_qty)
-    )
-    pb_id = cur.lastrowid
-    for rid in rm_batch_ids:
-        cur.execute("INSERT INTO production_batch_materials VALUES (NULL,?,?,?)",
-                     (pb_id, rid, qty_used_map.get(rid, 0)))
-    conn.commit()
+    try:
+        with _write_lock():
+            # P0-36: everything validated above is RE-validated here, inside the transaction. The
+            # pre-lock checks are only a courtesy; between them and BEGIN IMMEDIATE another session
+            # can reject an RM lot, release a reservation or cancel the PI. Nothing has been written
+            # yet, so returning from inside the block leaves no side effects.
+            _lot_err = _check_rm_lots_usable(rm_batch_ids, factory)
+            if _lot_err:
+                return None, _lot_err
+            if production_instruction_id is not None:
+                # FIX (P0-3): server-side overproduction guard. Re-read PI state and the
+                # produced-so-far total INSIDE the write lock, so two operators
+                # submitting batches at the same time cannot both pass against the same
+                # remaining quantity. Produced is computed exactly as get_pi_progress()
+                # does (sum of actual output of every linked batch, unit-reconciled).
+                # Required is the PI quantity; there is no overproduction tolerance
+                # today — if the business wants one, it must be an explicit, audited
+                # policy rather than an unbounded operator entry.
+                _pi_now = cur.execute(
+                    "SELECT status, quantity, quantity_unit, instruction_no, bom_id "
+                    "FROM production_instructions WHERE id=?", (production_instruction_id,)
+                ).fetchone()
+                if _pi_now is None or _pi_now[0] not in ("Released to Production", "Acknowledged",
+                                                         "In Production"):
+                    return None, (f"Instruction is now '{_pi_now[0] if _pi_now else 'not found'}' — "
+                                  "a batch can only be created against a Released, Acknowledged or "
+                                  "In Production instruction.")
+                _mat_err = _check_pi_material_integrity(production_instruction_id, _pi_now[4],
+                                                        rm_batch_ids, qty_used_map)
+                if _mat_err:
+                    return None, _mat_err
+                if quantity is not None and quantity > 0:
+                    _prog_now = get_pi_progress(production_instruction_id)
+                    _produced = float(_prog_now["produced"]) if _prog_now else 0.0
+                    _required = float(_pi_now[1] or 0)
+                    _remaining = _required - _produced
+                    if quantity > _remaining + 1e-6:
+                        return None, (
+                            f"Batch output {quantity:g} {_pi_now[2]} exceeds the remaining quantity on "
+                            f"{_pi_now[3]} — required {_required:g}, already produced "
+                            f"{_produced:g}, remaining {max(_remaining, 0):g} {_pi_now[2]}. Reduce the "
+                            f"output, or ask R&D to raise/re-issue the instruction.")
+            cur.execute(
+                "INSERT INTO production_batches "
+                "(batch_no,product,formula,factory,operator,machine,shift,status,created_at,"
+                "quantity,quantity_unit,bom_id,production_instruction_id,planned_qty) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (batch_no, product, formula, factory, operator, machine, shift,
+                 "Production Started", _now_iso(), quantity, quantity_unit, _bom_id,
+                 production_instruction_id, planned_qty)
+            )
+            pb_id = cur.lastrowid
+            for rid in rm_batch_ids:
+                cur.execute("INSERT INTO production_batch_materials VALUES (NULL,?,?,?)",
+                             (pb_id, rid, qty_used_map[rid]))   # P0-36: validated, never defaulted
+            _so_link = None
+            if production_instruction_id is not None:
+                # FIX (P0-6): reservation draw-down, the PI's In-Production stamp and
+                # the linked SO's production_status are part of the SAME transaction
+                # as the batch + material rows (no intermediate commits). If the
+                # reservation cannot cover what was used, everything rolls back.
+                try:
+                    for rid in rm_batch_ids:
+                        _consume_rm_reservations_locked(production_instruction_id, rid,
+                                                        qty_used_map[rid])
+                except _ReservationConsumptionError as _rce:
+                    # Raising inside the with-block makes _write_lock() roll back.
+                    # It is re-raised below as a clean (None, message) result.
+                    raise
+                cur.execute(
+                    "UPDATE production_instructions SET production_batch_id=?, updated_at=? WHERE id=?",
+                    (pb_id, _now_iso(), production_instruction_id)
+                )
+                cur.execute(
+                    "UPDATE production_instructions SET status='In Production' "
+                    "WHERE id=? AND status IN ('Released to Production','Acknowledged')",
+                    (production_instruction_id,)
+                )
+                _so_link = cur.execute(
+                    "SELECT sales_order_id FROM production_instructions WHERE id=?",
+                    (production_instruction_id,)
+                ).fetchone()
+                if _so_link and _so_link[0]:
+                    cur.execute(
+                        "UPDATE sales_orders SET production_status='In Production' "
+                        "WHERE id=? AND production_status NOT IN ('Production Complete')",
+                        (_so_link[0],)
+                    )
+    except _ReservationConsumptionError as _rce:
+        return None, str(_rce)
+    # committed — audit + completion check only after the transaction
     log_audit("INSERT", "production_batches", pb_id, f"{batch_no} | {product} @ {factory}")
     if production_instruction_id is not None:
-        # Phase B: draw down this PI's RM reservations by exactly what got
-        # used in this specific load — a PI can span several physical
-        # batches/loads (Phase A), so this must decrement the reservation
-        # ledger per-load, not all-at-once, leaving the remainder available
-        # for the next load created against the same instruction.
-        for rid in rm_batch_ids:
-            _consume_rm_reservations(production_instruction_id, rid, qty_used_map.get(rid, 0))
-        _mark_instruction_in_production(production_instruction_id, pb_id)
-        # Produced/Remaining must reflect this batch's ACTUAL output the
-        # moment it's on file — and if it happens to already satisfy the
-        # instruction's Required quantity (e.g. the whole run fit in one
-        # load), the PI should complete now rather than sit "In Production"
-        # forever waiting for a load that will never be created.
+        log_audit("UPDATE", "production_instructions", production_instruction_id,
+                  f"Batch id {pb_id} created against this instruction")
+        # P0-7: completion now also requires every linked batch to be QC-resolved,
+        # so this is normally a no-op here; it re-runs from record_dispatch_approval().
         recompute_pi_completion(production_instruction_id)
     return pb_id, batch_no
 
 # ── Stage 4: Process QC ──────────────────────────────────────────────────────
+# FIX (P0-14/15): the single source of truth for "what status must a batch
+# be in for THIS QC stage to be recorded, and what status can never be
+# re-entered from". Both `record_*_inspection` functions below and any
+# future caller must go through _advance_batch_qc_status(), which only
+# transitions a batch when it's still sitting at the exact expected prior
+# status — never on a duplicate/out-of-order/direct call. This is the
+# server-side half of the QC state machine; the UI's status-filtered query
+# (e.g. "WHERE status='Production Started'") is only ever the convenience
+# half, never the enforcement.
+_QC_STAGE_FROM_STATUS = {
+    "Process QC Passed": "Production Started",
+    "FG QC Passed":      "Process QC Passed",
+    "Packing QC Passed": "FG QC Passed",
+    "Dispatch Approved":  "Packing QC Passed",
+}
+
+def _advance_batch_qc_status(pb_id: int, pass_status: str) -> tuple[bool, str]:
+    """Attempts to move `pb_id` from the required prior status into
+    `pass_status`'s expected 'from' state (this is called before deciding
+    Pass/Fail — Pass writes `pass_status` itself, Fail writes
+    BATCH_STATUS_HOLD[pass_status], but either way the batch must currently
+    be sitting at the correct prior stage)."""
+    _expected_from = _QC_STAGE_FROM_STATUS[pass_status]
+    _row = cur.execute("SELECT status, batch_no FROM production_batches WHERE id=?", (pb_id,)).fetchone()
+    if _row is None:
+        return False, f"Production batch id {pb_id} not found."
+    # Factory axis (P0-1): every batch-level QC stage (process / FG / packing /
+    # PDI) funnels through this function BEFORE writing anything, so the
+    # ownership check lives here once.
+    _fe = _factory_error_for("production_batches", pb_id)
+    if _fe:
+        return False, _fe
+    _cur_status, _bno = _row
+    if _cur_status != _expected_from:
+        return False, (
+            f"Cannot record this inspection — batch {_bno} is '{_cur_status}', not "
+            f"'{_expected_from}'. It may already have been inspected at this stage, "
+            f"or hasn't reached it yet."
+        )
+    return True, ""
+
 def record_process_inspection(pb_id: int, viscosity: str, density: str, temperature: str,
-                               appearance: str, remarks: str, decision: str, inspector: str) -> int:
+                               appearance: str, remarks: str, decision: str,
+                               inspector: str) -> tuple[bool, int | str]:
     assert decision in ("Pass", "Fail")
+    if not _dept_allows("QC"):
+        return False, "Only QC can record a Process QC decision."
+    _ok, _msg = _advance_batch_qc_status(pb_id, "Process QC Passed")
+    if not _ok:
+        return False, _msg
+    new_status = "Process QC Passed" if decision == "Pass" else BATCH_STATUS_HOLD["Process QC Passed"]
+    cur.execute(
+        "UPDATE production_batches SET status=? WHERE id=? AND status='Production Started'",
+        (new_status, pb_id)
+    )
+    if cur.rowcount == 0:
+        return False, "Batch status changed before this could be saved — please refresh and retry."
     cur.execute(
         "INSERT INTO process_inspection VALUES (NULL,?,?,?,?,?,?,?,?,?)",
         (pb_id, viscosity, density, temperature, appearance, remarks, decision, inspector, _now_iso())
     )
     insp_id = cur.lastrowid
-    new_status = "Process QC Passed" if decision == "Pass" else BATCH_STATUS_HOLD["Process QC Passed"]
-    cur.execute("UPDATE production_batches SET status=? WHERE id=?", (new_status, pb_id))
     conn.commit()
     log_audit("UPDATE", "production_batches", pb_id, f"Process QC: {decision}")
     if decision == "Fail":
         _bno = cur.execute("SELECT batch_no FROM production_batches WHERE id=?", (pb_id,)).fetchone()
         raise_ncr("Process", insp_id, _bno[0] if _bno else "", f"Process QC failed: {remarks}")
-    return insp_id
+    return True, insp_id
 
 # ── Stage 5: Finished Goods QC ───────────────────────────────────────────────
 def record_fg_inspection(pb_id: int, adhesion: str, strength: str, consistency: str,
-                          colour: str, weight: str, decision: str, inspector: str) -> int:
+                          colour: str, weight: str, decision: str,
+                          inspector: str) -> tuple[bool, int | str]:
     assert decision in ("Pass", "Fail")
+    if not _dept_allows("QC"):
+        return False, "Only QC can record a Finished Goods QC decision."
+    _ok, _msg = _advance_batch_qc_status(pb_id, "FG QC Passed")
+    if not _ok:
+        return False, _msg
+    new_status = "FG QC Passed" if decision == "Pass" else BATCH_STATUS_HOLD["FG QC Passed"]
+    cur.execute(
+        "UPDATE production_batches SET status=? WHERE id=? AND status='Process QC Passed'",
+        (new_status, pb_id)
+    )
+    if cur.rowcount == 0:
+        return False, "Batch status changed before this could be saved — please refresh and retry."
     cur.execute(
         "INSERT INTO fg_inspection VALUES (NULL,?,?,?,?,?,?,?,?,?)",
         (pb_id, adhesion, strength, consistency, colour, weight, decision, inspector, _now_iso())
     )
     insp_id = cur.lastrowid
-    new_status = "FG QC Passed" if decision == "Pass" else BATCH_STATUS_HOLD["FG QC Passed"]
-    cur.execute("UPDATE production_batches SET status=? WHERE id=?", (new_status, pb_id))
     conn.commit()
     log_audit("UPDATE", "production_batches", pb_id, f"FG QC: {decision}")
     if decision == "Fail":
         _bno = cur.execute("SELECT batch_no FROM production_batches WHERE id=?", (pb_id,)).fetchone()
         raise_ncr("FG", insp_id, _bno[0] if _bno else "", "Finished Goods QC failed")
-    return insp_id
+    return True, insp_id
 
 # ── Stage 6: Packing QC ──────────────────────────────────────────────────────
 def record_packing_inspection(pb_id: int, correct_bag: bool, correct_label: bool,
                                correct_batch: bool, net_weight_ok: bool, seal_quality_ok: bool,
-                               inspector: str) -> tuple[int, str | None]:
+                               inspector: str) -> tuple[bool, int | str, str | None]:
+    if not _dept_allows("QC"):
+        return False, "Only QC can record a Packing QC decision.", None
+    _ok, _msg = _advance_batch_qc_status(pb_id, "Packing QC Passed")
+    if not _ok:
+        return False, _msg, None
     decision = "Pass" if all([correct_bag, correct_label, correct_batch,
                                net_weight_ok, seal_quality_ok]) else "Fail"
+    new_status = "Packing QC Passed" if decision == "Pass" else BATCH_STATUS_HOLD["Packing QC Passed"]
+    cur.execute(
+        "UPDATE production_batches SET status=? WHERE id=? AND status='FG QC Passed'",
+        (new_status, pb_id)
+    )
+    if cur.rowcount == 0:
+        return False, "Batch status changed before this could be saved — please refresh and retry.", None
     cur.execute(
         "INSERT INTO packing_inspection VALUES (NULL,?,?,?,?,?,?,?,?,?)",
         (pb_id, int(correct_bag), int(correct_label), int(correct_batch),
          int(net_weight_ok), int(seal_quality_ok), decision, inspector, _now_iso())
     )
     insp_id = cur.lastrowid
-    new_status = "Packing QC Passed" if decision == "Pass" else BATCH_STATUS_HOLD["Packing QC Passed"]
-    cur.execute("UPDATE production_batches SET status=? WHERE id=?", (new_status, pb_id))
     conn.commit()
     log_audit("UPDATE", "production_batches", pb_id, f"Packing QC: {decision}")
     _fg_msg = None
@@ -6680,32 +8256,129 @@ def record_packing_inspection(pb_id: int, correct_bag: bool, correct_label: bool
         # passes — the batch's downstream identity (Dispatch, reconciliation)
         # now traces back to this exact physical batch, not just a
         # factory+product+date bucket.
-        _ok, _fg_msg = record_fg_stock_for_batch(pb_id)
-    return insp_id, _fg_msg
+        _fg_ok, _fg_msg = record_fg_stock_for_batch(pb_id)
+    return True, insp_id, _fg_msg
 
 # ── Stage 7: Dispatch QC (PDI) ───────────────────────────────────────────────
-def record_dispatch_approval(pb_id: int, pdi_completed: bool, approved_by: str) -> int:
+def record_dispatch_approval(pb_id: int, pdi_completed: bool, approved_by: str) -> tuple[bool, int | str]:
+    if not _dept_allows("QC"):
+        return False, "Only QC can record the Pre-Dispatch Inspection."
+    _ok, _msg = _advance_batch_qc_status(pb_id, "Dispatch Approved")
+    if not _ok:
+        return False, _msg
     status = "Released" if pdi_completed else "Blocked"
+    new_status = "Dispatch Approved" if pdi_completed else BATCH_STATUS_HOLD["Dispatch Approved"]
+    cur.execute(
+        "UPDATE production_batches SET status=? WHERE id=? AND status='Packing QC Passed'",
+        (new_status, pb_id)
+    )
+    if cur.rowcount == 0:
+        return False, "Batch status changed before this could be saved — please refresh and retry."
     cur.execute(
         "INSERT INTO dispatch_approval VALUES (NULL,?,?,?,?,?)",
         (pb_id, int(pdi_completed), approved_by, _now_iso(), status)
     )
-    conn.commit()
-    new_status = "Dispatch Approved" if pdi_completed else BATCH_STATUS_HOLD["Dispatch Approved"]
-    cur.execute("UPDATE production_batches SET status=? WHERE id=?", (new_status, pb_id))
+    insp_id = cur.lastrowid
     conn.commit()
     log_audit("UPDATE", "production_batches", pb_id, f"Dispatch QC: {status}")
-    return cur.lastrowid
+    if pdi_completed:
+        # P0-7: a PI can only complete once its batches clear PDI, so this is the
+        # moment to re-evaluate it.
+        _pi_of_batch = cur.execute(
+            "SELECT production_instruction_id FROM production_batches WHERE id=?", (pb_id,)
+        ).fetchone()
+        if _pi_of_batch and _pi_of_batch[0]:
+            recompute_pi_completion(int(_pi_of_batch[0]))
+    return True, insp_id
+
+# ── QC exception recovery (P0-8) ─────────────────────────────────────────────
+# The QC engine is forward-only: each inspection requires the batch to sit at the
+# exact preceding pass-stage status. A failed batch lands in an exception status
+# (On Hold / Rejected / Rework / Dispatch Blocked) that no inspection accepts, so
+# without an explicit way back it is stranded. These are the ONLY legal ways out.
+# Each moves the batch back to the status the failed stage expects, so the normal
+# inspection function records the re-inspection; the transition itself is logged
+# (who / when / why / NCR closed) in batch_recovery_log.
+#   (exception status, action) -> (target status, description, admin_only)
+# Scrap is not offered for 'Dispatch Blocked': by then Packing QC has already
+# posted the batch into FG stock, so it must be re-inspected, not discarded here.
+_BATCH_RECOVERY_TRANSITIONS = {
+    ("On Hold",          "reinspect"): ("Production Started", "Process QC re-inspection", False),
+    ("Rework",           "reinspect"): ("FG QC Passed",       "Packing QC re-inspection", False),
+    ("Dispatch Blocked", "reinspect"): ("Packing QC Passed",  "PDI re-inspection", False),
+    ("Rejected",         "rework"):    ("Process QC Passed",   "FG QC re-inspection after authorised rework", True),
+    ("On Hold",          "scrap"):     ("Scrapped", "Scrapped — quantity released for a replacement batch", True),
+    ("Rejected",         "scrap"):     ("Scrapped", "Scrapped — quantity released for a replacement batch", True),
+    ("Rework",           "scrap"):     ("Scrapped", "Scrapped — quantity released for a replacement batch", True),
+}
+
+def get_batch_recovery_options(status: str) -> list[tuple[str, str, bool]]:
+    """[(action, description, admin_only)] legal for a batch in `status`."""
+    return [(a, v[1], v[2]) for (st_, a), v in _BATCH_RECOVERY_TRANSITIONS.items() if st_ == status]
+
+def authorise_batch_recovery(pb_id: int, action: str, reason: str) -> tuple[bool, str]:
+    """FIX (P0-8): explicit, audited recovery transition out of a QC exception
+    status. QC (or Admin) may send a batch back for re-inspection; rework of a
+    Rejected batch and scrapping are Admin-only. A reason is mandatory. Runs in
+    one transaction: conditional status update (only from the expected exception
+    status), closes the batch's open NCR(s) with the reason as corrective action,
+    and writes batch_recovery_log."""
+    if not _dept_allows("QC"):
+        return False, "Only QC (or Admin) can authorise a batch recovery."
+    if len((reason or "").strip()) < 5:
+        return False, "A reason / corrective action (at least 5 characters) is required."
+    _fe = _factory_error_for("production_batches", pb_id)
+    if _fe:
+        return False, _fe
+    user = st.session_state.get("username", "system")
+    _audit: list[tuple] = []
+    with _write_lock():
+        row = cur.execute("SELECT status, batch_no FROM production_batches WHERE id=?",
+                          (pb_id,)).fetchone()
+        if row is None:
+            return False, "Production batch not found."
+        cur_status, batch_no = row
+        trans = _BATCH_RECOVERY_TRANSITIONS.get((cur_status, action))
+        if trans is None:
+            return False, (f"Batch {batch_no} is '{cur_status}' — '{action}' is not a valid recovery "
+                           "from that status.")
+        target, desc, admin_only = trans
+        if admin_only and not _is_admin:
+            return False, f"Only Admin can authorise: {desc}."
+        cur.execute("UPDATE production_batches SET status=? WHERE id=? AND status=?",
+                    (target, pb_id, cur_status))
+        if cur.rowcount == 0:
+            return False, "Batch status changed before this could be saved — please refresh."
+        _ncrs = [r[0] for r in cur.execute(
+            "SELECT id FROM ncr_capa WHERE batch_no=? AND status='Open'", (batch_no,)).fetchall()]
+        for _nid in _ncrs:
+            cur.execute("UPDATE ncr_capa SET corrective_action=?, status='Closed', closed_at=? "
+                        "WHERE id=?", (reason.strip(), _now_iso(), _nid))
+            _audit.append(("UPDATE", "ncr_capa", _nid, f"NCR closed via batch recovery ({action})"))
+        cur.execute(
+            "INSERT INTO batch_recovery_log (production_batch_id,batch_no,action,from_status,"
+            "to_status,reason,ncr_ids,actor,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (pb_id, batch_no, action, cur_status, target, reason.strip(),
+             ",".join(str(n) for n in _ncrs), user, _now_iso())
+        )
+        _audit.append(("UPDATE", "production_batches", pb_id,
+                       f"Recovery '{action}': {cur_status} -> {target} | {desc} | reason: {reason.strip()}"))
+    for _a in _audit:
+        log_audit(*_a)
+    return True, f"Batch {batch_no}: {cur_status} → {target} ({desc})."
 
 def mark_batch_dispatched(pb_id: int) -> None:
-    """Not called from any UI as of the Phase-A/containment fix (2026-08) —
-    QC/PDI's "Mark Dispatched" button was removed because it let QC bypass
-    Dispatch/challan/FG-stock entirely (see the QC/PDI module's "Ready for
-    Dispatch" tab). Kept, and kept CORRECT, for Phase C to call once batch-
-    controlled Dispatch actually confirms a real dispatch transaction.
-    Uses recompute_pi_completion() (Produced >= Required across ALL of the
-    instruction's batches), not the old one-batch-completes-everything
-    logic — a batch reaching Dispatched no longer force-completes its PI."""
+    """SUPERSEDED (Phase 1, P0-11): this was written for a future Dispatch
+    flow to call once it actually confirmed a real transaction — but was
+    never wired in, which was itself flagged as a P0 gap (a batch could sit
+    at 'Dispatch Approved' forever, never reaching 'Dispatched', even after
+    it physically left the factory). create_dispatch() now does this
+    status transition itself, inline, as part of its one atomic
+    transaction (together with dispatched_qty and, where linked, the Sales
+    Order's own totals) — a standalone call here wouldn't touch either of
+    those, so it would silently reintroduce the exact desync this function
+    was meant to prevent. Left in place only for any legacy/external caller
+    that predates create_dispatch(); no code in this app calls it anymore."""
     cur.execute("UPDATE production_batches SET status='Dispatched' WHERE id=?", (pb_id,))
     conn.commit()
     log_audit("UPDATE", "production_batches", pb_id, "Marked Dispatched")
@@ -6778,12 +8451,13 @@ def get_batch_traceability(batch_no: str) -> dict | None:
 # unreachable from the new Batch Detail 360° page since that page can be
 # opened without ever visiting the Quality module in the same run) ─────────
 BATCH_STEPS = [
-    ("Production Started", "Production"),
-    ("Process QC Passed",  "Process QC"),
-    ("FG QC Passed",       "FG QC"),
-    ("Packing QC Passed",  "Packing QC"),
-    ("Dispatch Approved",  "Dispatch QC"),
-    ("Dispatched",         "Dispatched"),
+    ("Production Started",   "Production"),
+    ("Process QC Passed",    "Process QC"),
+    ("FG QC Passed",         "FG QC"),
+    ("Packing QC Passed",    "Packing QC"),
+    ("Dispatch Approved",    "Dispatch QC"),
+    ("Partially Dispatched", "Dispatching"),  # PHASE 1: some, not all, has shipped
+    ("Dispatched",           "Dispatched"),
 ]
 BATCH_HOLD_STAGE = {
     "On Hold":           "Process QC",
@@ -6793,6 +8467,10 @@ BATCH_HOLD_STAGE = {
 }
 
 def render_batch_progress(status: str) -> None:
+    if status == "Scrapped":
+        st.markdown(status_pill("🗑️ Scrapped — quantity released for a replacement batch", "error"),
+                    unsafe_allow_html=True)
+        return
     if status in BATCH_HOLD_STAGE:
         st.markdown(status_pill(f"🛑 Held at {BATCH_HOLD_STAGE[status]} — {status}", "error"),
                     unsafe_allow_html=True)
@@ -7252,6 +8930,9 @@ def generate_invoice_pdf(order_row: dict, customer_row: dict | None) -> bytes | 
     formatted to look like a GST invoice, but isn't a substitute for your
     accountant/GST software confirming it meets full statutory requirements
     (e.g. invoice numbering sequence, e-invoice IRN if applicable)."""
+    # P0-6: service-level factory enforcement — the dropdown filter is not the
+    # security boundary. Raises PermissionError for another factory's order.
+    assert_factory_access(order_row.get("factory"))
     if not HAS_REPORTLAB:
         return None
     # FIX: refuse to generate a tax invoice with an unconfigured GSTIN
@@ -7352,6 +9033,8 @@ def get_order_status(order_id: int, restrict_factory: str | None = None) -> dict
     must belong to that factory or this returns None, exactly as if the
     order didn't exist — same behaviour a genuinely unknown order id gets,
     so this doesn't even reveal "an order with this id exists elsewhere"."""
+    if not _is_admin:
+        restrict_factory = _user_factory or "__NO_FACTORY__"   # enforced here, not just at the call site
     if restrict_factory:
         order = cur.execute(
             "SELECT * FROM sales_orders WHERE id = ? AND factory = ?",
@@ -7366,13 +9049,17 @@ def get_order_status(order_id: int, restrict_factory: str | None = None) -> dict
     cols = [d[0] for d in cur.description]
     order_row = dict(zip(cols, order, strict=True))
 
+    # P0-10: the MANUFACTURING factory is the Production Instruction's, not the
+    # legacy sales_orders.factory tag — use the PI's factory when one exists,
+    # and prefer batches actually raised against that PI.
+    _mfg_fac = get_manufacturing_factory(order_row["id"]) or order_row["factory"]
     candidate = cur.execute("""
         SELECT pb.batch_no, pb.status, da.date AS dispatch_date
         FROM production_batches pb
         LEFT JOIN dispatch_approval da ON da.production_batch_id = pb.id
         WHERE pb.product = ? AND pb.factory = ?
         ORDER BY pb.id DESC LIMIT 1
-    """, (order_row["product"], order_row["factory"])).fetchone()
+    """, (order_row["product"], _mfg_fac)).fetchone()
 
     return {
         "order": order_row,
@@ -7408,6 +9095,22 @@ with st.sidebar:
         f"</div>",
         unsafe_allow_html=True,
     )
+
+    # DEV GUARD: fail fast with a clear message if a helper that the sidebar
+    # depends on has been moved below this point (module-level Streamlit code
+    # runs top-to-bottom, so a late definition surfaces as a deep NameError).
+    _REQUIRED_BOOT_HELPERS = [
+        "render_notification_bell",
+        "get_notifications",
+        "get_rm_physical_stock",
+        "convert_material_qty_to_base",
+        "get_material_unit_factor",
+        "convert_weight_qty",
+        "units_equivalent",
+    ]
+    for _name in _REQUIRED_BOOT_HELPERS:
+        if _name not in globals():
+            raise RuntimeError(f"ERP startup dependency missing: {_name}")
 
     # NEW: notification bell — rolls up open procurement, overdue stages,
     # open NCRs, and low stock into one place instead of only surfacing on
@@ -7453,7 +9156,8 @@ with st.sidebar:
     # fresh run that follows, this widget reads that value from session
     # state instead of `index` (Streamlit only honors `index` the first
     # time a keyed widget is created, before session_state has a value for it).
-    module = st.radio("MODULE", available_modules, index=_module_default_idx, key="module_radio")
+    module = st.radio("MODULE", available_modules, index=_module_default_idx, key="module_radio",
+                      format_func=lambda _m: (f"{_MODULE_ICONS.get(_m, '•')}  {_m}" if ZOHO_SKIN else _m))
 
     # NEW: record a "module view" once per switch (not on every rerun caused
     # by unrelated widget clicks within the same module) — feeds the Pilot
@@ -7777,6 +9481,478 @@ def record_fg_stock_movement(date_val, fac: str, product: str, *, production_in:
         )
     return closing
 
+# ── Dispatch: single atomic transaction (Phase 1 — P0-9/10/11/18/19) ───────
+def create_dispatch(*, date_val, factory: str, customer: str, product: str, qty: float,
+                     price: float, status: str, challan_no: str, gstin: str, hsn_code: str,
+                     gst_rate: float, production_batch_id: int,
+                     allow_negative_override: bool = False,
+                     override_reason: str = "") -> tuple[int | None, str]:
+    """The single, atomic Dispatch transaction. Replaces the old flow, which
+    inserted a `sales` row and separately posted an FG-stock movement, with
+    nothing else about the dispatch actually recorded anywhere:
+
+      - PDI hard gate (P0-9): a Production Batch is now MANDATORY — the old
+        '— None / not batch-tracked —' option is gone. The batch must be
+        'Dispatch Approved' (or already 'Partially Dispatched' with
+        remaining quantity) — enforced here, not just by which batches the
+        dropdown happens to list, so a stale selection or a direct call
+        can't dispatch a batch that never passed PDI.
+      - Batch-level consumption (P0-10): the batch's own `dispatched_qty` is
+        drawn down and checked against its actual output (`quantity`) — a
+        dispatch can never draw more from one batch than that batch
+        actually produced, regardless of what the factory-wide FG Stock
+        bucket shows.
+      - Batch → Dispatched (P0-11): once a batch's dispatched_qty reaches
+        its full output, its status advances to 'Dispatched' right here —
+        the old mark_batch_dispatched() was never actually wired into the
+        Dispatch save path; this replaces that gap directly rather than
+        bolting the old function on separately.
+      - SO linkage + balance (P0-18/19/Section 25-26): when the batch traces
+        back to a Sales Order (via its Production Instruction), the
+        dispatch is checked against — and updates — that SO's own
+        dispatched_qty/wo_status, so 'Completed' only ever means the full
+        ordered quantity has actually shipped, never just been produced.
+      - Atomicity: the sales row, the FG-stock ledger row, the batch update
+        and the SO update all happen inside ONE _write_lock() transaction —
+        either all of them land, or (on any exception) none do.
+    """
+    # ── Authorization (P0-1 / P0-2 / P0-9) — enforced here, not by the UI ──
+    if not _dept_allows("Dispatch"):
+        return None, "Only Dispatch (or Admin) can record a dispatch."
+    if not _factory_allowed(factory):
+        return None, _CROSS_FACTORY_MSG
+    if allow_negative_override:
+        # The override bypasses the FG-stock and Sales-Order-balance guards, so
+        # it is a privileged exception, not a Dispatch capability: Admin only
+        # (the sole "authorised exception role" today), with a mandatory
+        # reason, and always audited below.
+        if not _is_admin:
+            return None, ("Only Admin can authorize a dispatch that exceeds FG stock or the "
+                          "Sales Order balance.")
+        if len((override_reason or "").strip()) < 5:
+            return None, "A reason (at least 5 characters) is required to use the dispatch override."
+    if qty is None or qty <= 0:
+        return None, "Dispatch quantity must be greater than zero."
+    if not customer or not customer.strip():
+        return None, "Customer is required."
+    if not product:
+        return None, "Product is required."
+    if not production_batch_id:
+        return None, ("A Production Batch must be selected — dispatch without a QC-cleared, "
+                       "PDI-approved batch is no longer allowed.")
+
+    pb = cur.execute(
+        "SELECT batch_no, product, factory, status, quantity, quantity_unit, "
+        "COALESCE(dispatched_qty,0), production_instruction_id "
+        "FROM production_batches WHERE id=?", (production_batch_id,)
+    ).fetchone()
+    if pb is None:
+        return None, "Selected production batch not found."
+    (batch_no, pb_product, pb_factory, pb_status, pb_qty, pb_unit, pb_dispatched, pi_id) = pb
+    pb_qty = pb_qty or 0
+    pb_dispatched = pb_dispatched or 0
+
+    if pb_status not in ("Dispatch Approved", "Partially Dispatched"):
+        return None, (f"Batch {batch_no} is '{pb_status}' — only a batch that has passed PDI "
+                       f"('Dispatch Approved') can be dispatched.")
+    if pb_factory != factory:
+        return None, f"Batch {batch_no} belongs to {pb_factory}, not {factory}."
+    if pb_product != product:
+        return None, f"Batch {batch_no} is for {fg_label(pb_product)}, not {fg_label(product)}."
+    if pb_qty <= 0:
+        return None, (f"Batch {batch_no} has no recorded actual output quantity on file — cannot "
+                       f"dispatch against it.")
+    _pb_available = pb_qty - pb_dispatched
+    if qty > _pb_available + 1e-6:
+        return None, (f"Cannot dispatch {qty:g} — only {_pb_available:g} {pb_unit} remains "
+                       f"undispatched on batch {batch_no}.")
+
+    # SO linkage + balance check — best-effort: only enforced when the batch
+    # traces back to a Sales Order via its Production Instruction; batches
+    # without one (direct/admin-created, no PI) skip this, same as before.
+    so_id, so_qty, so_dispatched, so_unit = None, 0.0, 0.0, ""
+    if pi_id:
+        _pi_row = cur.execute(
+            "SELECT sales_order_id FROM production_instructions WHERE id=?", (pi_id,)
+        ).fetchone()
+        if _pi_row and _pi_row[0]:
+            so_row = cur.execute(
+                "SELECT id, qty, COALESCE(dispatched_qty,0), COALESCE(ordered_unit,'') "
+                "FROM sales_orders WHERE id=?",
+                (_pi_row[0],)
+            ).fetchone()
+            if so_row:
+                so_id, so_qty, so_dispatched, so_unit = \
+                    so_row[0], float(so_row[1] or 0), float(so_row[2] or 0), so_row[3]
+    # FIX (P0-1/P0-2): qty here is in the DISPATCH's unit (the linked
+    # batch's quantity_unit); so_qty/so_dispatched are in the Sales Order's
+    # OWN ordered_unit, which is not guaranteed to be the same unit (e.g. a
+    # batch dispatched in Bags against an order placed in MT). Comparing
+    # the raw numbers directly — as this used to do — silently compares two
+    # different units whenever they differ. Convert the dispatch qty into
+    # the SO's unit before comparing/accumulating against it.
+    _qty_in_so_unit = qty
+    _so_unit_note = ""
+    if so_id and so_unit and not units_equivalent(pb_unit, so_unit):
+        _qty_in_so_unit, _so_conv_exact, _so_conv_note = convert_fg_qty_between_units(
+            qty, pb_unit, so_unit, product)
+        if not _so_conv_exact:
+            _so_unit_note = (f" (⚠️ could not reliably convert {qty:g} {pb_unit} to {so_unit} "
+                              f"for the Sales Order balance check — {_so_conv_note} treated as "
+                              f"{_qty_in_so_unit:g} {so_unit} for this check; verify manually)")
+    _override_used = False
+    if so_id:
+        _so_remaining = so_qty - so_dispatched
+        if _qty_in_so_unit > _so_remaining + 1e-6:
+            _override_used = True
+        if _qty_in_so_unit > _so_remaining + 1e-6 and not allow_negative_override:
+            return None, (f"Dispatching {_qty_in_so_unit:g} {so_unit or pb_unit} would exceed Sales "
+                           f"Order #{so_id}'s remaining balance ({_so_remaining:g} of {so_qty:g} "
+                           f"{so_unit}).{_so_unit_note} Reduce the quantity, or confirm this is an "
+                           f"authorized over-dispatch.")
+
+    _available_fg = get_fg_closing_stock(factory, product)
+    if qty > _available_fg + 1e-6:
+        _override_used = True
+    if qty > _available_fg + 1e-6 and not allow_negative_override:
+        return None, (f"Dispatch exceeds available FG stock — available {_available_fg:g}, "
+                       f"dispatching {qty:g}. Confirm to proceed anyway.")
+
+    _new_pb_dispatched = round(pb_dispatched + qty, 4)
+    _new_pb_status = "Dispatched" if _new_pb_dispatched >= pb_qty - 1e-6 else "Partially Dispatched"
+    # FIX (P0-1/P0-2): accumulate the SO's own dispatched_qty in the SO's
+    # own unit (_qty_in_so_unit), not the raw batch-unit qty — see the
+    # conversion above.
+    _new_so_dispatched = round(so_dispatched + _qty_in_so_unit, 4) if so_id else None
+    _new_so_status = None
+    if so_id:
+        _new_so_status = "Completed" if _new_so_dispatched >= so_qty - 1e-6 else "Partially Dispatched"
+
+    user = st.session_state.get("username", "system")
+    with _write_lock():
+        cur.execute(
+            "INSERT INTO sales(date,factory,customer,product,qty,price,total,status,"
+            "challan_no,gstin,hsn_code,gst_rate,production_batch_id,sales_order_id)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (str(date_val), factory, customer.strip(), product, qty, price, round(qty * price, 2),
+             status, challan_no.strip(), gstin.strip(), hsn_code.strip(), gst_rate,
+             production_batch_id, so_id)
+        )
+        sale_id = cur.lastrowid
+
+        # FG stock ledger — inlined rather than calling record_fg_stock_movement(),
+        # which opens its own _write_lock() and cannot be nested inside this one.
+        _prev_fg = get_fg_closing_stock(factory, product)
+        _closing_fg = _prev_fg - qty
+        cur.execute(
+            "INSERT INTO fg_stock (date,factory,product,fg_code,production_in,dispatch_out,"
+            "adjustment,closing_stock,source_module,source_ref_id,created_at,movement_type,"
+            "production_batch_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (str(date_val), factory, product, get_fg_code(product), 0, qty, 0, _closing_fg,
+             "Dispatch", sale_id, _now_iso(), "Entry", production_batch_id)
+        )
+
+        cur.execute(
+            "UPDATE production_batches SET dispatched_qty=?, status=? WHERE id=?",
+            (_new_pb_dispatched, _new_pb_status, production_batch_id)
+        )
+        if so_id:
+            cur.execute(
+                "UPDATE sales_orders SET dispatched_qty=?, wo_status=? WHERE id=?",
+                (_new_so_dispatched, _new_so_status, so_id)
+            )
+
+    log_audit("INSERT", "sales", sale_id,
+              f"{factory} | {product} | {customer.strip()} | qty {qty:g} | batch {batch_no}"
+              + (f" | SO #{so_id}" if so_id else ""))
+    if allow_negative_override:
+        log_audit("OVERRIDE", "sales", sale_id,
+                  f"Dispatch override authorized by {user} — "
+                  f"{'GUARD BYPASSED (exceeded FG stock and/or SO balance)' if _override_used else 'flag set but not needed'}"
+                  f" | reason: {override_reason.strip()}")
+    log_audit("UPDATE", "production_batches", production_batch_id,
+              f"Dispatched {qty:g} — batch now {_new_pb_dispatched:g}/{pb_qty:g} dispatched, "
+              f"status {_new_pb_status}")
+    if so_id:
+        log_audit("UPDATE", "sales_orders", so_id,
+                  f"Dispatched {qty:g} against this order — total {_new_so_dispatched:g}/{so_qty:g}, "
+                  f"status {_new_so_status}")
+    return sale_id, (f"✅ Dispatch saved against batch {batch_no}"
+                      + (f" (Sales Order #{so_id} — {_new_so_dispatched:g}/{so_qty:g} dispatched)"
+                         if so_id else "") + f" — FG Stock now {_closing_fg:,.2f}")
+
+def delete_dispatch(sale_id: int, reason: str) -> tuple[bool, str]:
+    """P0-10: deletes a Dispatch and reverses EVERYTHING it did — FG-stock
+    ledger, the batch's dispatched_qty/status, and the Sales Order's
+    dispatched_qty/wo_status — inside ONE _write_lock() transaction with ONE
+    commit. Either all four legs land or (on any exception) none do, so a
+    failure part-way can never leave the dispatch row gone while stock /
+    batch / order still show it as shipped. (The old flow deleted + committed
+    first, then ran the reversals as a callback with several separate
+    commits.) Admin-only, matching the app's rule for deleting transactional
+    records; a reason is mandatory and audited. Audit lines are written only
+    after the transaction commits."""
+    if not _is_admin:
+        return False, "Deleting a dispatch is restricted to Administrators."
+    if not reason or not reason.strip():
+        return False, "A deletion reason is required."
+    _audit: list[tuple] = []
+    with _write_lock():
+        row = cur.execute(
+            "SELECT id, factory, product, qty, production_batch_id, sales_order_id "
+            "FROM sales WHERE id=?", (sale_id,)
+        ).fetchone()
+        if row is None:
+            return False, f"Dispatch #{sale_id} not found."
+        _, d_fac, d_prod, d_qty, d_pb_id, d_so_id = row
+        d_qty = float(d_qty or 0)
+
+        # 1) FG stock ledger — offsetting row (inlined: record_fg_stock_movement()
+        #    opens its own _write_lock(), which cannot nest inside this one).
+        net = get_fg_source_net("Dispatch", sale_id)
+        if net["production_in"] or net["dispatch_out"] or net["adjustment"]:
+            _prev = get_fg_closing_stock(d_fac, d_prod)
+            _closing = _prev - net["production_in"] + net["dispatch_out"] - net["adjustment"]
+            cur.execute(
+                "INSERT INTO fg_stock (date,factory,product,fg_code,production_in,dispatch_out,"
+                "adjustment,closing_stock,source_module,source_ref_id,created_at,movement_type,"
+                "production_batch_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(today_ist()), d_fac, d_prod, "", -net["production_in"], -net["dispatch_out"],
+                 -net["adjustment"], _closing, "Dispatch", sale_id, _now_iso(), "Reversal", d_pb_id)
+            )
+            _audit.append(("REVERSE", "fg_stock", sale_id,
+                           f"Dispatch #{sale_id} deleted — FG stock reversed | {d_fac} | {d_prod} | "
+                           f"FG stock now {_closing:,.2f}"))
+
+        # 2) Production batch
+        pb_unit = ""
+        if d_qty > 0 and d_pb_id:
+            pb = cur.execute(
+                "SELECT batch_no, COALESCE(dispatched_qty,0), COALESCE(quantity_unit,'') "
+                "FROM production_batches WHERE id=?", (d_pb_id,)
+            ).fetchone()
+            if pb:
+                _bno, _bdisp, pb_unit = pb
+                _new_bdisp = max(0.0, round((_bdisp or 0) - d_qty, 4))
+                _new_bstatus = "Dispatch Approved" if _new_bdisp <= 1e-6 else "Partially Dispatched"
+                cur.execute("UPDATE production_batches SET dispatched_qty=?, status=? WHERE id=?",
+                            (_new_bdisp, _new_bstatus, d_pb_id))
+                _audit.append(("REVERSE", "production_batches", d_pb_id,
+                               f"Dispatch #{sale_id} deleted — {_bno} dispatched_qty reversed to "
+                               f"{_new_bdisp:g}, status {_new_bstatus}"))
+
+        # 3) Sales Order (in the SO's OWN ordered_unit, as create_dispatch accumulates it)
+        if d_qty > 0 and d_so_id:
+            so = cur.execute(
+                "SELECT qty, COALESCE(dispatched_qty,0), COALESCE(ordered_unit,'') "
+                "FROM sales_orders WHERE id=?", (d_so_id,)
+            ).fetchone()
+            if so:
+                _so_qty, _so_disp, _so_unit = so
+                _q_so = d_qty
+                if _so_unit and pb_unit and not units_equivalent(pb_unit, _so_unit):
+                    _q_so, _, _ = convert_fg_qty_between_units(d_qty, pb_unit, _so_unit, d_prod)
+                _new_so_disp = max(0.0, round((_so_disp or 0) - _q_so, 4))
+                _new_so_status = ("Completed" if _new_so_disp >= (_so_qty or 0) - 1e-6 and _new_so_disp > 0
+                                  else ("Partially Dispatched" if _new_so_disp > 1e-6 else "Instruction Created"))
+                cur.execute("UPDATE sales_orders SET dispatched_qty=?, wo_status=? WHERE id=?",
+                            (_new_so_disp, _new_so_status, d_so_id))
+                _audit.append(("REVERSE", "sales_orders", d_so_id,
+                               f"Dispatch #{sale_id} deleted — dispatched_qty reversed to "
+                               f"{_new_so_disp:g}, status {_new_so_status}"))
+
+        # 4) The dispatch row itself — last, inside the same transaction.
+        cur.execute("DELETE FROM sales WHERE id=?", (sale_id,))
+        _audit.append(("DELETE", "sales", sale_id, f"reason={reason.strip()}"))
+    # committed — now write the audit trail
+    for _a in _audit:
+        log_audit(*_a)
+    return True, f"Dispatch #{sale_id} deleted and stock / batch / sales-order reversed."
+
+def update_dispatch(sale_id: int, *, date_val, customer: str, qty: float, price: float,
+                    status: str, challan_no: str, gstin: str, hsn_code: str, gst_rate: float,
+                    allow_negative_override: bool = False,
+                    override_reason: str = "") -> tuple[bool, str]:
+    """FIX (P0-5): the ONLY way to edit an existing Dispatch. Editing used to be
+    raw SQL in the UI followed by several separate commits, and its only
+    quantity check was "batch availability" — so a valid dispatch could be edited
+    into SO dispatched > SO ordered and/or FG stock < 0.
+
+    Everything happens inside ONE _write_lock() transaction with ONE commit:
+      1. read the dispatch as it stands and *logically reverse* its old quantity
+         against the batch, the Sales Order and the FG ledger;
+      2. validate the proposed new quantity against the same guards as
+         create_dispatch() — batch PDI/status (when the quantity grows), batch
+         output, Sales Order remaining balance (unit-converted), FG stock;
+      3. only then write the sales row, the FG reversal + correction ledger rows,
+         and the batch / Sales Order dispatched_qty + status.
+    Any rejection returns before a single write, and any exception rolls the whole
+    transaction back. The over-stock / over-SO-balance guards can only be bypassed
+    by Admin with a reason (same rule as create_dispatch()), and that is audited.
+    Product, factory and linked batch are never editable — a batch change means
+    delete + re-dispatch. If the quantity is unchanged only the commercial fields
+    are updated and no stock / batch / SO movement is made.
+    """
+    if not _dept_allows("Dispatch"):
+        return False, "Only Dispatch (or Admin) can edit a dispatch."
+    if allow_negative_override:
+        if not _is_admin:
+            return False, ("Only Admin can authorize a dispatch edit that exceeds FG stock or "
+                           "the Sales Order balance.")
+        if len((override_reason or "").strip()) < 5:
+            return False, "A reason (at least 5 characters) is required to use the dispatch override."
+    if qty is None or qty <= 0:
+        return False, "Dispatch quantity must be greater than zero."
+    if not customer or not customer.strip():
+        return False, "Customer is required."
+
+    _audit: list[tuple] = []
+    user = st.session_state.get("username", "system")
+    with _write_lock():
+        row = cur.execute(
+            "SELECT factory, product, qty, production_batch_id, sales_order_id "
+            "FROM sales WHERE id=?", (sale_id,)
+        ).fetchone()
+        if row is None:
+            return False, f"Dispatch #{sale_id} not found."
+        d_fac, d_prod, old_qty, d_pb_id, d_so_id = row
+        old_qty = float(old_qty or 0)
+        if not _factory_allowed(d_fac):
+            return False, _CROSS_FACTORY_MSG
+        _delta = float(qty) - old_qty
+        _qty_changed = abs(_delta) > 1e-9
+
+        _new_pb_disp = _new_pb_status = _pb_no = None
+        _new_so_disp = _new_so_status = _so_qty = None
+        _closing_fg = None
+        _override_used = False
+
+        if _qty_changed:
+            # ── Batch: reverse old share, validate new ───────────────────────
+            pb_unit = ""
+            if d_pb_id:
+                pb = cur.execute(
+                    "SELECT batch_no, product, factory, status, COALESCE(quantity,0), "
+                    "COALESCE(quantity_unit,''), COALESCE(dispatched_qty,0) "
+                    "FROM production_batches WHERE id=?", (d_pb_id,)
+                ).fetchone()
+                if pb is None:
+                    return False, "The batch linked to this dispatch no longer exists."
+                _pb_no, pb_product, pb_factory, pb_status, pb_qty, pb_unit, pb_disp = pb
+                if pb_product != d_prod or pb_factory != d_fac:
+                    return False, (f"Batch {_pb_no} no longer matches this dispatch's product/factory "
+                                   "— cannot edit the quantity.")
+                if _delta > 0 and pb_status not in ("Dispatch Approved", "Partially Dispatched",
+                                                    "Dispatched"):
+                    return False, (f"Batch {_pb_no} is '{pb_status}' — the dispatched quantity can only "
+                                   "be increased on a batch that has passed PDI.")
+                if pb_qty <= 0:
+                    return False, f"Batch {_pb_no} has no recorded output quantity — cannot validate."
+                _pb_disp_wo = max(0.0, float(pb_disp) - old_qty)          # after reversing this dispatch
+                _pb_room = pb_qty - _pb_disp_wo
+                if qty > _pb_room + 1e-6:
+                    return False, (f"Cannot dispatch {qty:g} — only {_pb_room:g} {pb_unit} is available on "
+                                   f"batch {_pb_no} once this dispatch's current {old_qty:g} is released.")
+                _new_pb_disp = round(_pb_disp_wo + qty, 4)
+                if pb_status in ("Dispatch Approved", "Partially Dispatched", "Dispatched"):
+                    _new_pb_status = ("Dispatched" if _new_pb_disp >= pb_qty - 1e-6 else
+                                      "Partially Dispatched" if _new_pb_disp > 1e-6 else
+                                      "Dispatch Approved")
+                else:
+                    _new_pb_status = pb_status      # never overwrite a QC hold etc.
+
+            # ── Sales Order: reverse old share, validate new balance ─────────
+            if d_so_id:
+                so = cur.execute(
+                    "SELECT qty, COALESCE(dispatched_qty,0), COALESCE(ordered_unit,'') "
+                    "FROM sales_orders WHERE id=?", (d_so_id,)
+                ).fetchone()
+                if so:
+                    _so_qty, _so_disp, _so_unit = float(so[0] or 0), float(so[1] or 0), so[2]
+                    _old_in_so, _new_in_so, _note = old_qty, float(qty), ""
+                    if _so_unit and pb_unit and not units_equivalent(pb_unit, _so_unit):
+                        _old_in_so, _, _ = convert_fg_qty_between_units(old_qty, pb_unit, _so_unit, d_prod)
+                        _new_in_so, _ok, _cn = convert_fg_qty_between_units(float(qty), pb_unit,
+                                                                            _so_unit, d_prod)
+                        if not _ok:
+                            _note = f" (⚠️ unit conversion {pb_unit}→{_so_unit} not exact: {_cn})"
+                    _so_disp_wo = max(0.0, _so_disp - _old_in_so)
+                    _so_remaining = _so_qty - _so_disp_wo
+                    if _new_in_so > _so_remaining + 1e-6:
+                        _override_used = True
+                        if not allow_negative_override:
+                            return False, (f"Editing to {_new_in_so:g} {_so_unit or pb_unit} would exceed "
+                                           f"Sales Order #{d_so_id}'s remaining balance "
+                                           f"({_so_remaining:g} of {_so_qty:g} {_so_unit}).{_note}")
+                    _new_so_disp = round(_so_disp_wo + _new_in_so, 4)
+                    _new_so_status = ("Completed" if _new_so_disp >= _so_qty - 1e-6 and _new_so_disp > 0 else
+                                      "Partially Dispatched" if _new_so_disp > 1e-6 else "Instruction Created")
+
+            # ── FG stock: reverse this dispatch's net effect, then check ─────
+            net = get_fg_source_net("Dispatch", sale_id)
+            _prev_fg = get_fg_closing_stock(d_fac, d_prod)
+            _fg_after_reversal = _prev_fg - net["production_in"] + net["dispatch_out"] - net["adjustment"]
+            if qty > _fg_after_reversal + 1e-6:
+                _override_used = True
+                if not allow_negative_override:
+                    return False, (f"Edit exceeds available FG stock — available (with this dispatch's "
+                                   f"current {old_qty:g} released) {_fg_after_reversal:g}, requested {qty:g}.")
+
+            # ── All guards passed — apply ────────────────────────────────────
+            if net["production_in"] or net["dispatch_out"] or net["adjustment"]:
+                cur.execute(
+                    "INSERT INTO fg_stock (date,factory,product,fg_code,production_in,dispatch_out,"
+                    "adjustment,closing_stock,source_module,source_ref_id,created_at,movement_type,"
+                    "production_batch_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (str(today_ist()), d_fac, d_prod, get_fg_code(d_prod), -net["production_in"],
+                     -net["dispatch_out"], -net["adjustment"], _fg_after_reversal, "Dispatch", sale_id,
+                     _now_iso(), "Reversal", d_pb_id)
+                )
+            _closing_fg = _fg_after_reversal - qty
+            cur.execute(
+                "INSERT INTO fg_stock (date,factory,product,fg_code,production_in,dispatch_out,"
+                "adjustment,closing_stock,source_module,source_ref_id,created_at,movement_type,"
+                "production_batch_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(date_val), d_fac, d_prod, get_fg_code(d_prod), 0, qty, 0, _closing_fg,
+                 "Dispatch", sale_id, _now_iso(), "Correction", d_pb_id)
+            )
+            if d_pb_id and _new_pb_disp is not None:
+                cur.execute("UPDATE production_batches SET dispatched_qty=?, status=? WHERE id=?",
+                            (_new_pb_disp, _new_pb_status, d_pb_id))
+            if d_so_id and _new_so_disp is not None:
+                cur.execute("UPDATE sales_orders SET dispatched_qty=?, wo_status=? WHERE id=?",
+                            (_new_so_disp, _new_so_status, d_so_id))
+
+        cur.execute(
+            "UPDATE sales SET date=?,customer=?,qty=?,price=?,total=?,status=?,challan_no=?,"
+            "gstin=?,hsn_code=?,gst_rate=? WHERE id=?",
+            (str(date_val), customer.strip(), qty, price, round(qty * price, 2), status,
+             challan_no.strip(), gstin.strip(), hsn_code.strip(), gst_rate, sale_id)
+        )
+        _audit.append(("UPDATE", "sales", sale_id,
+                       f"{d_fac} | {d_prod} | {customer.strip()} | {status} | qty {old_qty:g} -> {qty:g}"))
+        if _qty_changed:
+            if allow_negative_override:
+                _audit.append(("OVERRIDE", "sales", sale_id,
+                               f"Dispatch edit override authorized by {user} — "
+                               f"{'GUARD BYPASSED (exceeded FG stock and/or SO balance)' if _override_used else 'flag set but not needed'}"
+                               f" | reason: {override_reason.strip()}"))
+            if d_pb_id and _new_pb_disp is not None:
+                _audit.append(("UPDATE", "production_batches", d_pb_id,
+                               f"Dispatch #{sale_id} edited — {_pb_no} dispatched_qty now {_new_pb_disp:g}, "
+                               f"status {_new_pb_status}"))
+            if d_so_id and _new_so_disp is not None:
+                _audit.append(("UPDATE", "sales_orders", d_so_id,
+                               f"Dispatch #{sale_id} edited — dispatched_qty now {_new_so_disp:g}/"
+                               f"{_so_qty:g}, status {_new_so_status}"))
+    # committed — audit lines only after the transaction
+    for _a in _audit:
+        log_audit(*_a)
+    _msg = "Dispatch updated."
+    if _closing_fg is not None:
+        _msg += f" FG Stock for {fg_label(d_prod)} @ {d_fac} now {_closing_fg:,.2f}."
+    return True, _msg
+
 # ── FG stock edit/delete integrity (Sections 7 & 8) ─────────────────────────
 # Production and Dispatch each write exactly one fg_stock row per save, tagged
 # with (source_module, source_ref_id). To keep the ledger truthful across
@@ -7893,7 +10069,7 @@ def _post_fg_adjustment_locked(date_val, fac: str, product: str, signed_qty: flo
 
 
 def _post_rm_adjustment_locked(date_val, fac: str, material: str, signed_qty: float,
-                                request_id: int) -> float:
+                                request_id: int, unit: str = "") -> float:
     """Appends the RM ledger row for an approved adjustment (received=0,
     used=0, adjustment=signed_qty) — never touches the received/used columns
     Stores' routine Log Stock entries use. MUST only be called from inside an
@@ -7907,7 +10083,7 @@ def _post_rm_adjustment_locked(date_val, fac: str, material: str, signed_qty: fl
     cur.execute(
         "INSERT INTO stock (date,factory,material,received,used,closing_stock,unit,code,"
         "adjustment,source_module,source_ref_id) VALUES (?,?,?,0,0,?,?,?,?,?,?)",
-        (str(date_val), fac, material, closing, "", get_lab_code(material) or "",
+        (str(date_val), fac, material, closing, unit, get_lab_code(material) or "",
          signed_qty, "STOCK_ADJUSTMENT", request_id)
     )
     return closing
@@ -7963,6 +10139,16 @@ def approve_and_post_stock_adjustment(request_id: int, approver: str,
                 # Backend enforcement — never rely on the Approve button merely
                 # being hidden for the requester.
                 return False, "Approver must be a different user from the requester."
+            _rm_adj_unit = ""
+            if stock_type != "FG":
+                # FIX (P0-9): the legacy RM ledger is chained in the material's BASE
+                # unit, so the adjustment is converted first — and refused (before any
+                # write) if there's no factor for the request's unit.
+                _rm_adj_unit = get_material_base_unit(material)
+                _adj_f = get_material_unit_factor(material, unit or _rm_adj_unit)
+                if _adj_f is None:
+                    return False, (f"No conversion factor from '{unit}' to {material}'s base unit "
+                                   f"({_rm_adj_unit}) — set it in Material Master, then approve again.")
             n = cur.execute(
                 "UPDATE stock_adjustment_requests SET status='APPROVED', approver=?, "
                 "decision_at=?, decision_reason=? WHERE id=? AND status='PENDING'",
@@ -7976,7 +10162,8 @@ def approve_and_post_stock_adjustment(request_id: int, approver: str,
                                                       signed_qty, request_id)
             else:
                 closing = _post_rm_adjustment_locked(today_ist(), factory, material,
-                                                      signed_qty, request_id)
+                                                      signed_qty * _adj_f, request_id,
+                                                      unit=_rm_adj_unit)
             ledger_id = cur.lastrowid
             cur.execute(
                 "UPDATE stock_adjustment_requests SET status='POSTED', posted_at=?, "
@@ -8142,6 +10329,65 @@ def convert_batch_qty_to_fg_unit(qty: float, batch_unit: str, product: str) -> t
         f"Recorded as-is in '{batch_unit}' — verify manually or align the units."
     )
 
+_WEIGHT_TO_KG = {"kg": 1.0, "kilogram": 1.0, "kilograms": 1.0,
+                 "mt": 1000.0, "metric tonne": 1000.0, "metric tonnes": 1000.0,
+                 "tonne": 1000.0, "tonnes": 1000.0, "ton": 1000.0}
+
+def convert_fg_qty_between_units(qty: float, from_unit: str, to_unit: str,
+                                  product: str) -> tuple[float, bool, str]:
+    """FIX (P0-1/P0-2): general-purpose counterpart to
+    convert_batch_qty_to_fg_unit()/convert_mt_to_fg_unit() — those only ever
+    convert INTO a product's canonical FG stock unit; this converts between
+    ANY two units in FG_UNIT_OPTIONS for a given product (used to compare a
+    Dispatch, which is always in the linked batch's quantity_unit, against a
+    Sales Order's ordered_unit, which the customer/Sales rep may have picked
+    independently). Same contract as its siblings: (converted_qty, is_exact,
+    note). A weight unit (KG/MT) always converts exactly. A packed unit
+    (Bags/Pieces/Drums) only converts exactly if it's the product's
+    configured canonical stock unit AND a pack weight is on file — going
+    through a packed unit that ISN'T the canonical one (e.g. dispatch in
+    'Bags' but the SO says 'Drums' for a product whose canonical unit is
+    'Pieces') is never guessed at; this returns the qty unconverted with
+    is_exact=False rather than silently assuming an equivalence."""
+    fu = (from_unit or "").strip().lower()
+    tu = (to_unit or "").strip().lower()
+    if fu == tu or fu.rstrip("s") == tu.rstrip("s"):
+        return qty, True, ""
+    cfg = get_fg_stock_unit_cfg(product)
+    stock_unit = cfg["stock_unit"]
+    pack_kg = cfg["pack_weight_kg"]
+    su = stock_unit.strip().lower()
+
+    def _to_kg(u: str, q: float) -> tuple[float | None, bool]:
+        if u in _WEIGHT_TO_KG:
+            return q * _WEIGHT_TO_KG[u], True
+        if (u == su or u.rstrip("s") == su.rstrip("s")) and pack_kg and pack_kg > 0:
+            return q * pack_kg, True
+        return None, False
+
+    def _from_kg(u: str, kg: float) -> tuple[float | None, bool]:
+        if u in _WEIGHT_TO_KG:
+            return kg / _WEIGHT_TO_KG[u], True
+        if (u == su or u.rstrip("s") == su.rstrip("s")) and pack_kg and pack_kg > 0:
+            return kg / pack_kg, True
+        return None, False
+
+    qty_kg, ok_in = _to_kg(fu, qty)
+    if not ok_in:
+        return qty, False, (
+            f"Can't reliably convert {qty:g} {from_unit} to {to_unit} for '{product}' — "
+            f"'{from_unit}' isn't a weight unit and doesn't match its configured FG stock "
+            f"unit ('{stock_unit}'). Verify manually."
+        )
+    result, ok_out = _from_kg(tu, qty_kg)
+    if not ok_out:
+        return qty, False, (
+            f"Can't reliably convert {qty:g} {from_unit} to {to_unit} for '{product}' — "
+            f"'{to_unit}' isn't a weight unit and doesn't match its configured FG stock "
+            f"unit ('{stock_unit}'). Verify manually."
+        )
+    return result, True, ""
+
 def record_fg_stock_for_batch(pb_id: int) -> tuple[bool, str]:
     """Phase B: auto-posts one FG Stock IN ledger row for a QC-traced
     production batch the moment it passes Packing QC — additive to, not a
@@ -8209,6 +10455,7 @@ def reconcile_rm_incoming(d_start_val, d_end_val, fac_filter: str | None = None)
     aggregated per factory+material over the date window — the two sides
     don't share a transaction ID, so this compares totals, not line items."""
     results = []
+    fac_filter = _effective_factory_filter(fac_filter)   # P0-5: only Admin may mean 'all factories'
     fac_clause = " AND factory=?" if fac_filter and fac_filter != ALL_FACTORIES else ""
     fac_param  = (fac_filter,) if fac_clause else ()
     qc_rows = cur.execute(
@@ -8234,6 +10481,7 @@ def reconcile_rm_used(d_start_val, d_end_val, fac_filter: str | None = None) -> 
     """QC Material Used (production_batch_materials, via the rm_batch it drew
     from) vs Stock Material Used (stock.used), aggregated per factory+material."""
     results = []
+    fac_filter = _effective_factory_filter(fac_filter)   # P0-5: only Admin may mean 'all factories'
     fac_clause = " AND rb.factory=?" if fac_filter and fac_filter != ALL_FACTORIES else ""
     fac_param  = (fac_filter,) if fac_clause else ()
     qc_rows = cur.execute(
@@ -8277,6 +10525,7 @@ def reconcile_dispatch_quality(d_start_val, d_end_val, fac_filter: str | None = 
        as a verified batch-level match.
     """
     results = []
+    fac_filter = _effective_factory_filter(fac_filter)   # P0-5: only Admin may mean 'all factories'
     fac_clause = " AND s.factory=?" if fac_filter and fac_filter != ALL_FACTORIES else ""
     fac_param  = (fac_filter,) if fac_clause else ()
 
@@ -8342,6 +10591,7 @@ def reconcile_fg_stock(fac_filter: str | None = None) -> list[dict]:
     """Self-check: the latest fg_stock closing balance for each factory+product
     vs an independent re-derivation from the full fg_stock ledger."""
     results = []
+    fac_filter = _effective_factory_filter(fac_filter)   # P0-5: only Admin may mean 'all factories'
     fac_clause = " AND factory=?" if fac_filter and fac_filter != ALL_FACTORIES else ""
     fac_param  = (fac_filter,) if fac_clause else ()
     pairs = cur.execute(
@@ -8382,6 +10632,7 @@ def reconcile_rm_stock(fac_filter: str | None = None) -> list[dict]:
        fine while actually being wrong).
     """
     results = []
+    fac_filter = _effective_factory_filter(fac_filter)   # P0-5: only Admin may mean 'all factories'
     fac_clause = " AND factory=?" if fac_filter and fac_filter != ALL_FACTORIES else ""
     fac_param  = (fac_filter,) if fac_clause else ()
     pairs = cur.execute(
@@ -8431,6 +10682,7 @@ def run_all_reconciliations(d_start_val, d_end_val, fac_filter: str | None = Non
     """Runs every check and returns a combined summary. Called on demand from
     the Reconciliation module — never runs automatically on every page load,
     to avoid writing to inventory_reconciliation on every single rerun."""
+    fac_filter = _effective_factory_filter(fac_filter)   # P0-5: None/'All' is Admin-only
     return {
         "RM Incoming — QC vs Stock":       reconcile_rm_incoming(d_start_val, d_end_val, fac_filter),
         "RM Used — QC vs Stock":           reconcile_rm_used(d_start_val, d_end_val, fac_filter),
@@ -8712,7 +10964,7 @@ def render_batch_detail_page(batch_no: str) -> None:
                 ccol1, ccol2 = st.columns([5, 1])
                 ccol1.markdown(f"🏢 {_cm['customer']}")
                 if ccol2.button("360° →", key=f"batchpage_cust_{_cm['customer']}",
-                                 use_container_width=True):
+                                 width='stretch'):
                     open_detail_view("customer", _cm["customer"])
 
     with tab_docs:
@@ -9666,13 +11918,33 @@ elif module == "Daily Log":
     st.title("📋 Daily Activity Log")
     tab_add, tab_view, tab_edit = st.tabs(["➕ Add Entry", "📋 View Log", "✏️ Edit Record"])
 
+    # FIX (P0-5A): Add had no department gate at all — any logged-in user
+    # could log an entry under ANY category, including ones that belong to
+    # a different department (e.g. a Sales account logging a "Quality
+    # Control" entry). Only categories that map onto one of the app's real
+    # departments are restricted; categories with no department owner
+    # (Procurement, Maintenance, HR, Safety, Finance, Other) stay open to
+    # everyone, same as before.
+    # ASSUMPTION: this mapping is a guess from category names — adjust it
+    # (or extend it to cover Procurement, etc.) if it doesn't match how
+    # your departments actually divide this log.
+    _DL_CATEGORY_DEPT = {
+        "Production": "Production",
+        "Quality Control": "QC",
+        "Dispatch": "Dispatch",
+        "R&D": "RD",
+    }
+    def _dl_category_allowed(cat: str) -> bool:
+        _dept = _DL_CATEGORY_DEPT.get(cat)
+        return _dept is None or _dept_allows(_dept)
+
     with tab_add:
         st.subheader("New Log Entry")
         c1, c2, c3 = st.columns(3)
         with c1:
             dl_date    = st.date_input("Date", value=today_ist(), key="dl_d")
-            dl_factory = st.selectbox("Factory", FACTORIES, key="dl_f",
-                                       index=FACTORIES.index(factory) if factory in FACTORIES else 0)
+            dl_factory = st.selectbox("Factory", _FAC_CHOICES, key="dl_f",
+                                       index=_FAC_CHOICES.index(factory) if factory in _FAC_CHOICES else 0)
             dl_cat     = st.selectbox("Category", LOG_CATEGORIES, key="dl_cat")
         with c2:
             dl_activity = st.text_input("Activity Description",
@@ -9682,7 +11954,14 @@ elif module == "Daily Log":
             dl_status = st.selectbox("Status", LOG_STATUSES, key="dl_stat")
             dl_notes  = st.text_input("Notes (optional)", key="dl_notes")
 
-        if st.button("💾 Save Log Entry"):
+        if not _dl_category_allowed(dl_cat):
+            st.info(f"🔒 Only **{_DL_CATEGORY_DEPT[dl_cat]}** (or Admin) can log a "
+                    f"**{dl_cat}** entry.")
+
+        if st.button("💾 Save Log Entry", disabled=not _dl_category_allowed(dl_cat)):
+            if not _dl_category_allowed(dl_cat):
+                st.error(f"Only {_DL_CATEGORY_DEPT[dl_cat]} (or Admin) can log a {dl_cat} entry.")
+                st.stop()
             if not dl_activity.strip():
                 st.warning("Activity description is required.")
             else:
@@ -9777,9 +12056,9 @@ elif module == "Daily Log":
                 e_dl_date    = st.date_input("Date",
                     value=pd.to_datetime(sel_row["date"]).date(), key="e_dl_d",
                     disabled=not _dl_edit_allowed)
-                e_dl_factory = st.selectbox("Factory", FACTORIES, key="e_dl_f",
-                    index=FACTORIES.index(sel_row["factory"])
-                          if sel_row["factory"] in FACTORIES else 0,
+                e_dl_factory = st.selectbox("Factory", _FAC_CHOICES, key="e_dl_f",
+                    index=_FAC_CHOICES.index(sel_row["factory"])
+                          if sel_row["factory"] in _FAC_CHOICES else 0,
                     disabled=not _is_admin)
                 e_dl_cat = st.selectbox("Category", LOG_CATEGORIES, key="e_dl_cat",
                     index=LOG_CATEGORIES.index(sel_row["category"])
@@ -9885,6 +12164,15 @@ elif module == "Production":
                     pc4.metric("Load Capacity",
                                f"{_cap['capacity']:g} {_cap['capacity_unit']}" if _cap else "Not set")
                     progress_bar("Production progress", _prog["produced"], max(_prog["required"], 1e-9))
+                    if _prog.get("unreconciled_batches"):
+                        st.warning(
+                            "⚠️ Unit mismatch: " + "; ".join(
+                                f"{b['batch_no']} recorded {b['quantity']:g} {b['quantity_unit']}"
+                                for b in _prog["unreconciled_batches"]
+                            ) + f" — could not be converted to this instruction's unit "
+                                f"({_prog['unit']}) and is EXCLUDED from Produced/Remaining above. "
+                                f"Verify and correct that batch's recorded quantity/unit."
+                        )
 
                     if not _prog["batches"].empty:
                         st.markdown("**📦 Production Batches (physical loads) under this instruction:**")
@@ -9934,8 +12222,13 @@ elif module == "Production":
                         )
 
                     if _pi["status"] == "Released to Production":
-                        if st.button("👍 Acknowledge", key=f"pi_ack_{_pi_id}"):
-                            acknowledge_production_instruction(_pi_id)
+                        _pi_can_ack = _dept_allows("Production")
+                        if not _pi_can_ack:
+                            st.caption("🔒 Only Production can acknowledge this instruction.")
+                        if st.button("👍 Acknowledge", key=f"pi_ack_{_pi_id}", disabled=not _pi_can_ack):
+                            _ack_ok, _ack_msg = acknowledge_production_instruction(_pi_id)
+                            if not _ack_ok:
+                                st.error(_ack_msg)
                             st.rerun()
 
                     # ── Create (Next) Production Load (Section 4/30): NOT
@@ -9953,11 +12246,27 @@ elif module == "Production":
                         st.markdown(f"**{_load_label}**")
                         _stores_ok = bool(int(_pi["stores_released"] or 0))
                         if not _stores_ok:
-                            st.warning(
-                                "⏳ Waiting on Stores to release raw material/packaging for this "
-                                "instruction (Stock → 🚚 Material Release). Production cannot "
-                                "start a batch until that happens."
-                            )
+                            _stores_status = _pi["stores_release_status"] or "Pending"
+                            if _stores_status == "Partial":
+                                st.warning(
+                                    "⏳ Stores has only PARTIALLY released materials for this "
+                                    "instruction — the reservation fell short of the full "
+                                    "requirement. Production cannot start until Stores tops it up "
+                                    "and the release is Full (Stock → 🚚 Material Release)."
+                                )
+                            else:
+                                st.warning(
+                                    "⏳ Waiting on Stores to release raw material/packaging for this "
+                                    "instruction (Stock → 🚚 Material Release). Production cannot "
+                                    "start a batch until that happens."
+                                )
+                        # FIX (P0-3): department gate on the button itself, in
+                        # addition to create_production_batch()'s own
+                        # server-side check — the button being disabled is a
+                        # UX convenience, not the actual enforcement.
+                        _prod_dept_ok = _dept_allows("Production")
+                        if _stores_ok and not _prod_dept_ok:
+                            st.caption("🔒 Only Production can create a production batch.")
                         st.caption("Product, formula and factory are already fixed by this instruction.")
                         _pif = str(_pi_id)
                         _planned_next = _prog["next_planned_load"]
@@ -9976,8 +12285,18 @@ elif module == "Production":
                                 value=0.0, key=f"sp_oq_{_pif}",
                                 help="What this specific load actually produced — may differ from "
                                      "the planned load above.")
-                        sp_out_unit = st.selectbox("Output Unit", ["Bags", "Pieces", "Drums", "KG", "MT"],
-                                                    key=f"sp_ou_{_pif}")
+                        # FIX (P0-1 / unit-consistency): this used to be a free
+                        # "Output Unit" dropdown (Bags/Pieces/Drums/KG/MT) with
+                        # no link to the instruction's own unit. get_pi_progress()
+                        # sums every batch's quantity directly against the PI's
+                        # required quantity, so a batch recorded in a different
+                        # unit than the PI silently corrupted Produced/Remaining
+                        # for the whole instruction. Output is now recorded in
+                        # the instruction's own unit — no choice to get wrong —
+                        # and create_production_batch() enforces this server-side
+                        # as well, so this can't be bypassed from elsewhere.
+                        sp_out_unit = _prog["unit"]
+                        st.caption(f"Output Unit: **{sp_out_unit}** (fixed to this instruction's unit)")
 
                         # Phase B: RM picker is scoped to THIS instruction's active
                         # Stores reservations only — not every QC-Approved batch in
@@ -10016,11 +12335,14 @@ elif module == "Production":
                                     _lbl, min_value=0.0, max_value=_sp_rm_max.get(rid, 0.0),
                                     step=1.0, key=f"sp_qty_{_pif}_{rid}")
 
-                        if st.button(_load_label, key=f"sp_create_{_pif}", disabled=not _stores_ok):
+                        if st.button(_load_label, key=f"sp_create_{_pif}",
+                                     disabled=not (_stores_ok and _prod_dept_ok)):
                             if not sp_operator.strip():
                                 st.warning("Operator is required.")
                             elif not _sp_rm_ids:
                                 st.warning("Select at least one QC-Approved raw material batch.")
+                            elif sp_out_qty <= 0:
+                                st.warning("Actual Output Quantity is required and must be greater than zero.")
                             else:
                                 pb_id, result = create_production_batch(
                                     _pi["product"], f"{_pi['formula_version']} ({_pi['formula_code']})",
@@ -10190,8 +12512,8 @@ elif module == "Production":
         c1, c2, c3 = st.columns(3)
         with c1:
             pr_date    = st.date_input("Date", value=today_ist(), key="pr_d", disabled=not _legacy_prod_allowed)
-            pr_factory = st.selectbox("Factory", FACTORIES, key="pr_f",
-                                       index=FACTORIES.index(factory) if factory in FACTORIES else 0,
+            pr_factory = st.selectbox("Factory", _FAC_CHOICES, key="pr_f",
+                                       index=_FAC_CHOICES.index(factory) if factory in _FAC_CHOICES else 0,
                                        disabled=not _legacy_prod_allowed)
             pr_product = st.selectbox("Product", FCSC_PRODUCTS, key="pr_p", format_func=fg_label,
                                        disabled=not _legacy_prod_allowed)
@@ -10479,36 +12801,55 @@ elif module == "Production":
             sel_id  = opts[sel_label]
             sel_row = prod_df[prod_df["id"] == sel_id].iloc[0]
 
+            # FIX (P0-5C): this legacy record-editing path had no department
+            # gate at all, unlike the main batch workflow — anyone who could
+            # reach the Production module could alter historical production
+            # records (and, via the FG-stock reversal below, historical FG
+            # stock) regardless of department. Gated the same way as the
+            # rest of Production (_dept_allows("Production")); Admin/'All'
+            # still pass through _dept_allows itself.
+            _prod_edit_allowed = _dept_allows("Production")
+            if not _prod_edit_allowed:
+                st.info("🔒 Only Production (or Admin) can edit production records.")
+
             pc1, pc2, pc3 = st.columns(3)
             with pc1:
                 e_pr_date    = st.date_input("Date",
-                    value=pd.to_datetime(sel_row["date"]).date(), key="e_pr_d")
-                e_pr_factory = st.selectbox("Factory", FACTORIES, key="e_pr_f",
-                    index=FACTORIES.index(sel_row["factory"])
-                          if sel_row["factory"] in FACTORIES else 0,
+                    value=pd.to_datetime(sel_row["date"]).date(), key="e_pr_d",
+                    disabled=not _prod_edit_allowed)
+                e_pr_factory = st.selectbox("Factory", _FAC_CHOICES, key="e_pr_f",
+                    index=_FAC_CHOICES.index(sel_row["factory"])
+                          if sel_row["factory"] in _FAC_CHOICES else 0,
                     disabled=not _is_admin)
                 cur_prod_idx = FCSC_PRODUCTS.index(sel_row["product"]) \
                                if sel_row["product"] in FCSC_PRODUCTS else len(FCSC_PRODUCTS) - 1
                 e_pr_product = st.selectbox("Product", FCSC_PRODUCTS, key="e_pr_p",
-                    index=cur_prod_idx, format_func=fg_label)
+                    index=cur_prod_idx, format_func=fg_label,
+                    disabled=not _prod_edit_allowed)
                 e_pr_custom  = st.text_input("Custom name (if Other / Custom)",
                     value=sel_row["product"] if sel_row["product"] not in FCSC_PRODUCTS else "",
-                    key="e_pr_cust")
+                    key="e_pr_cust", disabled=not _prod_edit_allowed)
             with pc2:
                 e_pr_labour = st.number_input("Labour (workers)",
-                    min_value=0, step=1, value=int(sel_row["labour"]), key="e_pr_l")
+                    min_value=0, step=1, value=int(sel_row["labour"]), key="e_pr_l",
+                    disabled=not _prod_edit_allowed)
                 e_pr_hours  = st.number_input("Hours worked",
-                    min_value=0.0, step=0.5, value=float(sel_row["hours"]), key="e_pr_h")
+                    min_value=0.0, step=0.5, value=float(sel_row["hours"]), key="e_pr_h",
+                    disabled=not _prod_edit_allowed)
             with pc3:
                 cur_display  = round(from_mt(sel_row["production"]), 3)
                 e_pr_display = st.number_input(f"Production ({unit})",
-                    min_value=0.0, step=0.1, value=cur_display, key="e_pr_v")
+                    min_value=0.0, step=0.1, value=cur_display, key="e_pr_v",
+                    disabled=not _prod_edit_allowed)
                 e_pr_mt  = to_mt(e_pr_display)
                 e_pr_eff = e_pr_mt / (e_pr_labour * e_pr_hours) \
                            if (e_pr_labour and e_pr_hours) else 0.0
                 st.metric("New Efficiency", f"{e_pr_eff:.4f} u/l·h")
 
-            if st.button("💾 Update Production", key="prod_upd_btn"):
+            if st.button("💾 Update Production", key="prod_upd_btn", disabled=not _prod_edit_allowed):
+                if not _prod_edit_allowed:
+                    st.error("Only Production (or Admin) can edit production records.")
+                    st.stop()
                 final_p = e_pr_custom.strip() \
                           if e_pr_product == "Other / Custom" and e_pr_custom.strip() \
                           else e_pr_product
@@ -10726,15 +13067,16 @@ elif module == "Formulation":
                     with psc1:
                         st.markdown(
                             f"**Order #{_pso['id']:05d}** — {_pso['customer']} — "
-                            f"{fg_label(_pso['product'])} ({_pso['qty']:g} units) — {_pso['factory']}"
+                            f"{fg_label(_pso['product'])} ({_pso['qty']:g} units) — responsible plant: {_pso['factory']}"
                         )
                     with psc2:
                         if st.button("Use ➡️", key=f"pi_use_so_{_pso['id']}", disabled=not _pi_can_create):
                             st.session_state["pi_pending_so_id"] = int(_pso["id"])
                             if _pso["product"] in FCSC_PRODUCTS:
                                 st.session_state["pi_product"] = _pso["product"]
-                            if _pso["factory"] in FACTORIES:
-                                st.session_state["pi_factory"] = _pso["factory"]
+                            # P0-10: the Sales Order's factory is a legacy tag and is NOT
+                            # used to pre-select the manufacturing factory — R&D chooses it
+                            # explicitly on the instruction.
                             st.session_state["pi_qty"] = float(_pso["qty"])
                             st.rerun()
                 st.markdown("---")
@@ -10769,7 +13111,9 @@ elif module == "Formulation":
                                                    list(_pi_bom_opts.keys()), key="pi_bom_pick")
                     pi_bom_id = _pi_bom_opts[_pi_bom_label]
             with pi3:
-                pi_factory = st.selectbox("Factory", FACTORIES, key="pi_factory")
+                pi_factory = st.selectbox("Manufacturing Factory", _FAC_CHOICES, key="pi_factory",
+                                          help="The factory chosen here is the manufacturing factory "
+                                               "of record for this order.")
 
             pi4, pi5, pi6 = st.columns(3)
             with pi4:
@@ -10833,10 +13177,13 @@ elif module == "Formulation":
                         if pi_id is None:
                             st.error(msg)
                         else:
-                            release_production_instruction(pi_id)
+                            _rel_ok, _rel_msg = release_production_instruction(pi_id)
                             st.session_state.pop("pi_pending_so_id", None)
-                            st.success(f"✅ **{msg}** released to Production.")
-                            st.rerun()
+                            if _rel_ok:
+                                st.success(f"✅ **{msg}** released to Production.")
+                                st.rerun()
+                            else:
+                                st.warning(f"**{msg}** was saved as Draft but could not be released: {_rel_msg}")
 
             st.markdown("---")
             st.subheader("All Production Instructions")
@@ -10863,9 +13210,12 @@ elif module == "Formulation":
                         if _pi["status"] == "Draft":
                             if st.button("🚀 Release to Production", key=f"pi_release_{_pi_id}",
                                           disabled=not _pi_can_create):
-                                release_production_instruction(_pi_id)
-                                st.success(f"✅ {_pi['instruction_no']} released to Production.")
-                                st.rerun()
+                                _rel_ok2, _rel_msg2 = release_production_instruction(_pi_id)
+                                if _rel_ok2:
+                                    st.success(f"✅ {_pi['instruction_no']} released to Production.")
+                                    st.rerun()
+                                else:
+                                    st.error(_rel_msg2)
                             if st.button("🚫 Cancel", key=f"pi_cancel_{_pi_id}",
                                           disabled=not _pi_can_create):
                                 cancel_production_instruction(_pi_id)
@@ -10878,6 +13228,15 @@ elif module == "Formulation":
                             pc1.metric("Produced (actual)", f"{_prog['produced']:g} {_prog['unit']}")
                             pc2.metric("Remaining", f"{_prog['remaining']:g} {_prog['unit']}")
                             pc3.metric("Batches", _prog["batch_count"])
+                            if _prog.get("unreconciled_batches"):
+                                st.warning(
+                                    "⚠️ Unit mismatch: " + "; ".join(
+                                        f"{b['batch_no']} recorded {b['quantity']:g} {b['quantity_unit']}"
+                                        for b in _prog["unreconciled_batches"]
+                                    ) + f" — could not be converted to this instruction's unit "
+                                        f"({_prog['unit']}) and is EXCLUDED from Produced/Remaining "
+                                        f"above. Verify and correct that batch's recorded quantity/unit."
+                                )
                             if not _prog["batches"].empty:
                                 _bshow = _prog["batches"].copy()
                                 _bshow["planned_qty"] = _bshow["planned_qty"].apply(
@@ -11417,6 +13776,32 @@ elif module == "Formulation":
                     width='stretch', hide_index=True
                 )
 
+                # FIX: there was no way to remove a factor once it existed —
+                # only "Save Factor" above, which can overwrite the *value*
+                # for a given (material, unit) pair but can't get rid of a
+                # factor entered against the wrong unit entirely. Wires up
+                # remove_material_unit_factor(), which already existed but
+                # had no caller anywhere in the UI.
+                st.caption("Remove a factor entered against the wrong unit:")
+                _uc_rm_options = {
+                    f"{r['material']} — {r['unit']} (factor {r['factor_to_base']})":
+                        (r["material"], r["unit"])
+                    for _, r in _uc_existing.iterrows()
+                }
+                _uc_rm_col1, _uc_rm_col2 = st.columns([3, 1])
+                with _uc_rm_col1:
+                    _uc_rm_choice = st.selectbox(
+                        "Factor to remove", list(_uc_rm_options.keys()), key="uc_factor_rm_pick"
+                    )
+                with _uc_rm_col2:
+                    st.write("")
+                    if st.button("🗑️ Remove", key="uc_factor_rm_btn",
+                                 disabled=not _uc_can_write):
+                        _uc_rm_mat, _uc_rm_unit = _uc_rm_options[_uc_rm_choice]
+                        remove_material_unit_factor(_uc_rm_mat, _uc_rm_unit)
+                        st.success(f"Removed the {_uc_rm_unit} factor for {_uc_rm_mat}.")
+                        st.rerun()
+
         st.markdown("---")
         st.markdown("#### 📤 Import Material Master (Excel / CSV)")
         st.caption("Columns expected: lab_code, name, procurement_code, category, status. "
@@ -11664,14 +14049,27 @@ elif module == "Formulation":
             st.info("No material codes saved yet.")
 
         st.markdown("#### Set / Update a Material's Code")
+        # FIX (P0-5E): this legacy editor called set_material_code() with no
+        # department gate at all — material codes are master data, and the
+        # newer Material Master tab it was superseded by is already gated
+        # to RD (_mm_can_write = _dept_allows("RD")); this legacy editor is
+        # gated the same way so it can't be used as a side door around that
+        # control. Admin/'All' still pass through _dept_allows itself.
+        _mc_can_write = _dept_allows("RD")
+        if not _mc_can_write:
+            st.info("🔒 Only R&D (or Admin) can set material codes.")
         mc1, mc2 = st.columns([2, 1])
         with mc1:
-            mc_material = st.selectbox("Material", MATERIALS, key="mc_material", format_func=material_label)
+            mc_material = st.selectbox("Material", MATERIALS, key="mc_material", format_func=material_label,
+                                        disabled=not _mc_can_write)
         with mc2:
             mc_code = st.text_input(
                 "Code", value=get_material_code(st.session_state.get("mc_material", MATERIALS[0])),
-                key="mc_code", placeholder="e.g. C0665/01")
-        if st.button("💾 Save Code", key="mc_save"):
+                key="mc_code", placeholder="e.g. C0665/01", disabled=not _mc_can_write)
+        if st.button("💾 Save Code", key="mc_save", disabled=not _mc_can_write):
+            if not _mc_can_write:
+                st.error("Only R&D (or Admin) can set material codes.")
+                st.stop()
             set_material_code(mc_material, mc_code)
             log_audit("UPDATE", "material_codes", mc_material, f"code={mc_code.strip()}")
             st.success(f"✅ {mc_material} → {mc_code.strip() or '(cleared)'}")
@@ -11682,19 +14080,36 @@ elif module == "Sand":
     st.title("🏗️ Sand Usage")
     tab_entry, tab_log, tab_edit_s = st.tabs(["➕ Log Sand", "📋 Records", "✏️ Edit Record"])
 
+    # FIX (P0-5B): Sand Add/Edit had no department gate at all — any
+    # logged-in department-scoped account could write raw-material usage
+    # records with no ownership control, unlike Stock/Stores. Sand is a raw
+    # material consumed into production, so it's gated the same way as
+    # Stores' other RM entries (_dept_allows("Stores")); Admin/'All' still
+    # pass through _dept_allows itself.
+    # ASSUMPTION: gated to "Stores" as the raw-material owning department —
+    # change to "Production" (or another department) if Sand usage is
+    # actually logged by Production at your factories instead.
+    _sand_can_write = _dept_allows("Stores")
+
     with tab_entry:
         st.subheader("New Sand Entry")
+        if not _sand_can_write:
+            st.info("🔒 Only Stores (or Admin) can log sand usage.")
         c1, c2 = st.columns(2)
         with c1:
-            s_date    = st.date_input("Date", value=today_ist(), key="s_d")
-            s_factory = st.selectbox("Factory", FACTORIES, key="s_f",
-                                      index=FACTORIES.index(factory) if factory in FACTORIES else 0)
+            s_date    = st.date_input("Date", value=today_ist(), key="s_d", disabled=not _sand_can_write)
+            s_factory = st.selectbox("Factory", _FAC_CHOICES, key="s_f",
+                                      index=_FAC_CHOICES.index(factory) if factory in _FAC_CHOICES else 0,
+                                      disabled=not _sand_can_write)
         with c2:
-            s_qty  = st.number_input("Quantity", min_value=0, step=1, key="s_q")
-            s_unit = st.selectbox("Unit", SAND_UNITS, key="s_unit")
-            s_type = st.selectbox("Sand Type", SAND_TYPES, key="s_t")
+            s_qty  = st.number_input("Quantity", min_value=0, step=1, key="s_q", disabled=not _sand_can_write)
+            s_unit = st.selectbox("Unit", SAND_UNITS, key="s_unit", disabled=not _sand_can_write)
+            s_type = st.selectbox("Sand Type", SAND_TYPES, key="s_t", disabled=not _sand_can_write)
 
-        if st.button("💾 Save Sand"):
+        if st.button("💾 Save Sand", disabled=not _sand_can_write):
+            if not _sand_can_write:
+                st.error("Only Stores (or Admin) can log sand usage.")
+                st.stop()
             if not s_qty:
                 st.warning("Please enter a quantity greater than 0.")
             else:
@@ -11776,25 +14191,35 @@ elif module == "Sand":
             sel_id  = opts[sel_label]
             sel_row = sand_df[sand_df["id"] == sel_id].iloc[0]
 
+            if not _sand_can_write:
+                st.info("🔒 Only Stores (or Admin) can edit sand records.")
+
             sc1, sc2 = st.columns(2)
             with sc1:
                 e_s_date    = st.date_input("Date",
-                    value=pd.to_datetime(sel_row["date"]).date(), key="e_s_d")
-                e_s_factory = st.selectbox("Factory", FACTORIES, key="e_s_f",
-                    index=FACTORIES.index(sel_row["factory"])
-                          if sel_row["factory"] in FACTORIES else 0,
+                    value=pd.to_datetime(sel_row["date"]).date(), key="e_s_d",
+                    disabled=not _sand_can_write)
+                e_s_factory = st.selectbox("Factory", _FAC_CHOICES, key="e_s_f",
+                    index=_FAC_CHOICES.index(sel_row["factory"])
+                          if sel_row["factory"] in _FAC_CHOICES else 0,
                     disabled=not _is_admin)
             with sc2:
                 e_s_qty  = st.number_input("Quantity",
-                    min_value=0, step=1, value=int(sel_row["qty"]), key="e_s_q")
+                    min_value=0, step=1, value=int(sel_row["qty"]), key="e_s_q",
+                    disabled=not _sand_can_write)
                 _s_cur_unit = sel_row.get("unit", "Bags (50 KG)") or "Bags (50 KG)"
                 e_s_unit = st.selectbox("Unit", SAND_UNITS, key="e_s_unit",
-                    index=SAND_UNITS.index(_s_cur_unit) if _s_cur_unit in SAND_UNITS else 0)
+                    index=SAND_UNITS.index(_s_cur_unit) if _s_cur_unit in SAND_UNITS else 0,
+                    disabled=not _sand_can_write)
                 e_s_type = st.selectbox("Sand Type", SAND_TYPES, key="e_s_t",
                     index=SAND_TYPES.index(sel_row["sand_type"])
-                          if sel_row["sand_type"] in SAND_TYPES else 0)
+                          if sel_row["sand_type"] in SAND_TYPES else 0,
+                    disabled=not _sand_can_write)
 
-            if st.button("💾 Update Sand Record", key="sand_upd_btn"):
+            if st.button("💾 Update Sand Record", key="sand_upd_btn", disabled=not _sand_can_write):
+                if not _sand_can_write:
+                    st.error("Only Stores (or Admin) can edit sand records.")
+                    st.stop()
                 if not e_s_qty:
                     st.warning("Quantity must be greater than 0.")
                 else:
@@ -11877,8 +14302,8 @@ elif module == "Stock":
         c1, c2, c3 = st.columns(3)
         with c1:
             st_date    = st.date_input("Date", value=today_ist(), key="stk_d")
-            st_factory = st.selectbox("Factory", FACTORIES, key="stk_f",
-                                       index=FACTORIES.index(factory) if factory in FACTORIES else 0)
+            st_factory = st.selectbox("Factory", _FAC_CHOICES, key="stk_f",
+                                       index=_FAC_CHOICES.index(factory) if factory in _FAC_CHOICES else 0)
         with c2:
             st_material = st.selectbox("Material", MATERIALS, key="stk_m", format_func=lab_code_label)
             _stk_lab_code = get_lab_code(st_material)
@@ -11903,8 +14328,17 @@ elif module == "Stock":
                 "SELECT closing_stock FROM stock WHERE factory=? AND material=? ORDER BY id DESC LIMIT 1",
                 conn, params=(st_factory, st_material)
             )
-            last_close = int(prev_row.iloc[0, 0]) if not prev_row.empty else 0
-            closing    = last_close + st_received - st_used
+            last_close = float(prev_row.iloc[0, 0]) if not prev_row.empty else 0.0
+            # FIX (P0-9): entered quantities are converted to the material's base
+            # unit; a unit with no conversion factor blocks the save.
+            _stk_f = get_material_unit_factor(st_material, st_unit)
+            _stk_unit_ok = _stk_f is not None
+            if not _stk_unit_ok:
+                st.error(f"⚠️ No conversion factor on file from **{st_unit}** to this material's "
+                         f"base unit (**{get_material_base_unit(st_material)}**). Set it in Stock → "
+                         "📇 Material Master → ⚖️ Unit Conversion Factors before logging stock in "
+                         "this unit.")
+            closing    = last_close + (st_received - st_used) * (_stk_f if _stk_unit_ok else 1.0)
             st.metric("Closing Stock Preview", f"{closing:,}",
                       delta="⚠️ Negative" if closing < 0 else None)
 
@@ -11936,7 +14370,8 @@ elif module == "Stock":
                     "to review if this is a genuine backdated correction."
                 )
 
-        _stock_can_save = _dept_allows("Stores") and bool(_stk_lab_code) and _stk_negative_ok
+        _stock_can_save = (_dept_allows("Stores") and bool(_stk_lab_code) and _stk_negative_ok
+                           and _stk_unit_ok)
         if not _dept_allows("Stores"):
             st.caption("🔒 Only Stores can log RM stock receipt/usage.")
         elif not _stk_lab_code:
@@ -11978,7 +14413,7 @@ elif module == "Stock":
                     recompute_stock_chain(st_factory, st_material)
                     log_audit("INSERT", "stock", "new",
                               f"{st_factory} | {st_material} ({st_code.strip() or 'no code'}) | closing={closing}")
-                    st.success(f"✅ {lab_code_label(st_material)} closing stock: {closing:,} units")
+                    st.success(f"✅ {lab_code_label(st_material)} closing stock: {closing:,.2f} {get_material_base_unit(st_material)}")
                     st.rerun()
             except sqlite3.Error as e:
                 st.error(f"Database error: {e}")
@@ -12122,7 +14557,7 @@ elif module == "Stock":
             for _mat in sorted(current["material"].unique()):
                 mrow1, mrow2 = st.columns([5, 1])
                 mrow1.markdown(f"🧱 **{lab_code_label(_mat)}**")
-                if mrow2.button("360° →", key=f"mat360_{_mat}", use_container_width=True):
+                if mrow2.button("360° →", key=f"mat360_{_mat}", width='stretch'):
                     open_detail_view("material", _mat)
 
             if HAS_PLOTLY and not current.empty:
@@ -12259,10 +14694,15 @@ elif module == "Stock":
                     if st.button("✅ Release Materials for Production", key=f"rel_go_{_ri['id']}",
                                  disabled=not _rel_can_release):
                         _rel_ok, _rel_msg = release_stores_materials(int(_ri["id"]))
-                        if _rel_ok:
-                            st.success(f"{_rel_msg}")
-                        else:
+                        if not _rel_ok:
                             st.error(_rel_msg)
+                        elif _rel_msg.startswith("⚠️"):
+                            # Partial reservation — Production is still blocked
+                            # (stores_released stays 0), so this is a warning,
+                            # not a success, however the button phrased it.
+                            st.warning(_rel_msg)
+                        else:
+                            st.success(_rel_msg)
                         st.rerun()
 
         st.markdown("---")
@@ -12313,8 +14753,8 @@ elif module == "Stock":
         with adjc1:
             adj_type = st.selectbox("Stock Type", ["FG", "RM"], key="adj_type",
                                      format_func=lambda v: "Finished Goods" if v == "FG" else "Raw Material")
-            adj_factory = st.selectbox("Factory", FACTORIES, key="adj_f",
-                                        index=FACTORIES.index(factory) if factory in FACTORIES else 0)
+            adj_factory = st.selectbox("Factory", _FAC_CHOICES, key="adj_f",
+                                        index=_FAC_CHOICES.index(factory) if factory in _FAC_CHOICES else 0)
         with adjc2:
             if adj_type == "FG":
                 adj_product = st.selectbox("Product", FCSC_PRODUCTS, key="adj_p", format_func=fg_label)
@@ -12918,7 +15358,7 @@ elif module == "Procurement":
 
             rl1, rl2, rl3 = st.columns(3)
             with rl1:
-                rl_factory = st.selectbox("Factory", FACTORIES, key="rl_factory")
+                rl_factory = st.selectbox("Factory", _FAC_CHOICES, key="rl_factory")
             with rl2:
                 rl_material = st.selectbox("Material", MATERIALS, key="rl_material", format_func=material_label)
             with rl3:
@@ -13135,7 +15575,7 @@ elif module == "Quality":
         with ic3:
             im_qty  = st.number_input("Quantity", min_value=0.0, step=1.0, key="im_qty")
             im_unit = st.selectbox("Unit", ["KG", "Bags", "Litres", "MT", "Barrel", "Units"], key="im_unit")
-            im_factory = st.selectbox("Factory", FACTORIES if _is_admin else [_user_factory], key="im_factory")
+            im_factory = st.selectbox("Factory", _FAC_CHOICES if _is_admin else [_user_factory], key="im_factory")
             im_date = st.date_input("Received Date", value=today_ist(), key="im_date")
 
         _q_can_stores = _dept_allows("Stores")
@@ -13145,10 +15585,14 @@ elif module == "Quality":
             if not im_supplier_final or not im_batch_no.strip():
                 st.warning("Supplier and batch number are required.")
             else:
-                rm_id = create_rm_batch(im_supplier_final, im_po.strip(), im_material,
-                                          im_batch_no.strip(), im_qty, im_unit, im_factory, im_date)
-                st.success(f"✅ Logged — RM-{rm_id:05d} — status: **Awaiting QC**")
-                st.rerun()
+                try:
+                    rm_id = create_rm_batch(im_supplier_final, im_po.strip(), im_material,
+                                              im_batch_no.strip(), im_qty, im_unit, im_factory, im_date)
+                except ValueError as _rm_ve:
+                    st.error(f"🛑 {_rm_ve}")
+                else:
+                    st.success(f"✅ Logged — RM-{rm_id:05d} — status: **Awaiting QC**")
+                    st.rerun()
 
         st.markdown("---")
         st.markdown("#### Recent Incoming Material")
@@ -13197,11 +15641,13 @@ elif module == "Quality":
                     if not _q_can_qc:
                         st.caption("🔒 Only QC can record an incoming inspection decision.")
                     if st.button("💾 Submit Inspection", key=f"iq_submit_{rm['id']}", disabled=not _q_can_qc):
-                        record_incoming_inspection(
+                        _iq_ok, _iq_result = record_incoming_inspection(
                             rm["id"], _iq_appearance, _iq_colour, _iq_moisture, _iq_particle,
                             _iq_remarks, _iq_decision, st.session_state.username
                         )
-                        if _iq_decision == "Pass":
+                        if not _iq_ok:
+                            st.error(_iq_result)
+                        elif _iq_decision == "Pass":
                             st.success(f"✅ RM-{rm['id']:05d} Approved — Stores can now issue this material.")
                         else:
                             st.error(f"🔴 RM-{rm['id']:05d} Rejected — blocked, Supplier Return Note generated, NCR raised.")
@@ -13212,20 +15658,62 @@ elif module == "Quality":
         sub_create, sub_all = st.tabs(["➕ Create Batch", "📋 All Batches"])
 
         with sub_create:
-            st.subheader("Create Production Batch")
-            st.caption("Only QC-Approved raw material batches can be selected — this is "
-                        "enforced server-side, not just hidden in the dropdown.")
+            # FIX (P0-1): this screen used to be a normal, everyday way to
+            # start production — production_instruction_id=None, falling
+            # back to whatever BOM is currently active — completely
+            # bypassing Sales Order → Production Instruction → Stores
+            # Release. That meant the entire chain this ERP was built around
+            # (SO → PI → Stores Reservation → Batch) was optional in
+            # practice. The normal way to start a batch is now exclusively
+            # Production → Production Instructions → Create (Next)
+            # Production Load, which enforces PI status, factory/product
+            # match, and a FULL Stores reservation before a batch can exist.
+            # This screen is kept only as an explicit, logged Admin
+            # exception (matching the pattern already used for Production →
+            # Legacy Direct Entry) — e.g. a genuine one-off where no PI
+            # makes sense (a trial/lab batch) — never as a routine option.
+            st.subheader("⚠️ Direct Batch Creation — Admin Correction Mode")
+            st.caption(
+                "This creates a QC-tracked Production Batch **without** a Production "
+                "Instruction — no Sales Order link, no formal Stores material "
+                "reservation, and no server-side check that Stores actually released "
+                "enough material. For normal work, start every batch from "
+                "**Production → 🧾 Production Instructions → Create (Next) Production "
+                "Load**, which enforces the full SO → PI → Stores Release → Batch chain."
+            )
+            _pb_legacy_admin_ok = _is_admin
+            if not _pb_legacy_admin_ok:
+                st.info("🔒 This direct-creation path is restricted to Administrators. "
+                        "Use Production → Production Instructions instead.")
+            _pb_legacy_correction_mode = False
+            if _pb_legacy_admin_ok:
+                _pb_legacy_correction_mode = st.checkbox(
+                    "🔓 Enable Correction Mode — I understand this batch will NOT be "
+                    "linked to a Sales Order or Production Instruction, and Stores "
+                    "material availability is not formally verified.",
+                    key="pb_correction_mode"
+                )
+                if not _pb_legacy_correction_mode:
+                    st.caption("Enable Correction Mode above to unlock this form.")
+            _pb_legacy_allowed = _pb_legacy_admin_ok and _pb_legacy_correction_mode
+            _pb_correction_reason = st.text_input(
+                "Correction Reason *", key="pb_correction_reason",
+                placeholder="e.g. One-off lab/trial batch with no Sales Order behind it",
+                disabled=not _pb_legacy_allowed
+            )
 
             pcb1, pcb2 = st.columns(2)
             with pcb1:
-                pb_product = st.selectbox("Product", FCSC_PRODUCTS, key="pb_product", format_func=fg_label)
+                pb_product = st.selectbox("Product", FCSC_PRODUCTS, key="pb_product",
+                                           format_func=fg_label, disabled=not _pb_legacy_allowed)
                 pb_formula = st.text_input("Formula / Recipe reference", key="pb_formula",
-                                             placeholder="e.g. TG3.0-STD-v2")
-                pb_factory = st.selectbox("Factory", FACTORIES if _is_admin else [_user_factory], key="pb_factory")
+                                             placeholder="e.g. TG3.0-STD-v2", disabled=not _pb_legacy_allowed)
+                pb_factory = st.selectbox("Factory", _FAC_CHOICES if _is_admin else [_user_factory],
+                                           key="pb_factory", disabled=not _pb_legacy_allowed)
             with pcb2:
-                pb_operator = st.text_input("Operator", key="pb_operator")
-                pb_machine  = st.text_input("Machine", key="pb_machine")
-                pb_shift    = st.selectbox("Shift", SHIFTS, key="pb_shift")
+                pb_operator = st.text_input("Operator", key="pb_operator", disabled=not _pb_legacy_allowed)
+                pb_machine  = st.text_input("Machine", key="pb_machine", disabled=not _pb_legacy_allowed)
+                pb_shift    = st.selectbox("Shift", SHIFTS, key="pb_shift", disabled=not _pb_legacy_allowed)
 
             st.caption("Output quantity (optional, but needed for an accurate Dispatch ↔ "
                        "Quality reconciliation later — without it, dispatches linked to this "
@@ -13233,10 +15721,11 @@ elif module == "Quality":
             pqc1, pqc2 = st.columns(2)
             with pqc1:
                 pb_out_qty = st.number_input("Output Quantity", min_value=0.0, step=1.0,
-                                              value=0.0, key="pb_out_qty")
+                                              value=0.0, key="pb_out_qty", disabled=not _pb_legacy_allowed)
             with pqc2:
                 pb_out_unit = st.selectbox(
-                    "Output Unit", ["Bags", "Pieces", "Drums", "KG", "MT"], key="pb_out_unit")
+                    "Output Unit", ["Bags", "Pieces", "Drums", "KG", "MT"], key="pb_out_unit",
+                    disabled=not _pb_legacy_allowed)
 
             _pb_bom = get_active_bom(pb_product)
             if _pb_bom is None:
@@ -13275,7 +15764,8 @@ elif module == "Quality":
                     for _, r in _approved_rm.iterrows()
                 }
                 _picked_labels = st.multiselect("Raw Materials Used (Approved only)",
-                                                  list(_rm_opts.keys()), key="pb_rm_pick")
+                                                  list(_rm_opts.keys()), key="pb_rm_pick",
+                                                  disabled=not _pb_legacy_allowed)
                 _selected_rm_ids = [_rm_opts[l] for l in _picked_labels]
                 _qty_used_map = {}
                 if _selected_rm_ids:
@@ -13283,16 +15773,17 @@ elif module == "Quality":
                     for rid in _selected_rm_ids:
                         _label = next(l for l, v in _rm_opts.items() if v == rid)
                         _qty_used_map[rid] = st.number_input(
-                            _label, min_value=0.0, step=1.0, key=f"pb_qty_{rid}")
+                            _label, min_value=0.0, step=1.0, key=f"pb_qty_{rid}",
+                            disabled=not _pb_legacy_allowed)
 
-            _q_can_production = _dept_allows("Production")
-            if not _q_can_production:
-                st.caption("🔒 Only Production can create a production batch.")
-            if st.button("🚀 Create Batch", key="pb_create", disabled=not _q_can_production):
+            if st.button("🚀 Create Batch (Direct — Admin Correction)", key="pb_create",
+                         disabled=not _pb_legacy_allowed):
                 if not pb_operator.strip():
                     st.warning("Operator is required.")
                 elif not _selected_rm_ids:
                     st.warning("Select at least one QC-Approved raw material batch.")
+                elif not _pb_correction_reason.strip():
+                    st.warning("A Correction Reason is required for a direct batch creation.")
                 else:
                     pb_id, result = create_production_batch(
                         pb_product, pb_formula.strip(), pb_factory, pb_operator.strip(),
@@ -13303,7 +15794,12 @@ elif module == "Quality":
                     if pb_id is None:
                         st.error(result)
                     else:
-                        st.success(f"✅ Batch **{result}** created — status: **Production Started**")
+                        log_audit("DIRECT_BATCH_CREATED", "production_batches", pb_id,
+                                  f"Admin direct creation (no PI) by "
+                                  f"{st.session_state.get('username', 'system')} — "
+                                  f"reason: {_pb_correction_reason.strip()}")
+                        st.success(f"✅ Batch **{result}** created — status: **Production Started** "
+                                   f"(direct/admin — no Production Instruction).")
                         st.rerun()
 
         with sub_all:
@@ -13366,9 +15862,12 @@ elif module == "Quality":
                     if not _q_can_qc_pq:
                         st.caption("🔒 Only QC can record a Process QC decision.")
                     if st.button("💾 Submit", key=f"pq_submit_{pb['id']}", disabled=not _q_can_qc_pq):
-                        record_process_inspection(pb["id"], _pq_visc, _pq_dens, _pq_temp,
-                                                    _pq_app, _pq_remarks, _pq_decision, st.session_state.username)
-                        if _pq_decision == "Pass":
+                        _pq_ok, _pq_result = record_process_inspection(
+                            pb["id"], _pq_visc, _pq_dens, _pq_temp,
+                            _pq_app, _pq_remarks, _pq_decision, st.session_state.username)
+                        if not _pq_ok:
+                            st.error(_pq_result)
+                        elif _pq_decision == "Pass":
                             st.success(f"✅ {pb['batch_no']} → Process QC Passed")
                         else:
                             st.error(f"🛑 {pb['batch_no']} → On Hold — NCR raised")
@@ -13401,9 +15900,12 @@ elif module == "Quality":
                     if not _q_can_qc_fg:
                         st.caption("🔒 Only QC can record a Finished Goods QC decision.")
                     if st.button("💾 Submit", key=f"fg_submit_{pb['id']}", disabled=not _q_can_qc_fg):
-                        record_fg_inspection(pb["id"], _fg_adh, _fg_str, _fg_con, _fg_col, _fg_wt,
-                                              _fg_decision, st.session_state.username)
-                        if _fg_decision == "Pass":
+                        _fg_ok, _fg_result = record_fg_inspection(
+                            pb["id"], _fg_adh, _fg_str, _fg_con, _fg_col, _fg_wt,
+                            _fg_decision, st.session_state.username)
+                        if not _fg_ok:
+                            st.error(_fg_result)
+                        elif _fg_decision == "Pass":
                             st.success(f"✅ {pb['batch_no']} → FG QC Passed")
                         else:
                             st.error(f"🛑 {pb['batch_no']} → Rejected — NCR raised")
@@ -13435,10 +15937,12 @@ elif module == "Quality":
                     if not _q_can_qc_pk:
                         st.caption("🔒 Only QC can record a Packing QC decision.")
                     if st.button("💾 Submit", key=f"pk_submit_{pb['id']}", disabled=not _q_can_qc_pk):
-                        _insp_id, _fg_msg = record_packing_inspection(
+                        _pk_ok, _pk_result, _fg_msg = record_packing_inspection(
                             pb["id"], _pk_bag, _pk_label, _pk_batch,
                             _pk_wt_ok, _pk_seal, st.session_state.username)
-                        if all([_pk_bag, _pk_label, _pk_batch, _pk_wt_ok, _pk_seal]):
+                        if not _pk_ok:
+                            st.error(_pk_result)
+                        elif all([_pk_bag, _pk_label, _pk_batch, _pk_wt_ok, _pk_seal]):
                             st.success(f"✅ {pb['batch_no']} → Packing QC Passed")
                             if _fg_msg:
                                 st.info(_fg_msg)
@@ -13465,8 +15969,11 @@ elif module == "Quality":
                     if not _q_can_qc_pdi:
                         st.caption("🔒 Only QC can record the Pre-Dispatch Inspection.")
                     if st.button("💾 Submit", key=f"pdi_submit_{pb['id']}", disabled=not _q_can_qc_pdi):
-                        record_dispatch_approval(pb["id"], _pdi_done, st.session_state.username)
-                        if _pdi_done:
+                        _pdi_ok, _pdi_result = record_dispatch_approval(
+                            pb["id"], _pdi_done, st.session_state.username)
+                        if not _pdi_ok:
+                            st.error(_pdi_result)
+                        elif _pdi_done:
                             st.success(f"✅ {pb['batch_no']} → Dispatch Approved")
                         else:
                             st.error(f"🛑 {pb['batch_no']} → Dispatch Blocked")
@@ -13482,25 +15989,28 @@ elif module == "Quality":
         # That let QC silently bypass the entire Dispatch module. Removed.
         # QC's only remaining action for a cleared batch is to see it listed
         # here as evidence PDI passed -- picking it up for an actual dispatch
-        # transaction is the Dispatch module's job (Phase C will make that
-        # module batch-aware; today it still dispatches by product+qty, see
-        # Dispatch → Add Dispatch).
-        _cleared_q = "SELECT * FROM production_batches WHERE status='Dispatch Approved'" + \
+        # transaction is the Dispatch module's job. (Phase 1: Dispatch is now
+        # batch-aware end to end — see create_dispatch() / Dispatch → Add
+        # Dispatch, which requires selecting one of these batches.)
+        _cleared_q = ("SELECT *, (COALESCE(quantity,0) - COALESCE(dispatched_qty,0)) AS remaining_qty "
+                      "FROM production_batches WHERE status IN ('Dispatch Approved','Partially Dispatched')") + \
                       (" AND factory=?" if _q_factory_filter else "") + " ORDER BY id"
         _cleared = pd.read_sql_query(_cleared_q, conn, params=(_q_factory_filter,) if _q_factory_filter else ())
         if _cleared.empty:
             st.caption("No batches currently cleared and waiting to leave the factory.")
         else:
             st.caption(
-                "These batches have passed PDI and are cleared for dispatch. "
+                "These batches have passed PDI and have quantity still available to dispatch. "
                 "QC/PDI cannot dispatch goods, generate challans, or deduct FG "
                 "stock — that happens in the Dispatch module."
             )
             for _, pb in _cleared.iterrows():
+                _remaining_txt = (f" — {pb['remaining_qty']:g} {pb['quantity_unit']} remaining"
+                                   if pb.get("quantity") else "")
                 st.markdown(
-                    f"{status_pill('Ready for Dispatch', 'success')} &nbsp; "
+                    f"{status_pill(pb['status'], 'success')} &nbsp; "
                     f"<code style='font-size:12.5px;'>{pb['batch_no']}</code> — "
-                    f"{fg_label(pb['product'])} @ {pb['factory']}",
+                    f"{fg_label(pb['product'])} @ {pb['factory']}{_remaining_txt}",
                     unsafe_allow_html=True
                 )
 
@@ -13527,6 +16037,32 @@ elif module == "Quality":
                         log_audit("UPDATE", "ncr_capa", ncr["id"], "NCR closed")
                         st.success("NCR closed.")
                         st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### 🔁 Batches awaiting recovery (On Hold / Rejected / Rework / Dispatch Blocked)")
+        _held_df = pd.read_sql_query(
+            "SELECT id, batch_no, product, factory, status FROM production_batches "
+            "WHERE status IN ('On Hold','Rejected','Rework','Dispatch Blocked') "
+            + ("AND factory=? " if _q_factory_filter else "") + "ORDER BY id DESC",
+            conn, params=((_q_factory_filter,) if _q_factory_filter else ()))
+        if _held_df.empty:
+            st.caption("No batches are currently held.")
+        else:
+            for _, _hb in _held_df.iterrows():
+                _opts = get_batch_recovery_options(_hb["status"])
+                with st.expander(f"{_hb['batch_no']} — {fg_label(_hb['product'])} — {_hb['status']}"):
+                    _rc_reason = st.text_area("Reason / corrective action (required)",
+                                              key=f"rcv_reason_{_hb['id']}")
+                    for _act, _desc, _adm in _opts:
+                        _lbl = f"{_desc}" + (" (Admin)" if _adm else "")
+                        if st.button(_lbl, key=f"rcv_{_act}_{_hb['id']}",
+                                     disabled=(_adm and not _is_admin)):
+                            _rc_ok, _rc_msg = authorise_batch_recovery(int(_hb["id"]), _act, _rc_reason)
+                            if _rc_ok:
+                                st.success(_rc_msg)
+                                st.rerun()
+                            else:
+                                st.error(_rc_msg)
 
         st.markdown("---")
         st.markdown("#### Closed NCRs (recent)")
@@ -13727,11 +16263,17 @@ elif module == "Dispatch":
 
     with tab_entry:
         st.subheader("New Dispatch Entry")
+        st.caption(
+            "🔒 FIX (P0-9/10): a Production Batch is now REQUIRED for every dispatch — the old "
+            "'not batch-tracked' option is gone, so Dispatch can no longer skip Pre-Dispatch "
+            "Inspection (PDI). Batch, Sales Order and FG Stock quantities all move together in "
+            "one transaction when you save."
+        )
         c1, c2, c3 = st.columns(3)
         with c1:
             sl_date    = st.date_input("Date", value=today_ist(), key="sl_d")
-            sl_factory = st.selectbox("Factory", FACTORIES, key="sl_f",
-                                       index=FACTORIES.index(factory) if factory in FACTORIES else 0)
+            sl_factory = st.selectbox("Factory", _FAC_CHOICES, key="sl_f",
+                                       index=_FAC_CHOICES.index(factory) if factory in _FAC_CHOICES else 0)
             # Customer dropdown from master, with manual fallback
             _sl_cust_opts = ["— Type below —"] + CUSTOMER_LIST
             _sl_cust_pick = st.selectbox("Customer (from master)", _sl_cust_opts, key="sl_cust_pick")
@@ -13739,28 +16281,49 @@ elif module == "Dispatch":
                                             placeholder="New / one-time customer")
             sl_cust = _sl_cust_pick if _sl_cust_pick != "— Type below —" else sl_cust_manual.strip()
         with c2:
-            sl_product    = st.selectbox("Product", FCSC_PRODUCTS, key="sl_p_sel", format_func=fg_label)
-            sl_custom_prd = st.text_input("Custom name (if 'Other / Custom')", key="sl_p_cust")
-            sl_qty        = st.number_input("Qty", min_value=0, step=1, key="sl_q")
-            sl_price      = st.number_input("Unit Price (₹)", min_value=0.0, step=0.01,
-                                             format="%.2f", key="sl_p")
-            # Optional link to a QC-cleared batch, for Dispatch <-> Quality
-            # reconciliation. Purely optional — leaving it unset just means
-            # that reconciliation falls back to a factory+product proxy match.
+            # FIX (P0-9): the Production Batch is now selected FIRST and
+            # drives Product — dispatch is "ship this specific QC-cleared
+            # batch", not "log a product+qty and optionally tag a batch
+            # after the fact". Only batches that have passed PDI (or are
+            # already partway dispatched with quantity left) are offered.
             _sl_batch_opts = pd.read_sql_query(
-                "SELECT id, batch_no, product FROM production_batches "
-                "WHERE factory=? AND status IN ('Dispatch Approved','Dispatched') "
-                "ORDER BY id DESC LIMIT 50", conn, params=(sl_factory,)
+                "SELECT id, batch_no, product, quantity, quantity_unit, COALESCE(dispatched_qty,0) AS dispatched_qty "
+                "FROM production_batches "
+                "WHERE factory=? AND status IN ('Dispatch Approved','Partially Dispatched') "
+                "AND quantity IS NOT NULL AND quantity > COALESCE(dispatched_qty,0) "
+                "ORDER BY id DESC LIMIT 100", conn, params=(sl_factory,)
             )
-            _sl_batch_map = {"— None / not batch-tracked —": None}
-            _sl_batch_map.update({
-                f"{r['batch_no']} ({r['product']})": r["id"] for _, r in _sl_batch_opts.iterrows()
-            })
-            sl_batch_label = st.selectbox("Link to QC Batch (optional)", list(_sl_batch_map.keys()),
-                                           key="sl_batch_link",
-                                           help="Links this dispatch to a QC-cleared production batch "
-                                                "for accurate Dispatch <-> Quality reconciliation.")
-            sl_batch_id = _sl_batch_map[sl_batch_label]
+            if _sl_batch_opts.empty:
+                st.warning("No PDI-cleared batches with undispatched quantity at this factory yet.")
+                sl_batch_id = None
+                sl_product = None
+                _sl_batch_available = 0.0
+                _sl_batch_unit = ""
+            else:
+                _sl_batch_map = {
+                    f"{r['batch_no']} — {fg_label(r['product'])} "
+                    f"({r['quantity'] - r['dispatched_qty']:g} {r['quantity_unit']} available)": r["id"]
+                    for _, r in _sl_batch_opts.iterrows()
+                }
+                sl_batch_label = st.selectbox("Production Batch *", list(_sl_batch_map.keys()),
+                                               key="sl_batch_link",
+                                               help="Only batches that have passed PDI (Dispatch "
+                                                    "Approved) and still have undispatched quantity "
+                                                    "are listed.")
+                sl_batch_id = _sl_batch_map[sl_batch_label]
+                _sl_row = _sl_batch_opts[_sl_batch_opts["id"] == sl_batch_id].iloc[0]
+                sl_product = _sl_row["product"]
+                _sl_batch_available = float(_sl_row["quantity"] - _sl_row["dispatched_qty"])
+                _sl_batch_unit = _sl_row["quantity_unit"]
+                st.caption(f"Product: **{fg_label(sl_product)}** (fixed by the selected batch)")
+            sl_qty = st.number_input(
+                f"Qty to dispatch{f' ({_sl_batch_unit})' if sl_batch_id else ''}",
+                min_value=0.0, step=1.0, key="sl_q",
+                help=(f"Up to {_sl_batch_available:g} {_sl_batch_unit} remaining on this batch."
+                      if sl_batch_id else None)
+            )
+            sl_price = st.number_input("Unit Price (₹)", min_value=0.0, step=0.01,
+                                        format="%.2f", key="sl_p")
         with c3:
             sl_status   = st.selectbox("Payment Status",
                                         ["Paid","Pending","Partial","Overdue"], key="sl_s")
@@ -13782,66 +16345,45 @@ elif module == "Dispatch":
         _dispatch_can_save = _dept_allows("Dispatch")
         if not _dispatch_can_save:
             st.caption("🔒 Only Dispatch can record a dispatch.")
+        # Negative-stock / over-SO override — surfaced as its own explicit
+        # checkbox rather than folded silently into a normal save, matching
+        # the "not a normal Dispatch option" rule (P0-12).
+        _sl_force_override = False
+        _sl_override_reason = ""
+        if _is_admin:
+            _sl_force_override = st.checkbox(
+                "Allow this dispatch even if it exceeds available FG stock or the linked Sales "
+                "Order's remaining balance (e.g. an authorized backdated correction)",
+                key="sl_force_negative", value=False
+            )
+            if _sl_force_override:
+                _sl_override_reason = st.text_input(
+                    "Override reason * (audited)", key="sl_override_reason",
+                    placeholder="Why is this over-dispatch authorized?")
+        else:
+            st.caption("ℹ️ A dispatch that exceeds FG stock or the Sales Order balance can only be "
+                       "authorized by an Administrator.")
         if st.button("💾 Save Dispatch", disabled=not _dispatch_can_save):
-            final_sl_product = (sl_custom_prd.strip()
-                                if sl_product == "Other / Custom" and sl_custom_prd.strip()
-                                else sl_product)
-            if not sl_cust.strip() or not final_sl_product or final_sl_product == "Other / Custom":
-                st.warning("Customer and product are required.")
+            if not sl_batch_id:
+                st.warning("Select a Production Batch to dispatch against.")
+            elif not sl_cust.strip():
+                st.warning("Customer is required.")
+            elif sl_qty <= 0:
+                st.warning("Enter a dispatch quantity greater than zero.")
             else:
-                dup = pd.read_sql_query(
-                    "SELECT id FROM sales WHERE date=? AND factory=? AND customer=? AND product=?",
-                    conn, params=(str(sl_date), sl_factory, sl_cust.strip(), final_sl_product)
+                _new_sale_id, _dispatch_msg = create_dispatch(
+                    date_val=sl_date, factory=sl_factory, customer=sl_cust, product=sl_product,
+                    qty=sl_qty, price=sl_price, status=sl_status, challan_no=sl_challan,
+                    gstin=sl_gstin, hsn_code=sl_hsn, gst_rate=sl_gst_rate,
+                    production_batch_id=sl_batch_id,
+                    allow_negative_override=_sl_force_override,
+                    override_reason=_sl_override_reason
                 )
-                if not dup.empty:
-                    st.warning(
-                        f"⚠️ A dispatch of **{final_sl_product}** to **{sl_cust}** at "
-                        f"**{sl_factory}** on **{sl_date}** already exists. "
-                        f"Use the ✏️ Edit tab to modify it."
-                    )
+                if _new_sale_id is None:
+                    st.error(_dispatch_msg)
                 else:
-                    # Dispatch -> FG Stock OUT (Section 4 of the reconciliation spec):
-                    # flag/require override rather than silently allowing negative
-                    # FG stock, since a genuine backdated correction is legitimate.
-                    _sl_available = get_fg_closing_stock(sl_factory, final_sl_product)
-                    _sl_override_needed = sl_qty > _sl_available
-                    _sl_proceed = True
-                    if _sl_override_needed:
-                        st.error(
-                            f"🚨 **Dispatch exceeds available FG stock** — "
-                            f"{final_sl_product} @ {sl_factory}: available {_sl_available:,.2f}, "
-                            f"dispatching {sl_qty:,.2f}. This will push FG stock negative."
-                        )
-                        _sl_proceed = st.checkbox(
-                            "Proceed anyway (e.g. backdated entry, opening stock not yet logged)",
-                            key="sl_force_negative"
-                        )
-                    if not _sl_proceed:
-                        st.stop()
-                    try:
-                        cur.execute(
-                            "INSERT INTO sales(date,factory,customer,product,qty,price,total,"
-                            "status,challan_no,gstin,hsn_code,gst_rate,production_batch_id)"
-                            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                            (str(sl_date), sl_factory, sl_cust,
-                             final_sl_product, sl_qty, sl_price, round(sl_total, 2),
-                             sl_status, sl_challan.strip(),
-                             sl_gstin.strip(), sl_hsn.strip(), sl_gst_rate, sl_batch_id)
-                        )
-                        conn.commit()
-                        _new_sale_id = cur.lastrowid
-                        log_audit("INSERT", "sales", "new",
-                                  f"{sl_factory} | {final_sl_product} | {sl_cust} | {fmt_inr(sl_total)} | {sl_status}")
-                        _new_fg_closing = record_fg_stock_movement(
-                            sl_date, sl_factory, final_sl_product,
-                            dispatch_out=sl_qty, source_module="Dispatch",
-                            source_ref_id=_new_sale_id
-                        )
-                        st.success(f"✅ Dispatch saved — {fmt_inr(sl_total)} | {sl_cust} | {sl_status} | "
-                                   f"FG Stock now {_new_fg_closing:,.2f}")
-                        st.rerun()
-                    except sqlite3.Error as e:
-                        st.error(f"Database error: {e}")
+                    st.success(_dispatch_msg)
+                    st.rerun()
 
     with tab_log:
         st.subheader("Dispatch Records")
@@ -13868,19 +16410,9 @@ elif module == "Dispatch":
             st.dataframe(disp.drop(columns=["id"], errors="ignore"),
                          width='stretch', hide_index=True, height=320)
 
-            def _on_dispatch_deleted(_row) -> None:
-                # Section 8: deleting a Dispatch record must not leave an
-                # orphaned FG stock movement behind.
-                _closing = reverse_fg_stock_for_source(
-                    _row["factory"], _row["product"], "Dispatch", int(_row["id"]))
-                if _closing is not None:
-                    log_audit("REVERSE", "fg_stock", int(_row["id"]),
-                              f"Dispatch #{int(_row['id'])} deleted — FG stock movement "
-                              f"reversed | {_row['factory']} | {_row['product']} | "
-                              f"FG stock now {_closing:,.2f}")
-
+            # P0-10: one transaction, one commit — see delete_dispatch().
             delete_row_ui(sales_df, "sales", "customer", "sales",
-                           on_delete=_on_dispatch_deleted)
+                           delete_fn=delete_dispatch)
 
             if HAS_PLOTLY and not sales_df.empty:
                 ca, cb = st.columns(2)
@@ -13917,6 +16449,13 @@ elif module == "Dispatch":
 
     with tab_edit_sl:
         st.subheader("Edit a Dispatch Record")
+        # FIX (P0-34): this screen used to have no department gate at all —
+        # "New Dispatch" was restricted to the Dispatch department but
+        # editing an existing one wasn't, an inconsistency an audit flagged
+        # directly. Same gate as the Add tab now applies here too.
+        _sl_edit_can_save = _dept_allows("Dispatch")
+        if not _sl_edit_can_save:
+            st.caption("🔒 Only Dispatch can edit a dispatch record.")
         if sales_df.empty:
             st.info("No records to edit in the current date range.")
         else:
@@ -13928,27 +16467,54 @@ elif module == "Dispatch":
                                       key="sl_edit_sel")
             sel_id  = opts[sel_label]
             sel_row = sales_df[sales_df["id"] == sel_id].iloc[0]
+            _sl_edit_pb_id = sel_row.get("production_batch_id")
+            _sl_edit_has_batch = _sl_edit_pb_id is not None and not pd.isna(_sl_edit_pb_id)
+
+            # FIX (P0-10/18/19): Product and the linked Production Batch are
+            # no longer editable here — both are what tie this dispatch to a
+            # specific batch's dispatched_qty and (if linked) a Sales
+            # Order's dispatched_qty. Changing either behind those totals'
+            # backs would silently desync them. Only Qty, price and the
+            # commercial/admin fields can be changed; a batch change means
+            # delete + re-dispatch against the new batch instead.
+            _sl_edit_bno = "not linked"
+            if _sl_edit_has_batch:
+                _bno_row = cur.execute(
+                    "SELECT batch_no FROM production_batches WHERE id=?", (int(_sl_edit_pb_id),)
+                ).fetchone()
+                _sl_edit_bno = _bno_row[0] if _bno_row else f"id {int(_sl_edit_pb_id)}"
+            st.caption(f"Batch: **{_sl_edit_bno}** · Product: **{fg_label(sel_row['product'])}** — "
+                       "neither can be changed here. To move this dispatch to a different batch or "
+                       "product, delete this record (Records tab) and create a new dispatch instead.")
 
             slc1, slc2, slc3 = st.columns(3)
             with slc1:
                 e_sl_date    = st.date_input("Date",
                     value=pd.to_datetime(sel_row["date"]).date(), key="e_sl_d")
-                e_sl_factory = st.selectbox("Factory", FACTORIES, key="e_sl_f",
-                    index=FACTORIES.index(sel_row["factory"])
-                          if sel_row["factory"] in FACTORIES else 0,
-                    disabled=not _is_admin)
+                e_sl_factory = st.selectbox("Factory", _FAC_CHOICES, key="e_sl_f",
+                    index=_FAC_CHOICES.index(sel_row["factory"])
+                          if sel_row["factory"] in _FAC_CHOICES else 0,
+                    disabled=True,
+                    help="Factory is fixed to the linked batch's factory and can't be changed here.")
                 e_sl_cust    = st.text_input("Customer",
                     value=sel_row["customer"], key="e_sl_cust")
             with slc2:
-                cur_sl_prod_idx = FCSC_PRODUCTS.index(sel_row["product"]) \
-                                  if sel_row["product"] in FCSC_PRODUCTS else len(FCSC_PRODUCTS) - 1
-                e_sl_product    = st.selectbox("Product", FCSC_PRODUCTS, key="e_sl_p_sel",
-                    index=cur_sl_prod_idx, format_func=fg_label)
-                e_sl_custom_prd = st.text_input("Custom name (if Other / Custom)",
-                    value=sel_row["product"] if sel_row["product"] not in FCSC_PRODUCTS else "",
-                    key="e_sl_p_cust")
+                st.text_input("Product", value=fg_label(sel_row["product"]), disabled=True)
+                _sl_edit_max_qty = float(sel_row["qty"])
+                if _sl_edit_has_batch:
+                    _pb_row = cur.execute(
+                        "SELECT quantity, COALESCE(dispatched_qty,0) FROM production_batches WHERE id=?",
+                        (int(_sl_edit_pb_id),)
+                    ).fetchone()
+                    if _pb_row and _pb_row[0]:
+                        # room = what's left on the batch EXCLUDING this dispatch's
+                        # own current qty (since editing "reclaims" it first)
+                        _sl_edit_max_qty = (_pb_row[0] - _pb_row[1]) + float(sel_row["qty"])
                 e_sl_qty   = st.number_input("Qty",
-                    min_value=0, step=1, value=int(sel_row["qty"]), key="e_sl_q")
+                    min_value=0.0, max_value=max(_sl_edit_max_qty, float(sel_row["qty"])),
+                    step=1.0, value=float(sel_row["qty"]), key="e_sl_q",
+                    help=(f"Capped at {_sl_edit_max_qty:g} — what the linked batch has available "
+                          f"including this dispatch's current share." if _sl_edit_has_batch else None))
                 e_sl_price = st.number_input("Unit Price (₹)",
                     min_value=0.0, step=0.01, format="%.2f",
                     value=float(sel_row["price"]), key="e_sl_p")
@@ -13972,49 +16538,32 @@ elif module == "Dispatch":
                 e_sl_total = e_sl_qty * e_sl_price
                 st.metric("Updated Total (excl. GST)", fmt_inr(e_sl_total))
 
-            if st.button("💾 Update Sale", key="sl_upd_btn"):
-                final_e_product = (e_sl_custom_prd.strip()
-                                   if e_sl_product == "Other / Custom" and e_sl_custom_prd.strip()
-                                   else e_sl_product)
-                if not e_sl_cust.strip() or not final_e_product or final_e_product == "Other / Custom":
-                    st.warning("Customer and product are required.")
+            _e_sl_override = False
+            _e_sl_override_reason = ""
+            if _is_admin:
+                with st.expander("🛡️ Admin override (edit beyond FG stock / Sales Order balance)"):
+                    _e_sl_override = st.checkbox("Authorize this edit even if it exceeds FG stock or "
+                                                 "the Sales Order balance", key="e_sl_override")
+                    _e_sl_override_reason = st.text_input("Override reason (required)",
+                                                          key="e_sl_override_reason")
+            if st.button("💾 Update Sale", key="sl_upd_btn", disabled=not _sl_edit_can_save):
+                # FIX (P0-5): all validation + all writes (sales row, FG ledger,
+                # batch, Sales Order) happen inside update_dispatch() in ONE
+                # transaction — no direct SQL here.
+                try:
+                    _upd_ok, _upd_msg = update_dispatch(
+                        int(sel_id), date_val=e_sl_date, customer=e_sl_cust, qty=e_sl_qty,
+                        price=e_sl_price, status=e_sl_status, challan_no=e_sl_challan,
+                        gstin=e_sl_gstin, hsn_code=e_sl_hsn, gst_rate=e_sl_gst_rate,
+                        allow_negative_override=_e_sl_override,
+                        override_reason=_e_sl_override_reason)
+                except sqlite3.Error as e:
+                    _upd_ok, _upd_msg = False, f"Database error: {e}"
+                if _upd_ok:
+                    st.success(f"✅ {_upd_msg}")
+                    st.rerun()
                 else:
-                    try:
-                        cur.execute(
-                            "UPDATE sales SET date=?,factory=?,customer=?,"
-                            "product=?,qty=?,price=?,total=?,status=?,challan_no=?,"
-                            "gstin=?,hsn_code=?,gst_rate=? WHERE id=?",
-                            (str(e_sl_date), e_sl_factory, e_sl_cust,
-                             final_e_product, e_sl_qty, e_sl_price,
-                             round(e_sl_total, 2), e_sl_status,
-                             e_sl_challan.strip(), e_sl_gstin.strip(),
-                             e_sl_hsn.strip(), e_sl_gst_rate, sel_id)
-                        )
-                        conn.commit()
-                        log_audit("UPDATE", "sales", sel_id,
-                                  f"{e_sl_factory} | {final_e_product} | {e_sl_cust} | {fmt_inr(e_sl_total)} | {e_sl_status}")
-                        # Section 8: an edit must correct FG Stock too — reverse the
-                        # old dispatch-out movement (posted under the *old*
-                        # factory/product, in case those changed) then apply the new
-                        # one, so the final FG impact reflects only the new quantity.
-                        reverse_fg_stock_for_source(
-                            sel_row["factory"], sel_row["product"], "Dispatch", int(sel_id))
-                        _e_sl_fg_closing = record_fg_stock_movement(
-                            e_sl_date, e_sl_factory, final_e_product,
-                            dispatch_out=e_sl_qty, source_module="Dispatch",
-                            source_ref_id=int(sel_id), movement_type="Correction"
-                        )
-                        st.success(f"✅ Sale record updated — FG Stock for {final_e_product} "
-                                   f"@ {e_sl_factory} now {_e_sl_fg_closing:,.2f}.")
-                        if _e_sl_fg_closing < 0:
-                            st.warning(
-                                "⚠️ This edit has pushed FG stock negative for "
-                                f"{final_e_product} @ {e_sl_factory}. Review the dispatch "
-                                "quantity or log the missing opening/production stock."
-                            )
-                        st.rerun()
-                    except sqlite3.Error as e:
-                        st.error(f"Database error: {e}")
+                    st.error(_upd_msg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -14028,10 +16577,13 @@ elif module == "Reconciliation":
                "surfaced for investigation, never auto-corrected.")
 
     rc_f1, rc_f2 = st.columns([1, 1])
+    # P0-5: only Admin may choose "All"; everyone else is pinned to their own
+    # factory (and run_all_reconciliations() re-enforces this server-side).
+    _rc_fac_options = ([ALL_FACTORIES] + FACTORIES) if _is_admin else _factory_choices()
     with rc_f1:
-        rc_fac = st.selectbox("Factory", [ALL_FACTORIES] + FACTORIES, key="rc_fac",
-                               index=([ALL_FACTORIES] + FACTORIES).index(factory)
-                               if factory in ([ALL_FACTORIES] + FACTORIES) else 0)
+        rc_fac = st.selectbox("Factory", _rc_fac_options, key="rc_fac",
+                               index=_rc_fac_options.index(factory)
+                               if factory in _rc_fac_options else 0)
     with rc_f2:
         rc_days = st.selectbox("Period", [7, 14, 30, 90], index=2, key="rc_days",
                                 format_func=lambda d: f"Last {d} days")
@@ -14094,8 +16646,9 @@ elif module == "Reconciliation":
 
     with tab_history:
         st.subheader("Reconciliation History")
-        _rc_hist_clause = " WHERE factory=?" if rc_fac != ALL_FACTORIES else ""
-        _rc_hist_param  = (rc_fac,) if rc_fac != ALL_FACTORIES else ()
+        _rc_hist_scope  = _effective_factory_filter(None if rc_fac == ALL_FACTORIES else rc_fac)
+        _rc_hist_clause = " WHERE factory=?" if _rc_hist_scope else ""
+        _rc_hist_param  = (_rc_hist_scope,) if _rc_hist_scope else ()
         _rc_hist = pd.read_sql_query(
             "SELECT check_type, factory, item_code, period_start, period_end, "
             "qty_source_a, qty_source_b, difference, severity, detail, checked_at "
@@ -14141,8 +16694,8 @@ elif module == "Sales":
         c1, c2, c3 = st.columns(3)
         with c1:
             so_date    = st.date_input("Date", value=today_ist(), key="so_d")
-            st.caption(f"📍 Logged under **{so_factory}** — the manufacturing plant is "
-                      "decided later by R&D/Production, not by Sales.")
+            st.caption(f"📍 Responsible plant (legacy tag): **{so_factory}** — the manufacturing "
+                      "plant is decided later by R&D on the Production Instruction, not by Sales.")
             # Customer dropdown from master
             _so_cust_opts = ["— Type below —"] + CUSTOMER_LIST
             _so_cust_pick = st.selectbox("Customer (from master)", _so_cust_opts, key="so_cust_pick")
@@ -14153,8 +16706,20 @@ elif module == "Sales":
         with c2:
             so_product    = st.selectbox("Product", FCSC_PRODUCTS, key="so_p_sel", format_func=fg_label)
             so_custom_prd = st.text_input("Custom name (if 'Other / Custom')", key="so_p_cust")
+            _so_default_unit = get_fg_stock_unit_cfg(so_product)["stock_unit"] \
+                                if so_product != "Other / Custom" else DEFAULT_FG_STOCK_UNIT
             so_qty        = st.number_input("Quantity", min_value=0, step=1, key="so_qty")
-            so_price      = st.number_input("Unit Price (₹)", min_value=0.0,
+            # FIX (P0-2): the customer's order must record what unit "so_qty"
+            # is actually in — a bare number was ambiguous (10 MT vs 10
+            # Bags vs 10 KG are very different orders). Defaults to the
+            # product's own configured FG stock unit, but is editable so a
+            # customer who genuinely ordered in MT (say) can be recorded
+            # that way.
+            so_unit       = st.selectbox(
+                "Unit", FG_UNIT_OPTIONS, key="so_unit",
+                index=FG_UNIT_OPTIONS.index(_so_default_unit) if _so_default_unit in FG_UNIT_OPTIONS else 0
+            )
+            so_price      = st.number_input(f"Unit Price (₹ per {so_unit})", min_value=0.0,
                                              step=0.01, format="%.2f", key="so_price")
         with c3:
             # Sales rep — free-text with autocomplete from past entries
@@ -14217,17 +16782,18 @@ elif module == "Sales":
                         cur.execute(
                             "INSERT INTO sales_orders"
                             "(date,factory,customer,sales_rep,product,unit_price,qty,total,"
-                            "gstin,hsn_code,gst_rate)"
-                            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                            "gstin,hsn_code,gst_rate,ordered_unit)"
+                            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                             (str(so_date), so_factory, so_cust.strip(), so_rep,
                              final_so_product, so_price, so_qty, round(so_total, 2),
-                             so_gstin.strip(), so_hsn.strip(), so_gst_rate)
+                             so_gstin.strip(), so_hsn.strip(), so_gst_rate, so_unit)
                         )
                         conn.commit()
                         log_audit("INSERT", "sales_orders", "new",
                                   f"{so_factory} | {final_so_product} | {so_cust} "
-                                  f"| {so_rep} | {fmt_inr(so_total)}")
-                        st.success(f"✅ Order saved — {fmt_inr(so_total)} | {so_cust} via {so_rep}")
+                                  f"| {so_rep} | {so_qty:g} {so_unit} | {fmt_inr(so_total)}")
+                        st.success(f"✅ Order saved — {so_qty:g} {so_unit} | {fmt_inr(so_total)} "
+                                   f"| {so_cust} via {so_rep}")
                         st.rerun()
                     except sqlite3.Error as e:
                         st.error(f"Database error: {e}")
@@ -14315,47 +16881,73 @@ elif module == "Sales":
             sel_so_id  = opts_so[sel_so_label]
             sel_so_row = so_df[so_df["id"] == sel_so_id].iloc[0]
 
+            # P0-7: lifecycle lock. The backend (update_sales_order) is the real
+            # enforcement; these flags only grey out the matching inputs.
+            _e_lvl, _e_why = get_so_lock_level(int(sel_so_id))
+            _e_lock_commercial = _e_lvl != "open"
+            _e_lock_all        = _e_lvl == "full"
+            if _e_lvl == "full":
+                st.error(f"🔒 **Fully locked** — {_e_why} This order can't be edited in place. "
+                         "Corrections need an amendment / cancel-and-replace.")
+            elif _e_lvl == "commercial":
+                st.warning(f"🔒 **Commercial fields locked** — {_e_why} Customer, product, quantity, "
+                           "unit, price, GST and HSN can't change; date, sales rep and GSTIN still can.")
+
             ec1, ec2, ec3 = st.columns(3)
             with ec1:
                 e_so_date    = st.date_input("Date",
-                    value=pd.to_datetime(sel_so_row["date"]).date(), key="e_so_d")
-                # Section 9: Sales does not decide the manufacturing factory —
-                # the value is preserved as-is (not editable from Sales) so
-                # historical records/reports keep working; R&D/Production own
-                # factory allocation via the Production Instruction instead.
+                    value=pd.to_datetime(sel_so_row["date"]).date(), key="e_so_d",
+                    disabled=_e_lock_all)
+                # P0-10: sales_orders.factory is a LEGACY "responsible plant" tag —
+                # read-only, and no longer the manufacturing-factory assignment.
+                # The Production Instruction (R&D / authorised planner) decides
+                # where the order is actually made.
                 e_so_factory = sel_so_row["factory"]
-                st.caption(f"📍 Factory on file: **{e_so_factory or '—'}** — not editable "
-                          "here; manufacturing plant is decided by R&D/Production.")
+                _e_mfg_fac = get_manufacturing_factory(int(sel_so_id))
+                st.caption(f"📍 Responsible plant (legacy tag): **{e_so_factory or '—'}** — read-only. "
+                          + (f"Manufacturing plant (from Production Instruction): **{_e_mfg_fac}**."
+                             if _e_mfg_fac else
+                             "Manufacturing plant is decided by R&D on the Production Instruction."))
                 e_so_cust = st.text_input("Customer",
-                    value=sel_so_row["customer"], key="e_so_cust")
+                    value=sel_so_row["customer"], key="e_so_cust", disabled=_e_lock_commercial)
             with ec2:
                 cur_so_idx = FCSC_PRODUCTS.index(sel_so_row["product"]) \
                              if sel_so_row["product"] in FCSC_PRODUCTS else len(FCSC_PRODUCTS) - 1
                 e_so_product    = st.selectbox("Product", FCSC_PRODUCTS,
-                    index=cur_so_idx, key="e_so_p_sel", format_func=fg_label)
+                    index=cur_so_idx, key="e_so_p_sel", format_func=fg_label,
+                    disabled=_e_lock_commercial)
                 e_so_custom_prd = st.text_input("Custom name (if Other / Custom)",
                     value=sel_so_row["product"] if sel_so_row["product"] not in FCSC_PRODUCTS else "",
-                    key="e_so_p_cust")
+                    key="e_so_p_cust", disabled=_e_lock_commercial)
                 e_so_qty   = st.number_input("Quantity", min_value=0, step=1,
-                    value=int(sel_so_row["qty"]), key="e_so_qty")
-                e_so_price = st.number_input("Unit Price (₹)", min_value=0.0,
+                    value=int(sel_so_row["qty"]), key="e_so_qty", disabled=_e_lock_commercial)
+                _e_so_cur_unit = sel_so_row.get("ordered_unit") or DEFAULT_FG_STOCK_UNIT
+                e_so_unit  = st.selectbox("Unit", FG_UNIT_OPTIONS, key="e_so_unit",
+                    index=FG_UNIT_OPTIONS.index(_e_so_cur_unit) if _e_so_cur_unit in FG_UNIT_OPTIONS else 0,
+                    disabled=_e_lock_commercial)
+                e_so_price = st.number_input(f"Unit Price (₹ per {e_so_unit})", min_value=0.0,
                     step=0.01, format="%.2f",
-                    value=float(sel_so_row["unit_price"]), key="e_so_price")
+                    value=float(sel_so_row["unit_price"]), key="e_so_price",
+                    disabled=_e_lock_commercial)
             with ec3:
                 e_so_rep      = st.text_input("Sales Representative",
-                    value=sel_so_row["sales_rep"], key="e_so_rep")
+                    value=sel_so_row["sales_rep"], key="e_so_rep", disabled=_e_lock_all)
                 e_so_gstin    = st.text_input("Customer GSTIN",
-                    value=str(sel_so_row.get("gstin","") or ""), key="e_so_gstin")
+                    value=str(sel_so_row.get("gstin","") or ""), key="e_so_gstin", disabled=_e_lock_all)
                 e_so_hsn      = st.text_input("HSN Code",
-                    value=str(sel_so_row.get("hsn_code","") or ""), key="e_so_hsn")
+                    value=str(sel_so_row.get("hsn_code","") or ""), key="e_so_hsn",
+                    disabled=_e_lock_commercial)
                 _e_so_gst_cur = float(sel_so_row.get("gst_rate", 18.0) or 18.0)
                 e_so_gst_rate = st.selectbox("GST Rate (%)", GST_RATES,
                     index=GST_RATES.index(_e_so_gst_cur) if _e_so_gst_cur in GST_RATES else 2,
-                    key="e_so_gst_rate")
+                    key="e_so_gst_rate", disabled=_e_lock_commercial)
                 e_so_total = e_so_qty * e_so_price
                 st.metric("Updated Total (excl. GST)", fmt_inr(e_so_total))
 
-            if st.button("💾 Update Sales Order", key="so_upd_btn"):
+            _so_edit_can_save = _dept_allows("Sales") and not _e_lock_all
+            if not _dept_allows("Sales"):
+                st.caption("🔒 Only Sales can edit a Sales Order.")
+            if st.button("💾 Update Sales Order", key="so_upd_btn", disabled=not _so_edit_can_save):
                 final_e_so_product = (e_so_custom_prd.strip()
                                       if e_so_product == "Other / Custom" and e_so_custom_prd.strip()
                                       else e_so_product)
@@ -14365,24 +16957,18 @@ elif module == "Sales":
                     st.warning("Sales representative is required.")
                 else:
                     try:
-                        cur.execute(
-                            "UPDATE sales_orders SET date=?,factory=?,customer=?,"
-                            "sales_rep=?,product=?,unit_price=?,qty=?,total=?,"
-                            "gstin=?,hsn_code=?,gst_rate=? WHERE id=?",
-                            (str(e_so_date), e_so_factory, e_so_cust.strip(),
-                             e_so_rep.strip(), final_e_so_product,
-                             e_so_price, e_so_qty, round(e_so_total, 2),
-                             e_so_gstin.strip(), e_so_hsn.strip(),
-                             e_so_gst_rate, sel_so_id)
-                        )
-                        conn.commit()
-                        log_audit("UPDATE", "sales_orders", sel_so_id,
-                                  f"{e_so_factory} | {final_e_so_product} | "
-                                  f"{e_so_cust} | {e_so_rep} | {fmt_inr(e_so_total)}")
-                        st.success("✅ Sales order updated.")
-                        st.rerun()
+                        _upd_ok, _upd_msg = update_sales_order(
+                            int(sel_so_id), date_val=e_so_date, customer=e_so_cust,
+                            sales_rep=e_so_rep, product=final_e_so_product,
+                            unit_price=e_so_price, qty=e_so_qty, gstin=e_so_gstin,
+                            hsn_code=e_so_hsn, gst_rate=e_so_gst_rate, ordered_unit=e_so_unit)
                     except sqlite3.Error as e:
-                        st.error(f"Database error: {e}")
+                        _upd_ok, _upd_msg = False, f"Database error: {e}"
+                    if _upd_ok:
+                        st.success("✅ " + _upd_msg)
+                        st.rerun()
+                    else:
+                        st.error(_upd_msg)
 
     with tab_targets:
         st.subheader("🎯 Monthly Sales Targets")
@@ -14520,7 +17106,12 @@ elif module == "Sales":
                     "Edit COMPANY_INFO near the top of the file with your real GSTIN before "
                     "using these for actual customer-facing invoices.")
 
-        _all_so = pd.read_sql_query("SELECT * FROM sales_orders ORDER BY id DESC", conn)
+        # P0-6: a non-admin only ever sees (and can invoice) their own factory's
+        # orders; generate_invoice_pdf() re-checks ownership itself.
+        _all_so = pd.read_sql_query(
+            "SELECT * FROM sales_orders" + ("" if _is_admin else " WHERE factory = ?") + " ORDER BY id DESC",
+            conn, params=(() if _is_admin else (_user_factory or "__NO_FACTORY__",))
+        )
         if _all_so.empty:
             st.info("No sales orders yet.")
         else:
@@ -14649,16 +17240,29 @@ elif module == "Sales":
         else:
             _wo_disp = _wo_pipeline_df.copy()
             _wo_disp["product"] = _wo_disp["product"].apply(fg_label)
+            # FIX (P0-8): "Status" (wo_status) and "Production" (production_status)
+            # are shown as two separate columns now that they're tracked
+            # separately — an order can be Production Complete while its
+            # fulfilment Status is still Instruction Created/Partially
+            # Dispatched, and that distinction is the whole point of the fix.
+            _wo_disp["production_status"] = _wo_disp.get("production_status", "Pending").fillna("Pending")
+            _wo_disp["dispatched_qty"] = _wo_disp.get("dispatched_qty", 0.0).fillna(0.0)
             st.dataframe(
-                _wo_disp[["id", "customer", "product", "qty", "factory", "wo_status"]]
+                _wo_disp[["id", "customer", "product", "qty", "dispatched_qty", "factory",
+                          "wo_status", "production_status"]]
                     .rename(columns={"id": "Order #", "customer": "Customer", "product": "Product",
-                                      "qty": "Qty", "factory": "Factory", "wo_status": "Status"}),
+                                      "qty": "Ordered", "dispatched_qty": "Dispatched",
+                                      "factory": "Factory", "wo_status": "Fulfilment Status",
+                                      "production_status": "Production"}),
                 width='stretch', hide_index=True, height=320
             )
             st.caption(
-                "**Sent to Production** → waiting for R&D to issue a Production Instruction · "
-                "**Instruction Created** → formula/quantity locked, waiting for QC + Stores · "
-                "**In Production** → a batch is running · **Completed** → batch dispatched."
+                "**Fulfilment Status** — Sent to Production → waiting for R&D to issue a Production "
+                "Instruction · Instruction Created → formula/quantity locked, waiting for QC + Stores · "
+                "Partially Dispatched → some of this order has shipped · Completed → the full ordered "
+                "quantity has actually been dispatched.  \n"
+                "**Production** — Pending → no batch started yet · In Production → a batch is running · "
+                "Production Complete → the required quantity has been made (not necessarily shipped yet)."
             )
 
 
@@ -14670,21 +17274,41 @@ elif module == "Cost":
     st.title("🔖 Cost Entry")
     tab_entry, tab_log, tab_edit_co = st.tabs(["➕ Add Cost", "📋 Records", "✏️ Edit Record"])
 
+    # FIX (P0-5D): Cost Add/Edit had no department gate, and the factory
+    # selector let a non-admin, department-scoped user post a cost entry
+    # against ANY factory. Cost/financial data doesn't belong to any of the
+    # existing RD/QC/Production/Stores/Sales/Dispatch departments, so this
+    # is restricted to Admin / legacy 'All' accounts only — calling
+    # _dept_allows() with no allowed-department arguments does exactly
+    # that (it still always passes for Admin/'All', and always fails for
+    # any single department-scoped account, by the same rule every other
+    # _dept_allows(...) call in this app already uses).
+    # ASSUMPTION: if specific departments (e.g. a future "Finance" or
+    # "Admin" department) should be able to post costs too, add them here:
+    # _dept_allows("Finance") etc.
+    _cost_can_write = _dept_allows()
+
     with tab_entry:
         st.subheader("New Cost Entry")
+        if not _cost_can_write:
+            st.info("🔒 Only Admin can add cost entries.")
         c1, c2, c3 = st.columns(3)
         with c1:
-            co_date    = st.date_input("Date", value=today_ist(), key="co_d")
-            co_factory = st.selectbox("Factory", FACTORIES, key="co_f",
-                                       index=FACTORIES.index(factory) if factory in FACTORIES else 0)
+            co_date    = st.date_input("Date", value=today_ist(), key="co_d", disabled=not _cost_can_write)
+            co_factory = st.selectbox("Factory", _FAC_CHOICES, key="co_f",
+                                       index=_FAC_CHOICES.index(factory) if factory in _FAC_CHOICES else 0,
+                                       disabled=not _cost_can_write)
         with c2:
-            co_cat = st.selectbox("Category", COST_CATS, key="co_cat")
+            co_cat = st.selectbox("Category", COST_CATS, key="co_cat", disabled=not _cost_can_write)
             co_amt = st.number_input("Amount (₹)", min_value=0.0, step=1.0,
-                                      format="%.2f", key="co_amt")
+                                      format="%.2f", key="co_amt", disabled=not _cost_can_write)
         with c3:
-            co_desc = st.text_input("Description (optional)", key="co_desc")
+            co_desc = st.text_input("Description (optional)", key="co_desc", disabled=not _cost_can_write)
 
-        if st.button("💾 Save Cost"):
+        if st.button("💾 Save Cost", disabled=not _cost_can_write):
+            if not _cost_can_write:
+                st.error("Only Admin can add cost entries.")
+                st.stop()
             if not co_amt:
                 st.warning("Please enter an amount greater than 0.")
             else:
@@ -14777,26 +17401,35 @@ elif module == "Cost":
             sel_co_id  = opts_co[sel_co_label]
             sel_co_row = cost_df[cost_df["id"] == sel_co_id].iloc[0]
 
+            if not _cost_can_write:
+                st.info("🔒 Only Admin can edit cost entries.")
+
             cc1, cc2 = st.columns(2)
             with cc1:
                 e_co_date    = st.date_input("Date",
-                    value=pd.to_datetime(sel_co_row["date"]).date(), key="e_co_d")
-                e_co_factory = st.selectbox("Factory", FACTORIES, key="e_co_f",
-                    index=FACTORIES.index(sel_co_row["factory"])
-                          if sel_co_row["factory"] in FACTORIES else 0,
+                    value=pd.to_datetime(sel_co_row["date"]).date(), key="e_co_d",
+                    disabled=not _cost_can_write)
+                e_co_factory = st.selectbox("Factory", _FAC_CHOICES, key="e_co_f",
+                    index=_FAC_CHOICES.index(sel_co_row["factory"])
+                          if sel_co_row["factory"] in _FAC_CHOICES else 0,
                     disabled=not _is_admin)
             with cc2:
                 e_co_cat = st.selectbox("Category", COST_CATS, key="e_co_cat",
                     index=COST_CATS.index(sel_co_row["category"])
-                          if sel_co_row["category"] in COST_CATS else 0)
+                          if sel_co_row["category"] in COST_CATS else 0,
+                    disabled=not _cost_can_write)
                 e_co_amt = st.number_input("Amount (₹)",
                     min_value=0.0, step=1.0, format="%.2f",
-                    value=float(sel_co_row["amount"]), key="e_co_amt")
+                    value=float(sel_co_row["amount"]), key="e_co_amt",
+                    disabled=not _cost_can_write)
             e_co_desc = st.text_input("Description",
                 value=str(sel_co_row.get("description", "") or ""),
-                key="e_co_desc")
+                key="e_co_desc", disabled=not _cost_can_write)
 
-            if st.button("💾 Update Cost Record", key="co_upd_btn"):
+            if st.button("💾 Update Cost Record", key="co_upd_btn", disabled=not _cost_can_write):
+                if not _cost_can_write:
+                    st.error("Only Admin can edit cost entries.")
+                    st.stop()
                 if not e_co_amt:
                     st.warning("Amount must be greater than 0.")
                 else:
@@ -15466,7 +18099,7 @@ elif module == "Customers":
                 crow1, crow2, crow3 = st.columns([4, 3, 1])
                 crow1.markdown(f"🏢 **{_cr['name']}**")
                 crow2.caption(_cr.get("gstin") or "No GSTIN on file")
-                if crow3.button("360° →", key=f"cust360_{_cr['id']}", use_container_width=True):
+                if crow3.button("360° →", key=f"cust360_{_cr['id']}", width='stretch'):
                     open_detail_view("customer", _cr["name"])
 
             delete_row_ui(cust_all, "customers", "name", "cust")
