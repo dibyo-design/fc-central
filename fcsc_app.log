@@ -1,0 +1,111 @@
+2026-07-09 12:39:05,634 [WARNING] Low-stock scan query failed: Execution failed on sql '
+            SELECT s.factory, s.material, s.closing_stock,
+                   COALESCE(s.unit, '') AS unit
+            FROM stock s
+            INNER JOIN (
+                SELECT factory, material, MAX(date) AS max_date
+                FROM stock GROUP BY factory, material
+            ) latest
+            ON s.factory = latest.factory AND s.material = latest.material
+               AND s.date = latest.max_date
+        ': no such column: s.unit
+2026-07-09 12:39:48,523 [WARNING] Low-stock scan query failed: Execution failed on sql '
+            SELECT s.factory, s.material, s.closing_stock,
+                   COALESCE(s.unit, '') AS unit
+            FROM stock s
+            INNER JOIN (
+                SELECT factory, material, MAX(date) AS max_date
+                FROM stock GROUP BY factory, material
+            ) latest
+            ON s.factory = latest.factory AND s.material = latest.material
+               AND s.date = latest.max_date
+        ': no such column: s.unit
+2026-07-09 12:43:05,961 [WARNING] Low-stock scan query failed: Execution failed on sql '
+            SELECT s.factory, s.material, s.closing_stock,
+                   COALESCE(s.unit, '') AS unit
+            FROM stock s
+            INNER JOIN (
+                SELECT factory, material, MAX(date) AS max_date
+                FROM stock GROUP BY factory, material
+            ) latest
+            ON s.factory = latest.factory AND s.material = latest.material
+               AND s.date = latest.max_date
+        ': no such column: s.unit
+2026-07-09 12:45:34,952 [WARNING] Low-stock scan query failed: Execution failed on sql '
+            SELECT s.factory, s.material, s.closing_stock,
+                   COALESCE(s.unit, '') AS unit
+            FROM stock s
+            INNER JOIN (
+                SELECT factory, material, MAX(date) AS max_date
+                FROM stock GROUP BY factory, material
+            ) latest
+            ON s.factory = latest.factory AND s.material = latest.material
+               AND s.date = latest.max_date
+        ': no such column: s.unit
+2026-07-09 12:48:57,027 [WARNING] Low-stock scan query failed: Execution failed on sql '
+            SELECT s.factory, s.material, s.closing_stock,
+                   COALESCE(s.unit, '') AS unit
+            FROM stock s
+            INNER JOIN (
+                SELECT factory, material, MAX(date) AS max_date
+                FROM stock GROUP BY factory, material
+            ) latest
+            ON s.factory = latest.factory AND s.material = latest.material
+               AND s.date = latest.max_date
+        ': no such column: s.unit
+2026-07-09 14:59:27,549 [WARNING] Low-stock scan query failed: Execution failed on sql '
+            SELECT s.factory, s.material, s.closing_stock,
+                   COALESCE(s.unit, '') AS unit
+            FROM stock s
+            INNER JOIN (
+                SELECT factory, material, MAX(date) AS max_date
+                FROM stock GROUP BY factory, material
+            ) latest
+            ON s.factory = latest.factory AND s.material = latest.material
+               AND s.date = latest.max_date
+        ': no such column: s.unit
+2026-07-10 11:55:12,739 [WARNING] Low-stock scan query failed: Execution failed on sql '
+            SELECT s.factory, s.material, s.closing_stock,
+                   COALESCE(s.unit, '') AS unit
+            FROM stock s
+            INNER JOIN (
+                SELECT factory, material, MAX(date) AS max_date
+                FROM stock GROUP BY factory, material
+            ) latest
+            ON s.factory = latest.factory AND s.material = latest.material
+               AND s.date = latest.max_date
+        ': no such column: s.unit
+2026-07-13 13:40:18,317 [WARNING] Procurement alert email failed: (535, b'5.7.8 Username and Password not accepted. For more information, go to\n5.7.8  https://support.google.com/mail/?p=BadCredentials 5a478bee46e88-311b00048a3sm38252278eec.5 - gsmtp')
+2026-07-13 13:40:53,716 [WARNING] Procurement alert email failed: (535, b'5.7.8 Username and Password not accepted. For more information, go to\n5.7.8  https://support.google.com/mail/?p=BadCredentials a92af1059eb24-13ba16d46dfsm2965888c88.7 - gsmtp')
+2026-07-13 13:46:22,963 [WARNING] Procurement alert email failed: (535, b'5.7.8 Username and Password not accepted. For more information, go to\n5.7.8  https://support.google.com/mail/?p=BadCredentials 5a478bee46e88-313c50c70c9sm24291754eec.29 - gsmtp')
+2026-07-13 13:48:00,653 [WARNING] Procurement alert email failed: (535, b'5.7.8 Username and Password not accepted. For more information, go to\n5.7.8  https://support.google.com/mail/?p=BadCredentials 5a478bee46e88-311935fd091sm46813545eec.24 - gsmtp')
+2026-07-13 14:04:05,981 [WARNING] Procurement alert email failed: (535, b'5.7.8 Username and Password not accepted. For more information, go to\n5.7.8  https://support.google.com/mail/?p=BadCredentials 5a478bee46e88-3117462f5c7sm73824165eec.0 - gsmtp')
+2026-07-20 12:38:06,394 [WARNING] Logo asset not loaded (C:\Users\dibyo\OneDrive\Desktop\operations_project\assets\fcsc_logo.png): [Errno 2] No such file or directory: 'C:\\Users\\dibyo\\OneDrive\\Desktop\\operations_project\\assets\\fcsc_logo.png'
+2026-07-20 12:43:14,422 [WARNING] Logo asset not found. Checked: ['C:\\Users\\dibyo\\OneDrive\\Desktop\\operations_project\\assets\\fcsc_logo.png', 'C:\\Users\\dibyo\\OneDrive\\Desktop\\operations_project\\fcsc_logo.png', 'C:\\Users\\dibyo\\OneDrive\\Desktop\\operations_project\\assets\\fcsc_logo.png', 'C:\\Users\\dibyo\\OneDrive\\Desktop\\operations_project\\fcsc_logo.png']
+2026-07-20 14:36:02,147 [ERROR] Task exception was never retrieved
+future: <Task finished name='Task-7613' coro=<WebSocketProtocol13.write_message.<locals>.wrapper() done, defined at C:\Users\dibyo\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\tornado\websocket.py:1111> exception=WebSocketClosedError()>
+Traceback (most recent call last):
+  File "C:\Users\dibyo\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\tornado\websocket.py", line 1113, in wrapper
+    await fut
+tornado.iostream.StreamClosedError: Stream is closed
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\dibyo\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\tornado\websocket.py", line 1115, in wrapper
+    raise WebSocketClosedError()
+tornado.websocket.WebSocketClosedError
+2026-07-20 14:36:03,454 [ERROR] Task exception was never retrieved
+future: <Task finished name='Task-7636' coro=<WebSocketProtocol13.write_message.<locals>.wrapper() done, defined at C:\Users\dibyo\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\tornado\websocket.py:1111> exception=WebSocketClosedError()>
+Traceback (most recent call last):
+  File "C:\Users\dibyo\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\tornado\websocket.py", line 1113, in wrapper
+    await fut
+tornado.iostream.StreamClosedError: Stream is closed
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\dibyo\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\tornado\websocket.py", line 1115, in wrapper
+    raise WebSocketClosedError()
+tornado.websocket.WebSocketClosedError
+2026-08-20 13:19:58,861 [WARNING] Migration failed: ALTER TABLE sales ADD COLUMN gstin       TEXT DEFAULT '' | not an error
