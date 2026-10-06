@@ -1,3 +1,7 @@
+# FC Central -- FCSC ERP
+# Crafted by Dibyo Chattopadhyay.
+__author__ = "Dibyo Chattopadhyay"
+
 import streamlit as st
 import pandas as pd
 import sqlite3
@@ -105,6 +109,26 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("fcsc_erp")
+
+# NEW: authorship credit ("crafted by" + handwritten signature). The signature
+# image lives in its own module (fcsc_signature.py) so ~36 KB of base64 doesn't
+# sit in this file. Degrades to a text-only credit if the module isn't deployed
+# next to app.py, the same way reportlab / qrcode / Twilio degrade here.
+try:
+    from fcsc_signature import (
+        CREDIT_NAME as _CREDIT_NAME,
+        credit_line as _credit_line,
+        signature_html as _signature_html,
+    )
+except ImportError:
+    _CREDIT_NAME = "Dibyo Chattopadhyay"
+
+    def _credit_line() -> str:
+        return f"FC Central | Crafted by {_CREDIT_NAME}"
+
+    def _signature_html(**_kw) -> str:
+        return ("<div style='text-align:center;margin-top:0.9rem;font-size:11px;"
+                f"font-style:italic;opacity:.8;'>crafted by {_CREDIT_NAME}</div>")
 
 # ================= CONFIG =================
 st.set_page_config(page_title="FCSC ERP", layout="wide", page_icon="🏺")
@@ -751,13 +775,14 @@ except sqlite3.OperationalError as _e:
     if "duplicate column name" not in str(_e).lower():
         raise
 
-DEPARTMENTS = ["All", "RD", "QC", "Production", "Stores", "Sales", "Dispatch", "Admin"]
+DEPARTMENTS = ["All", "RD", "QC", "Production", "Stores", "Procurement", "Sales", "Dispatch", "Admin"]
 DEPARTMENT_LABELS = {
     "All":        "All Departments (full access within factory)",
     "RD":         "R&D / Formulation",
     "QC":         "Quality Control",
     "Production": "Production",
     "Stores":     "Stores",
+    "Procurement": "Procurement",
     "Sales":      "Sales",
     "Dispatch":   "Dispatch",
     "Admin":      "Administrator",
@@ -2197,10 +2222,11 @@ def show_login_page() -> None:
                     else:
                         st.error(f"Invalid username or password. {remaining} attempt(s) remaining.")
 
-        st.markdown("""
+        st.markdown(f"""
             <div class='fcsc-login-footer'>
                 Contact your administrator if you have trouble logging in.
                 <div class='fcsc-login-company'>FIRSTCHOICE SPECIALITY CHEMICALS PVT. LTD.</div>
+                {_signature_html(height_px=44, label_color="#B8860B")}
             </div>
           </div>
         </div>
@@ -2803,6 +2829,86 @@ def _safe_add_column(table: str, coldef: str) -> None:
 
 _safe_add_column("fg_stock", "movement_type TEXT DEFAULT 'Entry'")
 _safe_add_column("production_batches", "quantity REAL")
+
+# ── Audit fixtures: procurement state machine / RM lot integrity / SO cancel /
+#    formula-variance control ────────────────────────────────────────────────
+_safe_add_column("procurement_requests", "po_reference TEXT DEFAULT ''")
+_safe_add_column("procurement_requests", "approved_by TEXT DEFAULT ''")
+_safe_add_column("procurement_requests", "reorder_target REAL DEFAULT 0")
+_safe_add_column("reorder_levels", "reorder_target REAL DEFAULT 0")
+_safe_add_column("rm_batches", "procurement_request_id INTEGER")
+_safe_add_column("procurement_requests", "cancelled_qty REAL DEFAULT 0")   # base unit; PO balance ledger
+_safe_add_column("sales_orders", "cancel_reason TEXT DEFAULT ''")
+cur.executescript("""
+CREATE TABLE IF NOT EXISTS production_deviations (
+    id                        INTEGER PRIMARY KEY,
+    signature                 TEXT NOT NULL,
+    production_instruction_id INTEGER,
+    product                   TEXT,
+    factory                   TEXT,
+    material                  TEXT,
+    expected_qty              REAL,
+    actual_qty                REAL,
+    unit                      TEXT,
+    variance_pct              REAL,
+    reason                    TEXT,
+    raised_by                 TEXT,
+    raised_at                 TEXT,
+    status                    TEXT DEFAULT 'Pending',  -- Pending | Approved | Rejected | Consumed
+    approved_by               TEXT,
+    approved_at               TEXT,
+    approval_note             TEXT,
+    production_batch_id       INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_prod_dev_sig ON production_deviations(signature, status);
+CREATE TABLE IF NOT EXISTS batch_variance_log (
+    id                  INTEGER PRIMARY KEY,
+    production_batch_id INTEGER NOT NULL,
+    material            TEXT,
+    expected_qty        REAL,
+    actual_qty          REAL,
+    unit                TEXT,
+    variance_pct        REAL,
+    band                TEXT,       -- Normal | Warning | Deviation
+    reason              TEXT,
+    raised_by           TEXT,
+    approved_by         TEXT,
+    created_at          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_batch_var_pb ON batch_variance_log(production_batch_id);
+""")
+conn.commit()
+cur.executescript("""
+CREATE TABLE IF NOT EXISTS po_ledger (
+    id          INTEGER PRIMARY KEY,
+    request_id  INTEGER NOT NULL,
+    event       TEXT NOT NULL,     -- Ordered | Received | QC Approved | QC Rejected | Cancelled
+    qty_base    REAL,
+    unit        TEXT,
+    ref         TEXT,
+    by_user     TEXT,
+    at          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_po_ledger_req ON po_ledger(request_id);
+""")
+conn.commit()
+# One PO number per factory (normalised). Legacy duplicates leave the index unbuilt; the service-layer
+# check in set_procurement_po() still blocks new duplicates.
+try:
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_proc_po_factory ON procurement_requests"
+                "(factory, UPPER(TRIM(po_reference))) WHERE COALESCE(TRIM(po_reference),'')<>''")
+    conn.commit()
+except sqlite3.DatabaseError as _po_idx_err:
+    logger.warning("Unique PO index not created (existing duplicate POs?): %s", _po_idx_err)
+# Business-level supplier-lot identity: one physical lot is received once.
+# If legacy data already contains duplicates the index cannot be built; the
+# server-side check in create_rm_batch() still enforces it for new receipts.
+try:
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_rm_batches_lot ON rm_batches"
+                "(factory, material, UPPER(TRIM(supplier)), UPPER(TRIM(batch_no)))")
+    conn.commit()
+except sqlite3.DatabaseError as _lot_idx_err:
+    logger.warning("Unique RM-lot index not created (existing duplicate lots?): %s", _lot_idx_err)
 _safe_add_column("production_batches", "quantity_unit TEXT DEFAULT ''")
 
 # -- ADDITIVE MIGRATION (Production/Formulation/Quality traceability link) ---
@@ -3508,6 +3614,55 @@ BEGIN SELECT RAISE(ABORT, 'production_batches.quantity / planned_qty must be >= 
 conn.commit()
 
 _safe_add_column("sales", "sales_order_id INTEGER")
+
+# FIX (P0-9, additive): database-level referential integrity for the core traceability
+# chain (SO -> PI -> Batch -> QC -> Dispatch). SQLite can't add a FOREIGN KEY to an existing
+# table without a rebuild, so insert-time triggers (same style as above) reject orphan links.
+# New writes only; existing rows are never rewritten.
+cur.executescript("""
+CREATE TRIGGER IF NOT EXISTS trg_fk_production_batch_materials_batch
+BEFORE INSERT ON production_batch_materials
+WHEN NEW.production_batch_id IS NOT NULL
+ AND NOT EXISTS (SELECT 1 FROM production_batches WHERE id = NEW.production_batch_id)
+BEGIN SELECT RAISE(ABORT, 'production_batch_materials.production_batch_id does not reference an existing production batch'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_fk_process_inspection_batch
+BEFORE INSERT ON process_inspection
+WHEN NEW.production_batch_id IS NOT NULL
+ AND NOT EXISTS (SELECT 1 FROM production_batches WHERE id = NEW.production_batch_id)
+BEGIN SELECT RAISE(ABORT, 'process_inspection.production_batch_id does not reference an existing production batch'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_fk_fg_inspection_batch
+BEFORE INSERT ON fg_inspection
+WHEN NEW.production_batch_id IS NOT NULL
+ AND NOT EXISTS (SELECT 1 FROM production_batches WHERE id = NEW.production_batch_id)
+BEGIN SELECT RAISE(ABORT, 'fg_inspection.production_batch_id does not reference an existing production batch'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_fk_packing_inspection_batch
+BEFORE INSERT ON packing_inspection
+WHEN NEW.production_batch_id IS NOT NULL
+ AND NOT EXISTS (SELECT 1 FROM production_batches WHERE id = NEW.production_batch_id)
+BEGIN SELECT RAISE(ABORT, 'packing_inspection.production_batch_id does not reference an existing production batch'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_fk_dispatch_approval_batch
+BEFORE INSERT ON dispatch_approval
+WHEN NEW.production_batch_id IS NOT NULL
+ AND NOT EXISTS (SELECT 1 FROM production_batches WHERE id = NEW.production_batch_id)
+BEGIN SELECT RAISE(ABORT, 'dispatch_approval.production_batch_id does not reference an existing production batch'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_fk_pb_instruction
+BEFORE INSERT ON production_batches
+WHEN NEW.production_instruction_id IS NOT NULL
+ AND NOT EXISTS (SELECT 1 FROM production_instructions WHERE id = NEW.production_instruction_id)
+BEGIN SELECT RAISE(ABORT, 'production_batches.production_instruction_id does not reference an existing instruction'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_fk_sales_order
+BEFORE INSERT ON sales
+WHEN NEW.sales_order_id IS NOT NULL
+ AND NOT EXISTS (SELECT 1 FROM sales_orders WHERE id = NEW.sales_order_id)
+BEGIN SELECT RAISE(ABORT, 'sales.sales_order_id does not reference an existing sales order'); END;
+""")
+conn.commit()
 _safe_add_column("sales_orders", "dispatched_qty REAL DEFAULT 0")
 _safe_add_column("sales_orders", "production_status TEXT DEFAULT 'Pending'")
 
@@ -4973,6 +5128,8 @@ for _idx in [
     "CREATE INDEX IF NOT EXISTS idx_packing_insp_batch             ON packing_inspection(production_batch_id)",
     "CREATE INDEX IF NOT EXISTS idx_dispatch_appr_batch            ON dispatch_approval(production_batch_id)",
     "CREATE INDEX IF NOT EXISTS idx_ncr_status                     ON ncr_capa(status)",
+    "CREATE INDEX IF NOT EXISTS idx_prod_batches_pi                ON production_batches(production_instruction_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sales_so                       ON sales(sales_order_id)",
 ]:
     try:
         cur.execute(_idx)
@@ -5256,6 +5413,18 @@ PROCUREMENT_STAGES = [
 ]
 STAGE_STATUSES = ["Pending", "In Progress", "Completed", "Skipped"]
 DEFAULT_REORDER_THRESHOLD = 50  # used when a material/factory has no custom threshold set
+# Replenishment engine: order up to `reorder_target` (reorder_levels.reorder_target); when none
+# is configured, target = threshold x this multiplier.
+REORDER_TARGET_MULTIPLIER = 2.0
+# Procurement state machine: stages that are DERIVED from real receipts / QC, never hand-set.
+_PROC_DERIVED_STAGES = ("Material Received", "Quality Inspection", "Stock Updated")
+_PROC_SKIPPABLE_STAGES = ("Vendor Acknowledgement", "Material Dispatched")
+# Incoming material must be received against an open, PO-stage-complete procurement request.
+RM_RECEIPT_REQUIRES_PO = True
+RM_OVER_RECEIPT_TOLERANCE = 0.10      # max cumulative over-delivery vs the requested qty
+# Formula-vs-actual control (per material, abs % of the scaled BOM quantity)
+VARIANCE_WARN_PCT = 3.0               # <= normal ; above this a reason is mandatory
+VARIANCE_BLOCK_PCT = 10.0             # above this a deviation approval is mandatory
 
 # ── NEW: Quality / Batch workflow ─────────────────────────────────────────────
 # A production batch's `status` is the single source of truth for which stage
@@ -5332,7 +5501,7 @@ def safe_ratio_pct(part: float, whole: float) -> float | None:
     return (part / whole) * 100 if whole else None
 
 @st.cache_data(show_spinner=False)
-def _load_cached(table: str, _version: int) -> pd.DataFrame:
+def _load_cached(table: str, version: int) -> pd.DataFrame:
     return pd.read_sql_query(f"SELECT * FROM {table} ORDER BY date DESC", conn)
 
 def load(table: str) -> pd.DataFrame:
@@ -5343,7 +5512,7 @@ def load(table: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def _load_filtered_cached(table: str, factory_val: str,
-                           d_start_s: str, d_end_s: str, _version: int) -> pd.DataFrame:
+                           d_start_s: str, d_end_s: str, version: int) -> pd.DataFrame:
     if factory_val != ALL_FACTORIES:
         return pd.read_sql_query(
             f"SELECT * FROM {table} WHERE date >= ? AND date <= ? AND factory = ? ORDER BY date DESC",
@@ -5390,6 +5559,10 @@ def paginate_df(df: pd.DataFrame, page_size: int = 50,
     st.caption(f"Showing {page_size} of {n} records (page {page}/{pages})")
     return df.iloc[(page - 1) * page_size: page * page_size]
 
+# Tables whose rows carry a lifecycle: the generic DELETE would orphan downstream records, so they
+# MUST supply a lifecycle-aware delete_fn (e.g. delete_sales_order).
+_LIFECYCLE_GUARDED_TABLES = {"sales_orders"}
+
 def delete_row_ui(df: pd.DataFrame, table: str,
                   label_col: str, key_prefix: str, on_delete=None, delete_fn=None) -> None:
     """Renders an expander with two-step confirmation before deleting a row.
@@ -5413,6 +5586,9 @@ def delete_row_ui(df: pd.DataFrame, table: str,
     and only here, in the one shared helper every module's delete goes
     through."""
     assert table in _ALLOWED_TABLES, f"Invalid table: {table}"
+    if table in _LIFECYCLE_GUARDED_TABLES and delete_fn is None:
+        raise RuntimeError(f"'{table}' has a lifecycle — pass a lifecycle-aware delete_fn "
+                           "(e.g. delete_sales_order) instead of the generic DELETE.")
     if df.empty:
         return
     with st.expander("🗑️ Delete a Record", expanded=False):
@@ -5672,7 +5848,8 @@ def _get_smtp_config() -> dict | None:
     return {**transport, "recipients": recipients}
 
 def send_procurement_alert_email(material: str, factory: str, closing_stock: float,
-                                  threshold: float, unit: str, request_id: int) -> tuple[bool, str]:
+                                  threshold: float, unit: str, request_id: int,
+                                  suggested_qty: float | None = None) -> tuple[bool, str]:
     """Emails the purchase department about a low-stock / procurement event.
     Never raises — returns (success, message) so the caller can show it
     in-app either way (email failure must not block the request itself)."""
@@ -5704,8 +5881,9 @@ def send_procurement_alert_email(material: str, factory: str, closing_stock: flo
             f"Material         : {material}\n"
             f"Factory          : {factory}\n"
             f"Current Stock    : {closing_stock:.2f} {unit}\n"
-            f"Reorder Threshold: {threshold:.2f} {unit}\n\n"
-            f"Please action the Purchase Requisition stage in the FCSC ERP "
+            f"Reorder Threshold: {threshold:.2f} {unit}\n"
+            + (f"Qty To Procure   : {suggested_qty:.2f} {unit}\n" if suggested_qty is not None else "")
+            + f"\nPlease action the Purchase Requisition stage in the FCSC ERP "
             f"→ Procurement module.\n"
         )
         msg.attach(MIMEText(body, "plain"))
@@ -5866,9 +6044,13 @@ def get_vendor(name: str) -> dict | None:
             "lead_time_days": row[3], "notes": row[4]}
 
 def upsert_vendor(name: str, email: str, phone: str, lead_time_days: int, notes: str) -> tuple[bool, str]:
-    name = name.strip()
+    if not _dept_allows("Procurement", "Stores"):
+        return False, "Only Procurement (or Stores/Admin) can change the Vendor Master."
+    name = (name or "").strip()
     if not name:
         return False, "Vendor name is required."
+    if not _is_real_number(lead_time_days) or float(lead_time_days) < 0:
+        return False, "Lead time must be zero or more days."
     try:
         cur.execute(
             "INSERT INTO vendors VALUES (?,?,?,?,?,?) "
@@ -5882,14 +6064,21 @@ def upsert_vendor(name: str, email: str, phone: str, lead_time_days: int, notes:
     except sqlite3.Error as e:
         return False, f"Database error: {e}"
 
-def set_material_vendor(material: str, vendor_name: str, lead_time_days: int, pack_size: str) -> None:
-    cur.execute(
-        "INSERT INTO vendor_materials VALUES (?,?,?,?) "
-        "ON CONFLICT(material) DO UPDATE SET vendor_name=excluded.vendor_name, "
-        "lead_time_days=excluded.lead_time_days, pack_size=excluded.pack_size",
-        (material, vendor_name, lead_time_days, pack_size)
-    )
-    conn.commit()
+def set_material_vendor(material: str, vendor_name: str, lead_time_days: int, pack_size: str) -> tuple[bool, str]:
+    if not _dept_allows("Procurement", "Stores"):
+        return False, "Only Procurement (or Stores/Admin) can change the Vendor Master."
+    if not cur.execute("SELECT 1 FROM vendors WHERE name=?", (vendor_name,)).fetchone():
+        return False, f"Vendor '{vendor_name}' does not exist."
+    if not _is_real_number(lead_time_days) or float(lead_time_days) < 0:
+        return False, "Lead time must be zero or more days."
+    with _write_lock():
+        cur.execute(
+            "INSERT INTO vendor_materials VALUES (?,?,?,?) "
+            "ON CONFLICT(material) DO UPDATE SET vendor_name=excluded.vendor_name, "
+            "lead_time_days=excluded.lead_time_days, pack_size=excluded.pack_size",
+            (material, vendor_name, lead_time_days, (pack_size or "").strip())
+        )
+    return True, f"{material} → {vendor_name}"
 
 def send_vendor_email(vendor_name: str, material: str, factory: str, qty: float,
                        unit: str, request_id: int) -> tuple[bool, str]:
@@ -5934,23 +6123,47 @@ def send_vendor_email(vendor_name: str, material: str, factory: str, qty: float,
 
 def _open_procurement_request(material: str, factory: str, trigger_type: str,
                                qty: float, unit: str, notes: str,
-                               vendor: str | None = None) -> int:
+                               vendor: str | None = None,
+                               reorder_target: float = 0.0,
+                               _system: bool = False) -> int:
     """Creates a procurement_requests row plus its 8-stage workflow. Returns
     the new request id. If vendor isn't given, auto-fills from the material's
-    default vendor (vendor_materials) when one is on file."""
+    default vendor (vendor_materials) when one is on file.
+
+    NOTE: only the first five stages are ever hand-completed. Material Received /
+    Quality Inspection / Stock Updated are DERIVED from linked rm_batches receipts
+    (see sync_procurement_stages) and cannot be set manually.
+
+    FIX (P0-37): ownership is enforced HERE, not in the calling screen. A user request needs the
+    Procurement/Stores department (or Admin), the caller's own factory, a known factory, a finite
+    quantity > 0 and a material in the master. `_system=True` is reserved for the low-stock scanner,
+    which runs for the whole plant on behalf of nobody in particular. Raises PermissionError /
+    ValueError; callers show the message."""
+    if factory not in FACTORIES:
+        raise ValueError(f"Unknown factory '{factory}' — pick a specific factory.")
+    if not _system:
+        if not _dept_allows("Procurement", "Stores"):
+            raise PermissionError("Only Procurement (or Stores/Admin) can raise a procurement request.")
+        if trigger_type == "auto_low_stock":
+            raise PermissionError("Auto low-stock requests can only be raised by the replenishment scan.")
+        assert_factory_access(factory)
+    if not _is_real_number(qty) or float(qty) <= 0:
+        raise ValueError("Quantity needed must be a number greater than zero.")
+    if not material or not str(material).strip():
+        raise ValueError("Material is required.")
     now_iso = now_ist().isoformat(timespec="seconds")
     vendor = vendor or get_default_vendor_for_material(material) or ""
     cur.execute(
-        "INSERT INTO procurement_requests VALUES (NULL,?,?,?,?,?,?,?,?,NULL,?)",
-        (now_iso, factory, material, trigger_type, qty, unit, "Open", notes, vendor)
+        "INSERT INTO procurement_requests (created_at, factory, material, trigger_type, "
+        "qty_suggested, unit, status, notes, closed_at, vendor, po_reference, approved_by, "
+        "reorder_target) VALUES (?,?,?,?,?,?,?,?,NULL,?,'','',?)",
+        (now_iso, factory, material, trigger_type, qty, unit, "Open", notes, vendor,
+         float(reorder_target or 0.0))
     )
     req_id = cur.lastrowid
     today = today_ist()
-    # FIX: "Material Received" due date now reflects the vendor's actual
-    # lead_time_days when a vendor is on file, instead of a flat +6 days —
-    # this is what makes the promised-vs-actual vendor performance
-    # comparison (see vendor_performance_summary()) meaningful rather than
-    # comparing against an arbitrary placeholder date.
+    # "Material Received" due date reflects the vendor's lead_time_days when a
+    # vendor is on file, so promised-vs-actual vendor performance is meaningful.
     _vendor_row = get_vendor(vendor) if vendor else None
     _lead_days = _vendor_row["lead_time_days"] if _vendor_row and _vendor_row.get("lead_time_days") else None
     for i, (stage_name, default_owner) in enumerate(PROCUREMENT_STAGES):
@@ -5967,23 +6180,126 @@ def _open_procurement_request(material: str, factory: str, trigger_type: str,
     log_audit("INSERT", "procurement_requests", req_id, f"{trigger_type}: {material} @ {factory}")
     return req_id
 
+# ── Replenishment quantity (audit P0-1) ─────────────────────────────────────
+def _parse_pack_qty_base(material: str, pack_size_text: str | None, base_unit: str) -> float:
+    """vendor_materials.pack_size is free text ('25 KG', '50kg bag', '25'). Returns the pack
+    size in the material's BASE unit, or 0.0 when none/unparseable (=> no pack rounding)."""
+    import re as _re
+    m = _re.match(r"\s*(\d+(?:\.\d+)?)\s*([A-Za-z]*)", pack_size_text or "")
+    if not m:
+        return 0.0
+    qty, unit = float(m.group(1)), (m.group(2) or "").strip()
+    if qty <= 0:
+        return 0.0
+    if not unit or units_equivalent(unit, base_unit):
+        return qty
+    conv, exact, _ = convert_material_qty_to_base(material, qty, unit)
+    return float(conv) if exact and conv > 0 else 0.0
+
+def get_reorder_target(material: str, factory: str, threshold: float) -> float:
+    """Order-up-to level. A configured target at/below the threshold is meaningless, so it
+    falls back to threshold x REORDER_TARGET_MULTIPLIER."""
+    row = cur.execute(
+        "SELECT reorder_target FROM reorder_levels WHERE material=? AND factory=?",
+        (material, factory)).fetchone()
+    t = float(row[0]) if row and row[0] else 0.0
+    return t if t > threshold else float(threshold) * REORDER_TARGET_MULTIPLIER
+
+def _proc_lot_qty_base(req_id: int, statuses: tuple | None = None, exclude_rejected: bool = False) -> float:
+    """Sum (in the material's base unit) of rm_batches receipts linked to a procurement request."""
+    rows = cur.execute(
+        "SELECT rb.material, rb.quantity, rb.unit, rb.status FROM rm_batches rb "
+        "WHERE rb.procurement_request_id=?", (req_id,)).fetchall()
+    total = 0.0
+    for mat, qty, unit, st_ in rows:
+        if statuses is not None and st_ not in statuses:
+            continue
+        if exclude_rejected and st_ == "Rejected":
+            continue
+        conv, _exact, _n = convert_material_qty_to_base(mat, qty or 0, unit or get_material_base_unit(mat))
+        total += conv
+    return total
+
+def _po_ledger_add(req_id: int, event: str, qty_base: float | None, unit: str, ref: str = "") -> None:
+    cur.execute("INSERT INTO po_ledger (request_id, event, qty_base, unit, ref, by_user, at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (req_id, event, qty_base, unit, ref, st.session_state.get("username", "system"), _now_iso()))
+
+def get_po_balance(req_id: int) -> dict:
+    """PO commitment balance (base unit): Ordered / Received / QC Approved / Rejected / Cancelled /
+    Outstanding. Receipt figures come live from rm_batches; Cancelled is the explicit ledger figure
+    written by short-close. Outstanding = what the vendor still owes = ordered - cancelled - received
+    (rejected lots are NOT counted as received, so they come back as owed). `in_pipeline` adds lots
+    received but still awaiting QC — everything committed that is not yet in available stock."""
+    req = cur.execute("SELECT material, qty_suggested, unit, COALESCE(cancelled_qty,0), status "
+                      "FROM procurement_requests WHERE id=?", (req_id,)).fetchone()
+    z = {"ordered": 0.0, "received": 0.0, "approved": 0.0, "rejected": 0.0, "awaiting_qc": 0.0,
+         "cancelled": 0.0, "outstanding": 0.0, "in_pipeline": 0.0, "unit": ""}
+    if not req:
+        return z
+    mat, qty, unit, cancelled, status = req
+    base = get_material_base_unit(mat)
+    z["unit"] = base
+    z["ordered"] = convert_material_qty_to_base(mat, qty or 0, unit or base)[0]
+    z["cancelled"] = float(cancelled or 0)
+    for lq, lu, ls in cur.execute("SELECT quantity, unit, status FROM rm_batches "
+                                  "WHERE procurement_request_id=?", (req_id,)).fetchall():
+        c = convert_material_qty_to_base(mat, lq or 0, lu or base)[0]
+        if ls == "Rejected":
+            z["rejected"] += c
+        else:
+            z["received"] += c
+            if ls == "Approved":
+                z["approved"] += c
+            else:
+                z["awaiting_qc"] += c
+    z["outstanding"] = max(0.0, z["ordered"] - z["cancelled"] - z["received"])
+    z["in_pipeline"] = z["outstanding"] + z["awaiting_qc"]
+    return z
+
+def get_open_po_qty(material: str, factory: str) -> float:
+    """Committed-but-not-yet-in-stock quantity (base unit) across OPEN requests that have a PO
+    number: PO outstanding + lots awaiting QC, net of anything short-cancelled. Short-closed /
+    cancelled quantity is not counted (it is not coming); QC-approved quantity is not counted
+    (already in available stock)."""
+    total = 0.0
+    for (rid,) in cur.execute(
+            "SELECT id FROM procurement_requests WHERE material=? AND factory=? "
+            "AND status='Open' AND COALESCE(TRIM(po_reference),'')<>''", (material, factory)).fetchall():
+        total += get_po_balance(int(rid))["in_pipeline"]
+    return total
+
+def calculate_replenishment_qty(factory: str, material: str, snap: dict, threshold: float) -> dict:
+    """required = reorder_target - available - confirmed open PO qty, rounded UP to the
+    vendor's pack size where one is on file. Returns the full breakdown for the audit note."""
+    target = get_reorder_target(material, factory, threshold)
+    available = float(snap["available_qty"])
+    open_po = get_open_po_qty(material, factory)
+    raw = target - available - open_po
+    pack = 0.0
+    vm = cur.execute("SELECT pack_size FROM vendor_materials WHERE material=?", (material,)).fetchone()
+    if vm:
+        pack = _parse_pack_qty_base(material, vm[0], snap["base_unit"])
+    suggested = 0.0
+    if raw > 1e-9:
+        suggested = math.ceil(raw / pack - 1e-9) * pack if pack > 0 else raw
+    return {"target": target, "available": available, "open_po": open_po,
+            "raw_shortfall": raw, "pack": pack, "suggested": round(suggested, 4)}
+
 def scan_low_stock_and_trigger_procurement() -> list[dict]:
     """Checks physical/available RM stock against each material's reorder
     threshold. For anything below threshold that doesn't already have an
     open procurement request, opens one and emails the purchase department.
     Returns the list of newly created alerts.
 
-    FIX (Gap P0-1): previously scanned the legacy `stock` table, which is
-    only ever updated by manual "Log Stock" entry and is never touched by
-    RM Receipt / QC approval. A material received and QC-approved through
-    the real workflow but never separately hand-logged into Stock could run
-    out on the floor without ever triggering an alert -- see
-    get_rm_physical_stock() for the full fix rationale. Now scans every
-    (factory, material) pair that actually has rm_batches activity, and
-    compares AVAILABLE stock (physical minus active reservations) against
-    threshold -- material already earmarked for a released job is not
-    "available" to cover a new shortfall, so this is the operationally
-    correct number to reorder against, not gross physical stock."""
+    The scan compares AVAILABLE stock (physical minus active reservations,
+    from rm_batches — see get_rm_physical_stock()) against the threshold.
+
+    FIX (audit P0-1): the request quantity used to be the CURRENT available stock
+    (e.g. 20 MT on hand against a 100 MT threshold -> "buy 20 MT"). It is now the
+    replenishment quantity:
+        reorder_target - available - confirmed open PO qty
+    rounded up to the vendor pack size (calculate_replenishment_qty)."""
     created: list[dict] = []
     try:
         pairs = all_rm_factory_materials()
@@ -6008,26 +6324,288 @@ def scan_low_stock_and_trigger_procurement() -> list[dict]:
         if already_open:
             continue  # already actioned — don't spam a fresh alert every rerun
 
+        rep_ = calculate_replenishment_qty(factory_, material_, snap, threshold)
+        if rep_["suggested"] <= 0:
+            continue  # confirmed open POs already cover the shortfall
+
+        unit_ = snap["base_unit"]
         req_id = _open_procurement_request(
-            material_, factory_, "auto_low_stock", snap["available_qty"], snap["base_unit"],
-            f"Auto-triggered: available stock {snap['available_qty']:.2f} {snap['base_unit']} "
-            f"below reorder threshold {threshold:.2f}"
+            material_, factory_, "auto_low_stock", rep_["suggested"], unit_,
+            f"Auto-triggered: available {rep_['available']:.2f} {unit_} below reorder threshold "
+            f"{threshold:.2f}. Order {rep_['suggested']:.2f} {unit_} = target {rep_['target']:.2f} "
+            f"- available {rep_['available']:.2f} - open PO {rep_['open_po']:.2f}"
+            + (f", rounded up to pack {rep_['pack']:g}" if rep_["pack"] > 0 else "")
             + (f" [WARNING: {len(snap['unconverted'])} row(s) had no unit conversion "
-               f"factor on file — total may be approximate]" if snap["unconverted"] else "")
+               f"factor on file — total may be approximate]" if snap["unconverted"] else ""),
+            reorder_target=rep_["target"], _system=True
         )
         sent, msg = send_procurement_alert_email(
-            material_, factory_, snap["available_qty"], threshold, snap["base_unit"], req_id
+            material_, factory_, snap["available_qty"], threshold, unit_, req_id,
+            suggested_qty=rep_["suggested"]
         )
-        # NEW: WhatsApp/SMS goes out alongside the email — same trigger,
-        # different channel, for people who don't watch email closely.
         broadcast_phone_alert(
             "low_stock",
             f"⚠️ FCSC Low Stock — {material_} @ {factory_}: {snap['available_qty']:.2f} "
-            f"{snap['base_unit']} (below {threshold:.2f}). PR-{req_id:05d} opened."
+            f"{unit_} (below {threshold:.2f}). Order {rep_['suggested']:.2f} {unit_}. "
+            f"PR-{req_id:05d} opened."
         )
         created.append({"material": material_, "factory": factory_, "request_id": req_id,
+                         "qty_suggested": rep_["suggested"],
                          "email_sent": sent, "email_msg": msg})
     return created
+
+# ── Procurement state machine (audit P0-2) ──────────────────────────────────
+#   Requisition -> Approval -> PO (PO number) -> Vendor Ack -> Dispatched   [hand-set, in order]
+#   -> Material Received -> Quality Inspection -> Stock Updated             [DERIVED from rm_batches]
+# A request can only close when real receipts exist, are QC-decided, and the approved quantity
+# covers the order. Procurement actions require the Procurement (or Stores) department.
+def _proc_actor_ok() -> bool:
+    return _dept_allows("Procurement", "Stores")
+
+def _proc_request_row(req_id: int):
+    return cur.execute(
+        "SELECT id, factory, material, qty_suggested, unit, status, po_reference "
+        "FROM procurement_requests WHERE id=?", (req_id,)).fetchone()
+
+def get_procurement_receipt_summary(req_id: int) -> dict:
+    req = _proc_request_row(req_id)
+    out = {"ordered": 0.0, "received": 0.0, "approved": 0.0, "awaiting_qc": 0, "rejected": 0,
+           "unit": "", "lots": []}
+    if not req:
+        return out
+    base_unit = get_material_base_unit(req[2])
+    out["unit"] = base_unit
+    out["ordered"] = convert_material_qty_to_base(req[2], req[3] or 0, req[4] or base_unit)[0]
+    out["received"] = _proc_lot_qty_base(req_id, exclude_rejected=True)
+    out["approved"] = _proc_lot_qty_base(req_id, ("Approved",))
+    for rid, bno, qty, unit, status in cur.execute(
+            "SELECT id, batch_no, quantity, unit, status FROM rm_batches WHERE procurement_request_id=? "
+            "ORDER BY id", (req_id,)).fetchall():
+        out["lots"].append({"RM Batch": f"RM-{rid:05d}", "Supplier Lot": bno,
+                            "Qty": qty, "Unit": unit, "QC Status": status})
+        if status == "Awaiting QC":
+            out["awaiting_qc"] += 1
+        elif status == "Rejected":
+            out["rejected"] += 1
+    return out
+
+def _sync_procurement_stages_locked(req_id: int) -> bool:
+    """Derives the three receipt-driven stages from rm_batches and auto-closes the request when
+    everything is genuinely done. MUST be called inside _write_lock(). Returns True if closed."""
+    req = _proc_request_row(req_id)
+    if not req or req[5] != "Open":
+        return False
+    summ = get_procurement_receipt_summary(req_id)
+    ordered, received, approved = summ["ordered"], summ["received"], summ["approved"]
+    has_lots = bool(summ["lots"]) and (len(summ["lots"]) > summ["rejected"])
+    covers = lambda q: (q + 1e-6 >= ordered) if ordered > 0 else (q > 0)
+    recv_done = has_lots and covers(received)
+    qi_done = recv_done and summ["awaiting_qc"] == 0 and approved > 0
+    su_done = qi_done and covers(approved)
+    derived = {
+        "Material Received": "Completed" if recv_done else ("In Progress" if has_lots else "Pending"),
+        "Quality Inspection": "Completed" if qi_done else ("In Progress" if summ["lots"] else "Pending"),
+        "Stock Updated": "Completed" if su_done else ("In Progress" if approved > 0 else "Pending"),
+    }
+    now_iso = now_ist().isoformat(timespec="seconds")
+    for stage, new_status in derived.items():
+        row = cur.execute("SELECT id, status FROM procurement_stages WHERE request_id=? AND stage_name=?",
+                          (req_id, stage)).fetchone()
+        if row and row[1] != new_status:
+            cur.execute(
+                "UPDATE procurement_stages SET status=?, completed_at=?, updated_by=? WHERE id=?",
+                (new_status, now_iso if new_status == "Completed" else None,
+                 "system (receipt-derived)", row[0]))
+    return _try_close_procurement_locked(req_id)
+
+def _try_close_procurement_locked(req_id: int) -> bool:
+    req = _proc_request_row(req_id)
+    if not req or req[5] != "Open" or not (req[6] or "").strip():
+        return False
+    for name, status in cur.execute(
+            "SELECT stage_name, status FROM procurement_stages WHERE request_id=?", (req_id,)).fetchall():
+        if name in _PROC_DERIVED_STAGES or name not in _PROC_SKIPPABLE_STAGES:
+            if status != "Completed":
+                return False
+        elif status not in ("Completed", "Skipped"):
+            return False
+    if get_procurement_receipt_summary(req_id)["approved"] <= 0:
+        return False
+    cur.execute("UPDATE procurement_requests SET status='Closed', closed_at=? WHERE id=?",
+                (now_ist().isoformat(timespec="seconds"), req_id))
+    log_audit("UPDATE", "procurement_requests", req_id,
+              "Auto-closed — PO, receipt, QC approval and stock all verified against rm_batches")
+    return True
+
+def sync_procurement_stages(req_id: int) -> bool:
+    with _write_lock():
+        return _sync_procurement_stages_locked(req_id)
+
+def resolve_procurement_for_receipt(po_reference: str, material: str, factory: str) -> tuple[int | None, str]:
+    """Maps a PO number on an incoming receipt to THE procurement request that owns it. A PO number
+    is unique per factory (set_procurement_po + ux_proc_po_factory), so this is deterministic: the
+    lookup is by factory + normalised PO, and material / status are then VERIFIED against it —
+    never used to pick between several candidates. More than one hit (legacy duplicate data) is
+    refused as ambiguous rather than guessed."""
+    po = (po_reference or "").strip()
+    if not po:
+        return None, ("A PO Number is required — material can only be received against a Purchase "
+                      "Order raised in Procurement.")
+    rows = cur.execute(
+        "SELECT id, material, status FROM procurement_requests "
+        "WHERE factory=? AND UPPER(TRIM(po_reference))=UPPER(?)", (factory, po)).fetchall()
+    if not rows:
+        return None, (f"No procurement request at {factory} carries PO '{po}'. "
+                      "Record the PO number on the request in Procurement first.")
+    if len(rows) > 1:
+        return None, (f"PO '{po}' is assigned to {len(rows)} procurement requests at {factory} "
+                      "(PR-" + ", PR-".join(f"{r[0]:05d}" for r in rows) + ") — ambiguous. Procurement must "
+                      "correct the PO numbers before material can be received against it.")
+    rid, mat, status = rows[0]
+    if mat != material:
+        return None, (f"PO '{po}' (PR-{rid:05d}) is for {mat}, not {material}.")
+    if status != "Open":
+        return None, f"PO '{po}' (PR-{rid:05d}) is {status} — it can no longer receive material."
+    st_ = cur.execute("SELECT status FROM procurement_stages WHERE request_id=? AND stage_name='Purchase Order'",
+                      (rid,)).fetchone()
+    if not st_ or st_[0] != "Completed":
+        return None, (f"PO '{po}' is recorded but the 'Purchase Order' stage is not Completed yet "
+                      "(request must be Approved and its PO issued before goods can be received).")
+    return int(rid), ""
+
+def set_procurement_po(req_id: int, po_reference: str) -> tuple[bool, str]:
+    if not _proc_actor_ok():
+        return False, "Only Procurement (or Stores/Admin) can record a PO number."
+    po = (po_reference or "").strip()
+    if not po:
+        return False, "PO number cannot be blank."
+    with _write_lock():
+        req = _proc_request_row(req_id)
+        if not req or req[5] != "Open":
+            return False, "Request not found or already closed."
+        if (_fe := _factory_error_for_factory(req[1])):
+            return False, _fe
+        appr = cur.execute("SELECT status FROM procurement_stages WHERE request_id=? AND stage_name='Approval'",
+                           (req_id,)).fetchone()
+        if not appr or appr[0] != "Completed":
+            return False, "The request must be Approved before a PO number can be recorded."
+        if cur.execute("SELECT 1 FROM rm_batches WHERE procurement_request_id=? LIMIT 1", (req_id,)).fetchone():
+            return False, "Receipts already exist against this PO — the PO number can no longer be changed."
+        if (req[6] or "").strip() and (req[6] or "").strip().upper() != po.upper():
+            _ps = cur.execute("SELECT status FROM procurement_stages WHERE request_id=? AND stage_name='Purchase Order'",
+                              (req_id,)).fetchone()
+            if _ps and _ps[0] == "Completed":
+                return False, "The PO stage is already Completed — the PO number can no longer be changed."
+        _clash = cur.execute(
+            "SELECT id, status FROM procurement_requests WHERE factory=? AND id<>? "
+            "AND UPPER(TRIM(po_reference))=UPPER(?)", (req[1], req_id, po)).fetchone()
+        if _clash:
+            return False, (f"PO number '{po}' is already used by PR-{_clash[0]:05d} ({_clash[1]}) at {req[1]}. "
+                           "A PO number must be unique within a factory.")
+        try:
+            cur.execute("UPDATE procurement_requests SET po_reference=? WHERE id=?", (po, req_id))
+        except sqlite3.IntegrityError:
+            return False, f"PO number '{po}' is already in use at {req[1]}."
+        _o = get_po_balance(req_id)
+        _po_ledger_add(req_id, "Ordered", _o["ordered"], _o["unit"], po)
+    log_audit("UPDATE", "procurement_requests", req_id, f"PO number set: {po}")
+    return True, f"PO {po} recorded."
+
+def _factory_error_for_factory(factory: str | None) -> str | None:
+    return None if _factory_allowed(factory) else _CROSS_FACTORY_MSG
+
+def update_procurement_stages(req_id: int, edits: list[dict]) -> tuple[bool, str]:
+    """Server-side stage update. Derived stages cannot be set; stages complete strictly in order;
+    PO needs a PO number; nothing that has real receipts behind it can be un-completed."""
+    if not _proc_actor_ok():
+        return False, "Only Procurement (or Stores/Admin) can update procurement stages."
+    user = st.session_state.get("username", "system")
+    closed = False
+    with _write_lock():
+        req = _proc_request_row(req_id)
+        if not req or req[5] != "Open":
+            return False, "Request not found or already closed."
+        if (_fe := _factory_error_for_factory(req[1])):
+            return False, _fe
+        stages = {r[0]: {"id": r[0], "seq": r[1], "name": r[2], "status": r[3]} for r in cur.execute(
+            "SELECT id, seq, stage_name, status FROM procurement_stages WHERE request_id=? ORDER BY seq",
+            (req_id,)).fetchall()}
+        has_receipts = bool(cur.execute(
+            "SELECT 1 FROM rm_batches WHERE procurement_request_id=? LIMIT 1", (req_id,)).fetchone())
+        new_status = {sid: s_["status"] for sid, s_ in stages.items()}
+        for e in edits:
+            sid = int(e["id"])
+            if sid not in stages:
+                return False, "Unknown stage."
+            name, old = stages[sid]["name"], stages[sid]["status"]
+            ns = e["status"]
+            if ns not in STAGE_STATUSES:
+                return False, f"Invalid status '{ns}'."
+            if ns != old:
+                if name in _PROC_DERIVED_STAGES:
+                    return False, (f"'{name}' is derived from actual receipts / Incoming QC and cannot be "
+                                   "set manually. Log the material in Quality → Incoming Material "
+                                   "against this PO.")
+                if ns == "Skipped" and name not in _PROC_SKIPPABLE_STAGES:
+                    return False, f"'{name}' cannot be skipped."
+                if old == "Completed" and has_receipts:
+                    return False, f"'{name}' cannot be reopened — receipts already exist against this request."
+                if name == "Purchase Order" and ns == "Completed" and not (req[6] or "").strip():
+                    return False, "Record the PO number first — the Purchase Order stage needs a PO reference."
+            new_status[sid] = ns
+        manual = [s_ for s_ in sorted(stages.values(), key=lambda x: x["seq"])
+                  if s_["name"] not in _PROC_DERIVED_STAGES]
+        for i, s_ in enumerate(manual):
+            if new_status[s_["id"]] in ("Completed", "Skipped"):
+                for prev in manual[:i]:
+                    if new_status[prev["id"]] not in ("Completed", "Skipped"):
+                        return False, (f"Complete '{prev['name']}' before '{s_['name']}' — stages run in order.")
+        now_iso = now_ist().isoformat(timespec="seconds")
+        for e in edits:
+            sid = int(e["id"])
+            cur.execute(
+                "UPDATE procurement_stages SET status=?, owner=?, due_date=?, completed_at=?, updated_by=? "
+                "WHERE id=?",
+                (e["status"], e.get("owner") or "", e.get("due_date"),
+                 now_iso if e["status"] in ("Completed", "Skipped") else None, user, sid))
+            if stages[sid]["name"] == "Approval" and e["status"] == "Completed" and stages[sid]["status"] != "Completed":
+                cur.execute("UPDATE procurement_requests SET approved_by=? WHERE id=?", (user, req_id))
+        closed = _sync_procurement_stages_locked(req_id)
+    log_audit("UPDATE", "procurement_stages", req_id, "Stage progress updated")
+    return True, ("✅ All stages verified — request closed." if closed else "Progress saved.")
+
+def short_close_procurement(req_id: int, reason: str) -> tuple[bool, str]:
+    """Closes a PO that will not be fully delivered — and RECORDS what was cancelled. The undelivered
+    remainder (ordered - received) is written to procurement_requests.cancelled_qty and the po_ledger,
+    so history reads Ordered 100 | Received 40 | Cancelled 60 instead of just 'Closed'. With nothing
+    received at all this is a plain PO cancellation. Lots still awaiting QC block it."""
+    if not _proc_actor_ok():
+        return False, "Only Procurement (or Stores/Admin) can short-close a request."
+    if not (reason or "").strip():
+        return False, "A reason is required."
+    with _write_lock():
+        req = _proc_request_row(req_id)
+        if not req or req[5] != "Open":
+            return False, "Request not found or already closed."
+        if (_fe := _factory_error_for_factory(req[1])):
+            return False, _fe
+        if not (req[6] or "").strip():
+            return False, "No PO has been issued on this request — nothing to short-close."
+        bal = get_po_balance(req_id)
+        if bal["awaiting_qc"] > 1e-9:
+            return False, "Some received lots are still awaiting Incoming QC."
+        cancel_qty = bal["outstanding"]
+        cur.execute("UPDATE procurement_requests SET status='Closed', closed_at=?, cancelled_qty=COALESCE(cancelled_qty,0)+?, "
+                    "notes=COALESCE(notes,'')||? WHERE id=?",
+                    (now_ist().isoformat(timespec="seconds"), cancel_qty,
+                     f" [Short-closed by {st.session_state.get('username','system')}: {reason.strip()} — "
+                     f"ordered {bal['ordered']:g}, received {bal['received']:g}, cancelled {cancel_qty:g} {bal['unit']}]",
+                     req_id))
+        _po_ledger_add(req_id, "Cancelled", cancel_qty, bal["unit"], reason.strip())
+    log_audit("UPDATE", "procurement_requests", req_id,
+              f"Short-closed: cancelled {cancel_qty:g} {bal['unit']} | {reason.strip()}")
+    return True, (f"PO short-closed — received {bal['received']:g}, cancelled {cancel_qty:g} {bal['unit']}."
+                  if bal["received"] > 0 else f"PO cancelled — {cancel_qty:g} {bal['unit']} released.")
 
 # ================= VENDOR PERFORMANCE =================
 # NEW: compares each vendor's promised delivery (the "Material Received"
@@ -6257,13 +6835,14 @@ def get_bom_lines(bom_id: int) -> pd.DataFrame:
         "SELECT * FROM bom_lines WHERE bom_id = ? ORDER BY sequence, id", conn, params=(bom_id,)
     )
 
-def _activate_bom(bom_id: int, product: str) -> None:
+def _activate_bom(bom_id: int, product: str, commit: bool = True) -> None:
     """Marks one BOM version active and deactivates every other version of
     the same product — so exactly one version is ever "the" formula, while
     older versions stay in the table for history/traceability."""
     cur.execute("UPDATE bom_headers SET is_active=0 WHERE product = ?", (product,))
     cur.execute("UPDATE bom_headers SET is_active=1 WHERE id = ?", (bom_id,))
-    conn.commit()
+    if commit:
+        conn.commit()
 
 def create_bom_header(product: str, version: str, formula_code: str, batch_size: float,
                        batch_unit: str, notes: str) -> tuple[bool, str, int | None]:
@@ -6467,14 +7046,19 @@ def approve_bom(bom_id: int, product: str) -> tuple[bool, str]:
     if not _v["is_valid"]:
         return False, ("🔴 Formulation is not valid and cannot be approved:\n- " +
                         "\n- ".join(_v["issues"]))
-    cur.execute(
-        "UPDATE bom_headers SET status='Superseded' WHERE product=? AND status='Approved' AND id != ?",
-        (product, bom_id)
-    )
-    cur.execute("UPDATE bom_headers SET status='Approved' WHERE id=?", (bom_id,))
-    conn.commit()
-    _activate_bom(bom_id, product)
-    log_audit("UPDATE", "bom_headers", bom_id, f"Approved & activated for {product}")
+    # FIX (P0-8): supersede + approve + activate commit together or not at all.
+    with _write_lock():
+        cur.execute(
+            "UPDATE bom_headers SET status='Superseded' WHERE product=? AND status='Approved' AND id != ?",
+            (product, bom_id)
+        )
+        cur.execute("UPDATE bom_headers SET status='Approved' WHERE id=?", (bom_id,))
+        _activate_bom(bom_id, product, commit=False)
+        cur.execute(
+            "INSERT INTO audit_log VALUES (NULL,?,?,?,?,?,?)",
+            (now_ist().isoformat(timespec="seconds"), st.session_state.get("username", "system"),
+             "UPDATE", "bom_headers", str(bom_id), f"Approved & activated for {product}")
+        )
     return True, f"Formula {bom_id} approved and activated for {product}."
 
 def get_bom(bom_id: int) -> dict | None:
@@ -6514,10 +7098,18 @@ def scale_bom_lines(bom_id: int, target_qty: float) -> pd.DataFrame:
 
 def calculate_material_requirement(product: str, qty_to_produce: float,
                                     factory: str | None = None) -> pd.DataFrame:
-    """Scales the active BOM's per-batch quantities to a planned production
-    quantity, and compares against current closing stock — factory-specific
-    if `factory` is given, otherwise summed across all factories. Returns an
-    empty DataFrame if there's no active BOM or no lines on it."""
+    """Scales the active BOM's per-batch quantities to a planned production quantity and compares
+    against AVAILABLE raw material.
+
+    FIX (P0-38): availability used to come from the legacy hand-entered `stock.closing_stock` ledger,
+    so Production Metrics could say 8.0 MT while Stock / Procurement (get_rm_physical_stock) said
+    2.4 MT. It now uses the same authoritative engine — QC-approved receipts - consumption + posted
+    adjustments - active reservations — so every screen answers the same question. All quantities are
+    converted to the material's base unit. `factory` None = sum across the factories the caller may
+    see (a non-admin is always pinned to their own). `on_order_qty` is the committed-but-not-yet-
+    received PO quantity (specific factory only) and `to_order_qty` the shortage net of it — what a
+    new request should actually ask for, so a shortage already on order isn't ordered twice.
+    `unconverted` flags rows whose figures are approximate (missing unit-conversion factor)."""
     bom = get_active_bom(product)
     if bom is None:
         return pd.DataFrame()
@@ -6525,28 +7117,31 @@ def calculate_material_requirement(product: str, qty_to_produce: float,
     if lines.empty:
         return pd.DataFrame()
     scale = qty_to_produce / bom["batch_size"] if bom["batch_size"] else 0
+    if not _is_admin:
+        factory = _user_factory
+    scope = [factory] if factory else list(FACTORIES)
 
     rows = []
     for _, ln in lines.iterrows():
-        required = ln["qty_per_batch"] * scale
-        if factory:
-            row = cur.execute(
-                "SELECT closing_stock FROM stock WHERE material=? AND factory=? "
-                "ORDER BY id DESC LIMIT 1", (ln["material"], factory)
-            ).fetchone()
-            available = row[0] if row else 0
-        else:
-            row = cur.execute(
-                "SELECT COALESCE(SUM(closing_stock),0) FROM stock s1 WHERE material = ? "
-                "AND id = (SELECT MAX(id) FROM stock s2 "
-                "WHERE s2.material = s1.material AND s2.factory = s1.factory)",
-                (ln["material"],)
-            ).fetchone()
-            available = row[0] if row else 0
+        mat = ln["material"]
+        base_unit = get_material_base_unit(mat)
+        req_conv, req_exact, _n = convert_material_qty_to_base(mat, ln["qty_per_batch"] * scale,
+                                                               ln["unit"] or base_unit)
+        available, on_order, approx = 0.0, 0.0, not req_exact
+        for fac_ in scope:
+            snap = get_rm_physical_stock(fac_, mat)
+            available += snap["available_qty"]
+            approx = approx or bool(snap["unconverted"])
+            if factory:
+                on_order += get_open_po_qty(mat, fac_)
+        shortage = max(0.0, req_conv - available)
         rows.append({
-            "material": ln["material"], "unit": ln["unit"],
-            "required_qty": round(required, 3), "available_qty": round(available, 3),
-            "shortage": round(max(0.0, required - available), 3),
+            "material": mat, "unit": base_unit,
+            "required_qty": round(req_conv, 3), "available_qty": round(available, 3),
+            "shortage": round(shortage, 3),
+            "on_order_qty": round(on_order, 3),
+            "to_order_qty": round(max(0.0, shortage - on_order), 3),
+            "unconverted": approx,
         })
     return pd.DataFrame(rows)
 
@@ -7354,6 +7949,96 @@ def update_sales_order(so_id: int, *, date_val, customer: str, sales_rep: str, p
               f"{qty:g} {ordered_unit} @ {unit_price:g} | lock level was '{_lvl}'")
     return True, "Sales order updated."
 
+# ── Sales Order delete / cancel (audit P0-3) ───────────────────────────────
+# update_sales_order() locks an order once Production/Dispatch depends on it; deletion used to go
+# through the generic DELETE helper and bypassed that lifecycle. Hard delete is now allowed ONLY
+# for an untouched order; everything else is Cancel (or, once shipped, an amendment / credit note).
+def get_so_dependents(so_id: int) -> list[str]:
+    """Every downstream record that points at this Sales Order ([] = nothing depends on it)."""
+    deps: list[str] = []
+    def _n(sql: str) -> int:
+        return int(cur.execute(sql, (so_id,)).fetchone()[0] or 0)
+    if _n("SELECT COUNT(*) FROM production_instructions WHERE sales_order_id=?"):
+        deps.append(f"{_n('SELECT COUNT(*) FROM production_instructions WHERE sales_order_id=?')} "
+                    "Production Instruction(s)")
+    _nb = _n("SELECT COUNT(*) FROM production_batches WHERE production_instruction_id IN "
+             "(SELECT id FROM production_instructions WHERE sales_order_id=?)")
+    if _nb:
+        deps.append(f"{_nb} production batch(es)")
+    _nd = _n("SELECT COUNT(*) FROM sales WHERE sales_order_id=?")
+    if _nd:
+        deps.append(f"{_nd} dispatch(es)")
+    if _n("SELECT COUNT(*) FROM sales_orders WHERE id=? AND COALESCE(instruction_id,0)<>0"):
+        deps.append("a linked Production Instruction reference")
+    if _n("SELECT COUNT(*) FROM sales_orders WHERE id=? AND COALESCE(dispatched_qty,0)>0"):
+        deps.append("dispatched quantity")
+    if _n("SELECT COUNT(*) FROM invoice_numbers WHERE order_id=?"):
+        deps.append("an issued invoice number")
+    return deps
+
+def delete_sales_order(so_id: int, reason: str) -> tuple[bool, str]:
+    """HARD delete — only for a brand-new order (wo_status New, no PI, no batch, no dispatch, no
+    invoice, no dependent transaction). Admin-only, reason mandatory, fully audited. Anything else
+    must be cancelled (cancel_sales_order) or amended — never physically removed."""
+    if not _is_admin:
+        return False, "Deleting a Sales Order is restricted to Administrators."
+    if not reason or not reason.strip():
+        return False, "A deletion reason is required."
+    _fe = _factory_error_for("sales_orders", so_id)
+    if _fe:
+        return False, _fe
+    with _write_lock():
+        row = cur.execute("SELECT wo_status, customer, product, qty, factory FROM sales_orders WHERE id=?",
+                          (so_id,)).fetchone()
+        if row is None:
+            return False, f"Sales Order #{so_id} not found."
+        wo = row[0] or "New"
+        lvl, why = get_so_lock_level(so_id)
+        deps = get_so_dependents(so_id)
+        if wo != "New" or lvl != "open" or deps:
+            blockers = ", ".join(deps) if deps else (why or f"order is '{wo}'")
+            return False, (f"🔒 Sales Order #{so_id} cannot be deleted — {blockers}. Use Cancel (or an "
+                           "amendment / credit note once dispatched); only an untouched 'New' order can "
+                           "be hard-deleted.")
+        cur.execute("DELETE FROM sales_orders WHERE id=? AND COALESCE(wo_status,'New')='New'", (so_id,))
+    log_audit("DELETE", "sales_orders", so_id,
+              f"{row[4]} | {row[2]} | {row[1]} | qty {row[3]} | reason={reason.strip()}")
+    return True, f"Sales Order #{so_id} deleted."
+
+def cancel_sales_order(so_id: int, reason: str) -> tuple[bool, str]:
+    """Cancels (voids) an order that has not entered production: wo_status 'Cancelled', record kept
+    for audit. Refused if any dispatch, batch or live Production Instruction exists — a live PI must be
+    cancelled first by R&D so its reservations are released."""
+    if not _dept_allows("Sales"):
+        return False, "Only Sales (or Admin) can cancel a Sales Order."
+    if not reason or not reason.strip():
+        return False, "A cancellation reason is required."
+    _fe = _factory_error_for("sales_orders", so_id)
+    if _fe:
+        return False, _fe
+    with _write_lock():
+        row = cur.execute("SELECT wo_status FROM sales_orders WHERE id=?", (so_id,)).fetchone()
+        if row is None:
+            return False, f"Sales Order #{so_id} not found."
+        if (row[0] or "New") not in ("New", "Sent to Production"):
+            return False, f"Order is '{row[0]}' — only a New / Sent-to-Production order can be cancelled."
+        if cur.execute("SELECT 1 FROM sales WHERE sales_order_id=? LIMIT 1", (so_id,)).fetchone() or \
+           cur.execute("SELECT 1 FROM sales_orders WHERE id=? AND COALESCE(dispatched_qty,0)>0",
+                       (so_id,)).fetchone():
+            return False, "Dispatches exist against this order — raise an amendment / credit note instead."
+        if cur.execute("SELECT 1 FROM production_batches WHERE production_instruction_id IN "
+                       "(SELECT id FROM production_instructions WHERE sales_order_id=?) LIMIT 1",
+                       (so_id,)).fetchone():
+            return False, "Production batches exist against this order — it can no longer be cancelled here."
+        if cur.execute("SELECT 1 FROM production_instructions WHERE sales_order_id=? AND status<>'Cancelled' LIMIT 1",
+                       (so_id,)).fetchone():
+            return False, ("A live Production Instruction exists — ask R&D to cancel it first "
+                           "(so its RM reservations are released), then cancel the order.")
+        cur.execute("UPDATE sales_orders SET wo_status='Cancelled', production_status='Cancelled', "
+                    "cancel_reason=? WHERE id=?", (reason.strip(), so_id))
+    log_audit("UPDATE", "sales_orders", so_id, f"Cancelled | reason={reason.strip()}")
+    return True, f"Sales Order #{so_id} cancelled."
+
 def get_sales_orders_pending_production(restrict_factory: str | None = None) -> pd.DataFrame:
     """Sales Orders that have been forwarded to Production but don't yet
     have a Production Instruction issued against them. FIX: previously
@@ -7699,7 +8384,31 @@ def raise_ncr(source_stage: str, reference_id: int, batch_no: str, description: 
 # ── Stage 1: Incoming Material (Stores) ─────────────────────────────────────
 def create_rm_batch(supplier: str, po_reference: str, material: str, batch_no: str,
                      quantity: float, unit: str, factory: str, received_date) -> int:
+    """Logs an incoming RM receipt. Server-side integrity (audit P1-4):
+      * quantity must be a finite number > 0
+      * supplier + supplier batch number required; the physical lot identity
+        (factory + material + supplier + supplier batch no, case-insensitive) may be received once
+      * the receipt must be tied to a real purchase transaction: the PO number must belong to an
+        open procurement request for this material/factory whose PO stage is complete (see
+        RM_RECEIPT_REQUIRES_PO), and cumulative receipts may not exceed the order by more than
+        RM_OVER_RECEIPT_TOLERANCE
+      * the receipt drives the procurement request's Material Received / QC / Stock stages."""
     assert_factory_access(factory)   # P0-1 — raises PermissionError on cross-factory
+    if not _dept_allows("Stores"):
+        raise PermissionError("Only Stores can log incoming material.")
+    supplier = (supplier or "").strip()
+    batch_no = (batch_no or "").strip()
+    po_reference = (po_reference or "").strip()
+    if not supplier or not batch_no:
+        raise ValueError("Supplier and supplier batch number are required.")
+    if not _is_real_number(quantity) or float(quantity) <= 0:
+        raise ValueError("Received quantity must be a number greater than zero.")
+    quantity = float(quantity)
+    try:
+        if received_date and str(received_date)[:10] > str(today_ist()):
+            raise ValueError("Received date cannot be in the future.")
+    except TypeError:
+        pass
     # FIX (P0-9): an RM receipt in a unit that can't be converted to the material's
     # base unit would put an unqualified number into stock/reservations. Block it.
     if get_material_unit_factor(material, unit) is None:
@@ -7707,14 +8416,50 @@ def create_rm_batch(supplier: str, po_reference: str, material: str, batch_no: s
             f"No conversion factor on file from '{unit}' to {material}'s base unit "
             f"({get_material_base_unit(material)}). Set it in Stock → 📇 Material Master → "
             "⚖️ Unit Conversion Factors, then log the receipt again.")
-    cur.execute(
-        "INSERT INTO rm_batches VALUES (NULL,?,?,?,?,?,?,?,?,?,?,?)",
-        (supplier, po_reference, material, batch_no, quantity, unit, factory,
-         str(received_date), "Awaiting QC", st.session_state.get("username", "system"), _now_iso())
-    )
-    conn.commit()
-    rm_id = cur.lastrowid
-    log_audit("INSERT", "rm_batches", rm_id, f"{material} | batch {batch_no} | {supplier}")
+    req_id = None
+    if RM_RECEIPT_REQUIRES_PO or po_reference:
+        req_id, _perr = resolve_procurement_for_receipt(po_reference, material, factory)
+        if _perr and RM_RECEIPT_REQUIRES_PO:
+            raise ValueError(_perr)
+    try:
+        with _write_lock():
+            dup = cur.execute(
+                "SELECT id, status FROM rm_batches WHERE factory=? AND material=? "
+                "AND UPPER(TRIM(supplier))=UPPER(?) AND UPPER(TRIM(batch_no))=UPPER(?)",
+                (factory, material, supplier, batch_no)).fetchone()
+            if dup:
+                raise ValueError(
+                    f"Supplier lot '{batch_no}' from {supplier} for {material} was already received as "
+                    f"RM-{dup[0]:05d} ({dup[1]}). A physical lot can only be received once.")
+            if req_id is not None:
+                req = _proc_request_row(req_id)
+                ordered = convert_material_qty_to_base(material, req[3] or 0,
+                                                       req[4] or get_material_base_unit(material))[0]
+                this_base = convert_material_qty_to_base(material, quantity, unit)[0]
+                already = _proc_lot_qty_base(req_id, exclude_rejected=True)
+                if ordered > 0 and already + this_base > ordered * (1 + RM_OVER_RECEIPT_TOLERANCE) + 1e-9:
+                    raise ValueError(
+                        f"Receipt exceeds the PO: ordered {ordered:g}, already received {already:g}, "
+                        f"this lot {this_base:g} {get_material_base_unit(material)} "
+                        f"(tolerance +{RM_OVER_RECEIPT_TOLERANCE:.0%}).")
+            cur.execute(
+                "INSERT INTO rm_batches (supplier, po_reference, material, batch_no, quantity, unit, "
+                "factory, received_date, status, created_by, created_at, procurement_request_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (supplier, po_reference, material, batch_no, quantity, unit, factory,
+                 str(received_date), "Awaiting QC", st.session_state.get("username", "system"),
+                 _now_iso(), req_id))
+            rm_id = cur.lastrowid
+    except sqlite3.IntegrityError as _ie:
+        raise ValueError(f"Duplicate supplier lot rejected by the database: {_ie}") from _ie
+    if req_id is not None:
+        with _write_lock():
+            _po_ledger_add(req_id, "Received", convert_material_qty_to_base(material, quantity, unit)[0],
+                           get_material_base_unit(material), f"RM-{rm_id:05d} lot {batch_no}")
+        sync_procurement_stages(req_id)
+    log_audit("INSERT", "rm_batches", rm_id,
+              f"{material} | batch {batch_no} | {supplier} | PO {po_reference or '-'}"
+              + (f" | PR-{req_id:05d}" if req_id else ""))
     return rm_id
 
 # ── Stage 2: Incoming QC ─────────────────────────────────────────────────────
@@ -7760,6 +8505,14 @@ def record_incoming_inspection(rm_batch_id: int, appearance: str, colour: str, m
     conn.commit()
     _rm = cur.execute("SELECT material, batch_no FROM rm_batches WHERE id=?", (rm_batch_id,)).fetchone()
     log_audit("UPDATE", "rm_batches", rm_batch_id, f"Incoming QC: {decision}")
+    _lnk = cur.execute("SELECT procurement_request_id FROM rm_batches WHERE id=?", (rm_batch_id,)).fetchone()
+    if _lnk and _lnk[0]:
+        _lq = cur.execute("SELECT material, quantity, unit FROM rm_batches WHERE id=?", (rm_batch_id,)).fetchone()
+        with _write_lock():
+            _po_ledger_add(int(_lnk[0]), "QC Approved" if decision == "Pass" else "QC Rejected",
+                           convert_material_qty_to_base(_lq[0], _lq[1] or 0, _lq[2] or get_material_base_unit(_lq[0]))[0],
+                           get_material_base_unit(_lq[0]), f"RM-{rm_batch_id:05d}")
+        sync_procurement_stages(int(_lnk[0]))   # QC outcome drives Quality Inspection / Stock Updated
     if decision == "Fail":
         cur.execute("INSERT INTO supplier_return_notes VALUES (NULL,?,?,?)",
                      (rm_batch_id, remarks or "Failed incoming inspection", _now_iso()))
@@ -7900,12 +8653,127 @@ def _check_pi_material_integrity(pi_id: int, bom_id, rm_ids: list[int], usage: d
                     f"release more, or reduce the quantity used.")
     return ""
 
+# ── Formula-vs-actual variance CONTROL (audit P1-5) ─────────────────────────
+#   |variance| <= VARIANCE_WARN_PCT                 -> normal
+#   WARN < |variance| <= VARIANCE_BLOCK_PCT         -> allowed, written reason mandatory
+#   |variance| >  VARIANCE_BLOCK_PCT                -> blocked until a QC approver (different from
+#                                                      the person who raised it) approves the deviation
+# Expected = the batch's frozen BOM line scaled to the batch's actual output; actual = qty_used of
+# the RM lots, both converted to the material's base unit. Every check is stored in batch_variance_log.
+def _variance_band(pct: float) -> str:
+    a = abs(pct)
+    if a <= VARIANCE_WARN_PCT + 1e-9:
+        return "Normal"
+    if a <= VARIANCE_BLOCK_PCT + 1e-9:
+        return "Warning"
+    return "Deviation"
+
+def compute_material_variance(bom_id, quantity, quantity_unit, rm_ids: list[int], usage: dict) -> list[dict]:
+    """Per-material expected vs actual for one batch. [] when it cannot be scaled (no BOM, no
+    output, or output unit not convertible to the formula's batch unit) — never fabricates a scale."""
+    if not bom_id or not quantity or float(quantity) <= 0:
+        return []
+    bom = get_bom(int(bom_id))
+    if not bom or not bom.get("batch_size"):
+        return []
+    b_unit = bom.get("batch_unit") or ""
+    out_qty = float(quantity)
+    if b_unit and quantity_unit and not units_equivalent(quantity_unit, b_unit):
+        out_qty = convert_weight_qty(out_qty, quantity_unit, b_unit)
+        if out_qty is None:
+            return []
+    scale = out_qty / float(bom["batch_size"])
+    actual: dict[str, float] = {}
+    for rid in rm_ids:
+        r = cur.execute("SELECT material, unit FROM rm_batches WHERE id=?", (rid,)).fetchone()
+        if not r:
+            continue
+        conv, exact, _n = convert_material_qty_to_base(r[0], usage.get(rid, 0.0), r[1] or get_material_base_unit(r[0]))
+        if not exact:
+            return []          # an unconvertible lot would make every number approximate — don't guess
+        key = canonical_material(r[0])
+        actual[key] = actual.get(key, 0.0) + conv
+    rows: list[dict] = []
+    for _, ln in get_bom_lines(int(bom_id)).iterrows():
+        mat = ln["material"]
+        exp, ok_e, _n = convert_material_qty_to_base(mat, float(ln["qty_per_batch"] or 0) * scale,
+                                                     ln["unit"] or get_material_base_unit(mat))
+        if not ok_e or exp <= 0:
+            continue
+        act = actual.get(canonical_material(mat), 0.0)
+        pct = (act - exp) / exp * 100.0
+        rows.append({"material": mat, "expected_qty": round(exp, 4), "actual_qty": round(act, 4),
+                     "unit": get_material_base_unit(mat), "variance_pct": round(pct, 2),
+                     "band": _variance_band(pct)})
+    return rows
+
+def _deviation_signature(pi_id, product, factory, quantity, quantity_unit, rm_ids, usage) -> str:
+    import json as _json
+    payload = _json.dumps({"pi": pi_id, "p": product, "f": factory, "q": round(float(quantity), 6),
+                           "u": (quantity_unit or "").upper(),
+                           "m": sorted((int(r), round(float(usage[r]), 6)) for r in rm_ids)}, sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+def _deviation_gate(sig: str, pi_id, product: str, factory: str, dev_rows: list[dict],
+                    reason: str) -> tuple[bool, str]:
+    """True when every out-of-tolerance material of this exact submission has an Approved deviation.
+    Otherwise raises the pending request(s) once and returns (False, why)."""
+    need = {r["material"] for r in dev_rows}
+    with _write_lock():
+        ex = cur.execute("SELECT material, status, raised_by FROM production_deviations WHERE signature=? "
+                         "AND status IN ('Pending','Approved','Rejected')", (sig,)).fetchall()
+        if any(e[1] == "Rejected" for e in ex):
+            return False, ("This exact consumption was REJECTED by the deviation approver. Change the "
+                           "quantities (or ask R&D to revise the formula) and resubmit.")
+        approved = {e[0] for e in ex if e[1] == "Approved"}
+        if need <= approved:
+            return True, ""
+        pending = {e[0] for e in ex if e[1] == "Pending"}
+        user = st.session_state.get("username", "system")
+        for r in dev_rows:
+            if r["material"] in approved or r["material"] in pending:
+                continue
+            cur.execute(
+                "INSERT INTO production_deviations (signature, production_instruction_id, product, factory, "
+                "material, expected_qty, actual_qty, unit, variance_pct, reason, raised_by, raised_at, status) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'Pending')",
+                (sig, pi_id, product, factory, r["material"], r["expected_qty"], r["actual_qty"], r["unit"],
+                 r["variance_pct"], reason, user, _now_iso()))
+        newly = need - approved - pending
+    if newly:
+        log_audit("INSERT", "production_deviations", sig, f"Deviation approval raised: {', '.join(sorted(newly))}")
+    return False, ""
+
+def decide_production_deviation(signature: str, approve: bool, note: str) -> tuple[bool, str]:
+    """QC (or Admin) approves/rejects a pending formula deviation. The approver may not be the person
+    who raised it."""
+    if not _dept_allows("QC"):
+        return False, "Only QC (or Admin) can approve or reject a formula deviation."
+    user = st.session_state.get("username", "system")
+    with _write_lock():
+        rows = cur.execute("SELECT id, factory, raised_by FROM production_deviations "
+                           "WHERE signature=? AND status='Pending'", (signature,)).fetchall()
+        if not rows:
+            return False, "No pending deviation found (already decided?)."
+        if not _factory_allowed(rows[0][1]):
+            return False, _CROSS_FACTORY_MSG
+        if any(r[2] == user for r in rows):
+            return False, "Segregation of duties: you raised this deviation, so someone else must decide it."
+        if not approve and not (note or "").strip():
+            return False, "A reason is required to reject a deviation."
+        cur.execute("UPDATE production_deviations SET status=?, approved_by=?, approved_at=?, approval_note=? "
+                    "WHERE signature=? AND status='Pending'",
+                    ("Approved" if approve else "Rejected", user, _now_iso(), (note or "").strip(), signature))
+    log_audit("UPDATE", "production_deviations", signature, ("Approved" if approve else "Rejected"))
+    return True, "Deviation approved — Production can resubmit the batch." if approve else "Deviation rejected."
+
 def create_production_batch(product: str, formula: str, factory: str, operator: str,
                              machine: str, shift: str, rm_batch_ids: list[int],
                              qty_used_map: dict[int, float], quantity: float | None = None,
                              quantity_unit: str = "",
                              production_instruction_id: int | None = None,
-                             planned_qty: float | None = None) -> tuple[int | None, str]:
+                             planned_qty: float | None = None,
+                             variance_reason: str = "") -> tuple[int | None, str]:
     """Creates a production batch. Refuses if any selected RM batch isn't
     Approved — this is the actual enforcement, not just a UI filter.
     `quantity`/`quantity_unit` capture the batch's actual output (Section 11)
@@ -8010,6 +8878,40 @@ def create_production_batch(product: str, formula: str, factory: str, operator: 
                 quantity = _converted
             quantity_unit = _pi_unit
 
+    # ── Formula-vs-actual control (audit P1-5) ──────────────────────────────
+    _vrows: list[dict] = []
+    _dev_rows: list[dict] = []
+    _sig = None
+    _vreason = (variance_reason or "").strip()
+    if production_instruction_id is not None:
+        _pi_v = get_production_instruction(production_instruction_id)
+        _bom_pre = _pi_v["bom_id"] if _pi_v else None
+    else:
+        _ab = get_active_bom(product)
+        _bom_pre = _ab["id"] if _ab else None
+    _vrows = compute_material_variance(_bom_pre, quantity, quantity_unit, rm_batch_ids, qty_used_map)
+    _warn_rows = [r for r in _vrows if r["band"] == "Warning"]
+    _dev_rows = [r for r in _vrows if r["band"] == "Deviation"]
+    if (_warn_rows or _dev_rows) and not _vreason:
+        return None, ("Consumption deviates from the formula by more than ±"
+                      f"{VARIANCE_WARN_PCT:g}% for: "
+                      + "; ".join(f"{r['material']} {r['variance_pct']:+.1f}% "
+                                  f"(std {r['expected_qty']:g}, used {r['actual_qty']:g} {r['unit']})"
+                                  for r in _warn_rows + _dev_rows)
+                      + ". Enter a variance reason to continue.")
+    if _dev_rows:
+        _sig = _deviation_signature(production_instruction_id, product, factory, quantity, quantity_unit,
+                                    rm_batch_ids, qty_used_map)
+        _gate_ok, _gate_msg = _deviation_gate(_sig, production_instruction_id, product, factory,
+                                              _dev_rows, _vreason)
+        if not _gate_ok:
+            return None, (_gate_msg or (
+                "🛑 Deviation approval required: " + "; ".join(
+                    f"{r['material']} {r['variance_pct']:+.1f}%" for r in _dev_rows)
+                + f" is beyond ±{VARIANCE_BLOCK_PCT:g}% of the formula. A request has been raised for QC — "
+                  "resubmit this same batch once it is approved (Quality → Production Batch → "
+                  "Formula Deviation Approvals)."))
+
     # Batch number allocated BEFORE the write lock (generate_batch_no() opens its
     # own _write_lock(), which cannot nest inside the one below).
     try:
@@ -8064,6 +8966,12 @@ def create_production_batch(product: str, formula: str, factory: str, operator: 
                             f"{_pi_now[3]} — required {_required:g}, already produced "
                             f"{_produced:g}, remaining {max(_remaining, 0):g} {_pi_now[2]}. Reduce the "
                             f"output, or ask R&D to raise/re-issue the instruction.")
+            if _dev_rows:
+                # re-validate the approval INSIDE the transaction (it may have been consumed/rejected)
+                _n_ok = cur.execute("SELECT COUNT(DISTINCT material) FROM production_deviations "
+                                    "WHERE signature=? AND status='Approved'", (_sig,)).fetchone()[0]
+                if _n_ok < len({r["material"] for r in _dev_rows}):
+                    return None, "The deviation approval is no longer valid — resubmit to raise a new one."
             cur.execute(
                 "INSERT INTO production_batches "
                 "(batch_no,product,formula,factory,operator,machine,shift,status,created_at,"
@@ -8077,6 +8985,21 @@ def create_production_batch(product: str, formula: str, factory: str, operator: 
             for rid in rm_batch_ids:
                 cur.execute("INSERT INTO production_batch_materials VALUES (NULL,?,?,?)",
                              (pb_id, rid, qty_used_map[rid]))   # P0-36: validated, never defaulted
+            _approver = None
+            if _dev_rows:
+                _ar = cur.execute("SELECT approved_by FROM production_deviations WHERE signature=? "
+                                  "AND status='Approved' LIMIT 1", (_sig,)).fetchone()
+                _approver = _ar[0] if _ar else None
+                cur.execute("UPDATE production_deviations SET status='Consumed', production_batch_id=? "
+                            "WHERE signature=? AND status='Approved'", (pb_id, _sig))
+            for _vr in _vrows:
+                cur.execute(
+                    "INSERT INTO batch_variance_log (production_batch_id, material, expected_qty, actual_qty, "
+                    "unit, variance_pct, band, reason, raised_by, approved_by, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (pb_id, _vr["material"], _vr["expected_qty"], _vr["actual_qty"], _vr["unit"],
+                     _vr["variance_pct"], _vr["band"], _vreason if _vr["band"] != "Normal" else "",
+                     operator, _approver if _vr["band"] == "Deviation" else None, _now_iso()))
             _so_link = None
             if production_instruction_id is not None:
                 # FIX (P0-6): reservation draw-down, the PI's In-Production stamp and
@@ -8519,6 +9442,16 @@ def generate_batch_qr_png(batch_no: str) -> bytes | None:
     img.save(buf, format="PNG")
     return buf.getvalue()
 
+def _pdf_credit_footer(canvas, doc) -> None:
+    """Discreet one-line credit in the bottom margin of every PDF page.
+    Text only (no signature image) so it can never be mistaken for a
+    QC / authorising signature on an MTC, test report or invoice."""
+    canvas.saveState()
+    canvas.setFont("Helvetica", 7)
+    canvas.setFillColor(colors.HexColor("#8C7B62"))
+    canvas.drawCentredString(doc.pagesize[0] / 2.0, 8 * mm, _credit_line())
+    canvas.restoreState()
+
 def generate_traceability_pdf(trace: dict) -> bytes | None:
     """Builds a one-page traceability certificate PDF from the dict returned
     by get_batch_traceability(). Returns None if reportlab isn't installed."""
@@ -8618,7 +9551,7 @@ def generate_traceability_pdf(trace: dict) -> bytes | None:
         story.append(Paragraph("Scan to look up this batch:", body))
         story.append(RLImage(qr_buf, width=28*mm, height=28*mm))
 
-    doc.build(story)
+    doc.build(story, onFirstPage=_pdf_credit_footer, onLaterPages=_pdf_credit_footer)
     return buf.getvalue()
 
 # ── Shared PDF table helper for the three documents below ─────────────────
@@ -8725,7 +9658,7 @@ def generate_batch_card_pdf(trace: dict) -> bytes | None:
         "materials — QC test results are on the separate Test Report / Material Testing "
         "Certificate for this batch.", body))
 
-    doc.build(story)
+    doc.build(story, onFirstPage=_pdf_credit_footer, onLaterPages=_pdf_credit_footer)
     return buf.getvalue()
 
 def generate_test_report_pdf(trace: dict) -> bytes | None:
@@ -8817,7 +9750,7 @@ def generate_test_report_pdf(trace: dict) -> bytes | None:
         "batch. For a short customer-facing certificate, see the Material Testing Certificate.",
         body))
 
-    doc.build(story)
+    doc.build(story, onFirstPage=_pdf_credit_footer, onLaterPages=_pdf_credit_footer)
     return buf.getvalue()
 
 def generate_mtc_pdf(trace: dict) -> bytes | None:
@@ -8897,7 +9830,7 @@ def generate_mtc_pdf(trace: dict) -> bytes | None:
     sign_row.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")]))
     story.append(sign_row)
 
-    doc.build(story)
+    doc.build(story, onFirstPage=_pdf_credit_footer, onLaterPages=_pdf_credit_footer)
     return buf.getvalue()
 # FIX: company GSTIN used to be a hardcoded placeholder string that would
 # print on real customer tax invoices unless someone remembered to edit the
@@ -9016,15 +9949,15 @@ def generate_invoice_pdf(order_row: dict, customer_row: dict | None) -> bytes | 
     story.append(Paragraph(f"Sales Representative: {o.get('sales_rep') or '—'}", body))
     story.append(Paragraph("This is a computer-generated invoice.", styles["Italic"]))
 
-    doc.build(story)
+    doc.build(story, onFirstPage=_pdf_credit_footer, onLaterPages=_pdf_credit_footer)
     return buf.getvalue()
 
 def get_order_status(order_id: int, restrict_factory: str | None = None) -> dict | None:
     """Customer-facing order status lookup: which batch (if known) fulfilled
     this order and its dispatch stage, for a simple 'has my order shipped'
-    answer without a phone call. Best-effort — links an order to a batch via
-    matching product + factory + date, since sales_orders doesn't currently
-    store a direct batch reference.
+    answer without a phone call. The batch is found through the Production
+    Instruction raised for this order (SO -> PI -> Batch); if no PI/batch
+    exists yet, no batch is reported rather than guessed.
 
     FIX: previously looked up by order id alone with no factory check — a
     factory-locked supervisor account could type any order number and see
@@ -9052,20 +9985,28 @@ def get_order_status(order_id: int, restrict_factory: str | None = None) -> dict
     # P0-10: the MANUFACTURING factory is the Production Instruction's, not the
     # legacy sales_orders.factory tag — use the PI's factory when one exists,
     # and prefer batches actually raised against that PI.
-    _mfg_fac = get_manufacturing_factory(order_row["id"]) or order_row["factory"]
-    candidate = cur.execute("""
-        SELECT pb.batch_no, pb.status, da.date AS dispatch_date
+    # FIX (P0-10): trace SO -> Production Instruction -> Batch. The old
+    # "latest batch of the same product at the same factory" guess could show
+    # another customer's batch once two orders ran concurrently, so a batch is
+    # reported only when it is actually linked through the PI.
+    _linked = cur.execute("""
+        SELECT pb.batch_no, pb.status
         FROM production_batches pb
-        LEFT JOIN dispatch_approval da ON da.production_batch_id = pb.id
-        WHERE pb.product = ? AND pb.factory = ?
-        ORDER BY pb.id DESC LIMIT 1
-    """, (order_row["product"], _mfg_fac)).fetchone()
+        JOIN production_instructions pi ON pi.id = pb.production_instruction_id
+        WHERE pi.sales_order_id = ? AND pi.status NOT IN ('Cancelled')
+        ORDER BY pb.id DESC
+    """, (order_row["id"],)).fetchall()
+    _disp = cur.execute(
+        "SELECT MAX(date) FROM sales WHERE sales_order_id = ?", (order_row["id"],)
+    ).fetchone()
+    candidate = _linked[0] if _linked else None
 
     return {
         "order": order_row,
         "batch_no": candidate[0] if candidate else None,
         "batch_status": candidate[1] if candidate else None,
-        "dispatch_date": candidate[2] if candidate else None,
+        "dispatch_date": _disp[0] if _disp and _disp[0] else None,
+        "batches": [{"batch_no": r[0], "status": r[1]} for r in _linked],
     }
 
 # ================= SIDEBAR =================
@@ -9419,6 +10360,12 @@ if _is_admin:
         except Exception as e:
             logger.warning("Backup download UI failed: %s", e)
             st.caption("Backup download unavailable right now.")
+
+# NEW: authorship credit at the foot of the sidebar (shown to every role).
+st.sidebar.markdown(
+    _signature_html(height_px=30, label_color="#7B8494", invert=True, opacity=0.8),
+    unsafe_allow_html=True,
+)
 
 # ── unit converters ────────────────────────────────────────────────────────
 def to_mt(value: float) -> float:
@@ -10414,6 +11361,12 @@ def record_fg_stock_for_batch(pb_id: int) -> tuple[bool, str]:
     if _net["production_in"] or _net["dispatch_out"] or _net["adjustment"]:
         return False, f"FG Stock already posted for batch {pb['batch_no']} — not posting again."
     _fg_qty, _exact, _note = convert_batch_qty_to_fg_unit(pb["quantity"], pb["quantity_unit"], pb["product"])
+    if not _exact:
+        # FIX (P0-3): never post an ambiguous quantity into a ledger whose unit it doesn't match.
+        return False, (
+            f"🔴 FG Stock NOT posted for batch {pb['batch_no']}: {_note} "
+            f"Fix the unit/pack-weight setting, then post this batch again."
+        )
     _closing = record_fg_stock_movement(
         today_ist(), pb["factory"], pb["product"],
         production_in=_fg_qty, source_module="Packing QC", source_ref_id=pb_id,
@@ -10421,10 +11374,7 @@ def record_fg_stock_for_batch(pb_id: int) -> tuple[bool, str]:
     )
     log_audit("INSERT", "fg_stock", pb_id,
               f"Batch-linked FG Stock IN posted for {pb['batch_no']} ({_fg_qty:g})")
-    _msg = f"✅ FG Stock IN posted for batch {pb['batch_no']}: {_fg_qty:g} (closing {_closing:g})."
-    if not _exact:
-        _msg += f" ⚠️ {_note}"
-    return True, _msg
+    return True, f"✅ FG Stock IN posted for batch {pb['batch_no']}: {_fg_qty:g} (closing {_closing:g})."
 
 def log_reconciliation(check_type: str, fac: str, item_code: str, period_start, period_end,
                         qty_a: float, qty_b: float, detail: str = "",
@@ -10693,7 +11643,7 @@ def run_all_reconciliations(d_start_val, d_end_val, fac_filter: str | None = Non
 
 # ── Customer master ───────────────────────────────────────────────────────
 @st.cache_data(ttl=120, show_spinner=False)
-def _load_customers_cached(_version: int) -> list[str]:
+def _load_customers_cached(version: int) -> list[str]:
     df = pd.read_sql_query("SELECT name FROM customers ORDER BY name", conn)
     return df["name"].tolist() if not df.empty else []
 
@@ -11687,15 +12637,10 @@ if module == "Dashboard":
 
     st.markdown("<div class='fc-section-label'>Factory profit ranking · all time</div>", unsafe_allow_html=True)
     if not sales_all.empty or not cost_all.empty:
-        # Combine Dispatch + Sales Orders revenue per factory
-        _disp_g  = sales_all.groupby("factory")["total"].sum().reset_index() \
-                   if not sales_all.empty else pd.DataFrame(columns=["factory","total"])
-        _so_g    = so_all.groupby("factory")["total"].sum().reset_index() \
-                   if not so_all.empty else pd.DataFrame(columns=["factory","total"])
-        _rev_combined = pd.merge(_disp_g, _so_g, on="factory", how="outer",
-                                 suffixes=("_d","_s")).fillna(0)
-        _rev_combined["total"] = _rev_combined.get("total_d",0) + _rev_combined.get("total_s",0)
-        rev_g  = _rev_combined[["factory","total"]]
+        # FIX (P0-4): revenue = dispatched value ONLY. Sales Orders are order book
+        # (a commitment), so adding them to dispatch double-counted revenue.
+        rev_g  = (sales_all.groupby("factory")["total"].sum().reset_index()
+                  if not sales_all.empty else pd.DataFrame(columns=["factory","total"]))
         cost_g = (cost_all.groupby("factory")["amount"].sum().reset_index()
                   if not cost_all.empty else pd.DataFrame(columns=["factory","amount"]))
         base = pd.DataFrame({"factory": FACTORIES})
@@ -12335,6 +13280,11 @@ elif module == "Production":
                                     _lbl, min_value=0.0, max_value=_sp_rm_max.get(rid, 0.0),
                                     step=1.0, key=f"sp_qty_{_pif}_{rid}")
 
+                        sp_var_reason = st.text_area(
+                            "Formula variance reason",
+                            key=f"sp_var_reason_{_pif}", height=68,
+                            help=f"Required when any material is more than ±{VARIANCE_WARN_PCT:g}% off the "
+                                 f"formula. Beyond ±{VARIANCE_BLOCK_PCT:g}% QC must also approve the deviation.")
                         if st.button(_load_label, key=f"sp_create_{_pif}",
                                      disabled=not (_stores_ok and _prod_dept_ok)):
                             if not sp_operator.strip():
@@ -12351,7 +13301,8 @@ elif module == "Production":
                                     quantity=(sp_out_qty if sp_out_qty > 0 else None),
                                     quantity_unit=(sp_out_unit if sp_out_qty > 0 else ""),
                                     production_instruction_id=_pi_id,
-                                    planned_qty=_planned_next
+                                    planned_qty=_planned_next,
+                                    variance_reason=sp_var_reason
                                 )
                                 if pb_id is None:
                                     st.error(result)
@@ -12391,7 +13342,8 @@ elif module == "Production":
     with tab_metrics:
         st.subheader("📐 Material Requirement Calculator")
         st.caption("Uses the product's Approved/active formulation, scaled to a planned "
-                  "production quantity, and compares against current stock.")
+                  "production quantity, and compares against AVAILABLE raw material "
+                  "(QC-approved receipts − consumption + adjustments − reservations).")
         fc1, fc2, fc3 = st.columns(3)
         with fc1:
             fm_calc_product = st.selectbox("Product", FCSC_PRODUCTS, key="fm_calc_product", format_func=fg_label)
@@ -12399,7 +13351,7 @@ elif module == "Production":
             fm_calc_qty = st.number_input("Planned Production Qty", min_value=0.0, step=1.0,
                                            value=100.0, key="fm_calc_qty")
         with fc3:
-            fm_calc_fac_opts = ["All Factories"] + FACTORIES
+            fm_calc_fac_opts = (["All Factories"] + FACTORIES) if _is_admin else [_user_factory]
             fm_calc_factory = st.selectbox("Check stock at", fm_calc_fac_opts, key="fm_calc_factory")
 
         _fm_bom = get_active_bom(fm_calc_product)
@@ -12426,12 +13378,16 @@ elif module == "Production":
                 _fm_req_disp["lab_code"] = _fm_req_disp["material"].apply(get_lab_code)
                 st.dataframe(
                     _fm_req_disp[["lab_code", "material", "unit", "required_qty",
-                                  "available_qty", "shortage"]].rename(columns={
+                                  "available_qty", "shortage", "on_order_qty", "to_order_qty"]].rename(columns={
                         "lab_code": "Lab Code", "material": "Material", "unit": "Unit",
-                        "required_qty": "Required", "available_qty": "Available", "shortage": "Shortage"
+                        "required_qty": "Required", "available_qty": "Available", "shortage": "Shortage",
+                        "on_order_qty": "On Order (open PO)", "to_order_qty": "Still To Order"
                     }),
                     width='stretch', hide_index=True
                 )
+                if _fm_req_disp["unconverted"].any():
+                    st.warning("Some figures are approximate — a material is missing a unit-conversion "
+                               "factor (Stock → Material Master → Unit Conversion Factors).")
 
                 _fm_cost = bom_standard_cost(fm_calc_product)
                 if _fm_cost:
@@ -12443,21 +13399,35 @@ elif module == "Production":
                                 "Formulas → Material Unit Costs) are included — this is a "
                                 "partial estimate until all materials have a cost set.")
 
-                if not _fm_short.empty and st.button(
-                        "🛒 Raise procurement requests for shortages", key="fm_raise_proc"):
-                    _fm_target_factory = _fm_fac or (factory if factory != ALL_FACTORIES else FACTORIES[0])
-                    _fm_raised = []
-                    for _, _row in _fm_short.iterrows():
-                        _rid = _open_procurement_request(
-                            _row["material"], _fm_target_factory, "manual", _row["shortage"],
-                            _row["unit"],
-                            f"Shortage identified via Production Metrics calculator for "
-                            f"{fm_calc_product} (planned qty {fm_calc_qty:g})"
-                        )
-                        _fm_raised.append(_rid)
-                    st.success(f"✅ Raised {len(_fm_raised)} procurement request(s): "
-                                + ", ".join(f"PR-{r:05d}" for r in _fm_raised))
-                    st.rerun()
+                _fm_can_raise = _dept_allows("Procurement", "Stores")
+                _fm_to_order = fm_req_df[fm_req_df["to_order_qty"] > 0]
+                if not _fm_short.empty:
+                    if not _fm_can_raise:
+                        st.caption("🔒 Only Procurement (or Stores/Admin) can raise procurement requests.")
+                    elif _fm_fac is None:
+                        st.caption("Select a specific factory above to raise procurement requests.")
+                    elif _fm_to_order.empty:
+                        st.info("Every shortage is already covered by open POs — nothing new to order.")
+                    elif st.button("🛒 Raise procurement requests for shortages", key="fm_raise_proc"):
+                        _fm_raised, _fm_errs = [], []
+                        for _, _row in _fm_to_order.iterrows():
+                            try:
+                                _rid = _open_procurement_request(
+                                    _row["material"], _fm_fac, "manual", _row["to_order_qty"], _row["unit"],
+                                    f"Shortage identified via Production Metrics calculator for "
+                                    f"{fm_calc_product} (planned qty {fm_calc_qty:g}); required "
+                                    f"{_row['required_qty']:g}, available {_row['available_qty']:g}, "
+                                    f"on order {_row['on_order_qty']:g} {_row['unit']}"
+                                )
+                                _fm_raised.append(_rid)
+                            except (PermissionError, ValueError) as _fm_e:
+                                _fm_errs.append(f"{_row['material']}: {_fm_e}")
+                        if _fm_errs:
+                            st.error("🛑 " + " | ".join(_fm_errs))
+                        if _fm_raised:
+                            st.success(f"✅ Raised {len(_fm_raised)} procurement request(s): "
+                                        + ", ".join(f"PR-{r:05d}" for r in _fm_raised))
+                            st.rerun()
 
     with tab_entry:
         st.subheader("⚠️ Legacy Direct Production Entry — Admin Correction Mode")
@@ -14299,6 +15269,12 @@ elif module == "Stock":
 
     with tab_entry:
         st.subheader("New Stock Entry")
+        st.warning(
+            "⚠️ **Legacy ledger.** Entries here do **not** change authoritative RM stock "
+            "(approved receipts − consumption + adjustments − reservations). Receive material via "
+            "Procurement → Receipt → Incoming QC, consume it via Production, and correct it via "
+            "🔒 Stock Adjustments. Use this form only for records that must stay on the old ledger."
+        )
         c1, c2, c3 = st.columns(3)
         with c1:
             st_date    = st.date_input("Date", value=today_ist(), key="stk_d")
@@ -15020,7 +15996,31 @@ elif module == "Procurement":
 
                     progress_bar("Workflow progress", done, total_stages)
 
-                    editor_df = stages_df.drop(columns=["id", "seq"]).rename(
+                    _proc_ok = _dept_allows("Procurement", "Stores")
+                    if not _proc_ok:
+                        st.caption("🔒 Read-only — only Procurement (or Stores/Admin) can update this request.")
+
+                    # PO number (needed before the PO stage can complete / goods can be received)
+                    _po_now = (req["po_reference"] if "po_reference" in req.index else "") or ""
+                    _pc1, _pc2 = st.columns([3, 1])
+                    with _pc1:
+                        _po_in = st.text_input("PO Number", value=_po_now, key=f"proc_po_{req_id}",
+                                               disabled=not _proc_ok,
+                                               help="Requires the Approval stage to be Completed. Material can "
+                                                    "only be received against this PO number.")
+                    with _pc2:
+                        st.write("")
+                        if st.button("💾 Save PO", key=f"proc_po_save_{req_id}",
+                                     disabled=(not _proc_ok) or _po_in.strip() == _po_now):
+                            _po_ok, _po_msg = set_procurement_po(req_id, _po_in)
+                            (st.success if _po_ok else st.error)(_po_msg)
+                            if _po_ok:
+                                st.rerun()
+
+                    _manual_df = stages_df[~stages_df["stage_name"].isin(_PROC_DERIVED_STAGES)].reset_index(drop=True)
+                    _derived_df = stages_df[stages_df["stage_name"].isin(_PROC_DERIVED_STAGES)].reset_index(drop=True)
+
+                    editor_df = _manual_df.drop(columns=["id", "seq"]).rename(
                         columns={"stage_name": "Stage", "status": "Status",
                                  "owner": "Owner", "due_date": "Due Date"}
                     )
@@ -15035,46 +16035,58 @@ elif module == "Procurement":
                             "Owner": st.column_config.TextColumn(),
                             "Due Date": st.column_config.DateColumn(),
                         },
-                        hide_index=True, width='stretch',
+                        hide_index=True, width='stretch', disabled=not _proc_ok,
                         key=f"proc_editor_{req_id}",
                     )
 
-                    if st.button("💾 Save Progress", key=f"proc_save_{req_id}"):
-                        for (_, orig), (_, new) in zip(stages_df.iterrows(), edited.iterrows(), strict=True):
+                    if st.button("💾 Save Progress", key=f"proc_save_{req_id}", disabled=not _proc_ok):
+                        _edits = []
+                        for (_, orig), (_, new) in zip(_manual_df.iterrows(), edited.iterrows(), strict=True):
                             new_due = str(new["Due Date"].date()) if pd.notna(new["Due Date"]) else None
-                            if (new["Status"] != orig["status"] or new["Owner"] != orig["owner"]
+                            if (new["Status"] != orig["status"] or (new["Owner"] or "") != (orig["owner"] or "")
                                     or new_due != orig["due_date"]):
-                                completed_at = (
-                                    now_ist().isoformat(timespec="seconds")
-                                    if new["Status"] in ("Completed", "Skipped") else None
-                                )
-                                try:
-                                    cur.execute(
-                                        "UPDATE procurement_stages SET status=?, owner=?, due_date=?, "
-                                        "completed_at=?, updated_by=? WHERE id=?",
-                                        (new["Status"], new["Owner"], new_due, completed_at,
-                                         st.session_state.username, int(orig["id"]))
-                                    )
-                                except sqlite3.Error as e:
-                                    st.error(f"Database error while saving: {e}")
-                        conn.commit()
-                        log_audit("UPDATE", "procurement_stages", req_id, "Stage progress updated")
+                                _edits.append({"id": int(orig["id"]), "status": new["Status"],
+                                               "owner": new["Owner"] or "", "due_date": new_due})
+                        if not _edits:
+                            st.info("No changes to save.")
+                        else:
+                            _up_ok, _up_msg = update_procurement_stages(req_id, _edits)
+                            if _up_ok:
+                                st.success(_up_msg)
+                                st.rerun()
+                            else:
+                                st.error(_up_msg)
 
-                        remaining = cur.execute(
-                            "SELECT COUNT(*) FROM procurement_stages WHERE request_id = ? "
-                            "AND status NOT IN ('Completed','Skipped')",
-                            (req_id,)
-                        ).fetchone()[0]
-                        if remaining == 0:
-                            cur.execute(
-                                "UPDATE procurement_requests SET status='Closed', closed_at=? WHERE id=?",
-                                (now_ist().isoformat(timespec="seconds"), req_id)
-                            )
-                            conn.commit()
-                            log_audit("UPDATE", "procurement_requests", req_id,
-                                       "Auto-closed — all stages complete")
-                            st.success("✅ All stages complete — request closed.")
-                        st.rerun()
+                    # Receipt-driven stages: read-only, derived from rm_batches
+                    st.markdown("**Receipt-driven stages** — set automatically from Incoming Material "
+                                "receipts logged against this PO and from Incoming QC. They cannot be edited "
+                                "by hand, and the request only closes when they are genuinely complete.")
+                    st.dataframe(
+                        _derived_df.drop(columns=["id", "seq"]).rename(
+                            columns={"stage_name": "Stage", "status": "Status",
+                                     "owner": "Owner", "due_date": "Due Date"}),
+                        hide_index=True, width='stretch')
+                    _rs = get_procurement_receipt_summary(req_id)
+                    _bal = get_po_balance(req_id)
+                    _b1, _b2, _b3, _b4, _b5, _b6 = st.columns(6)
+                    _b1.metric("Ordered", f"{_bal['ordered']:g}")
+                    _b2.metric("Received", f"{_bal['received']:g}")
+                    _b3.metric("QC Approved", f"{_bal['approved']:g}")
+                    _b4.metric("Rejected", f"{_bal['rejected']:g}")
+                    _b5.metric("Cancelled", f"{_bal['cancelled']:g}")
+                    _b6.metric("Outstanding", f"{_bal['outstanding']:g}")
+                    st.caption(f"PO balance in {_bal['unit']} · {_rs['awaiting_qc']} lot(s) awaiting QC.")
+                    if _rs["lots"]:
+                        st.dataframe(pd.DataFrame(_rs["lots"]), hide_index=True, width='stretch')
+
+                    with st.expander("Short-close / cancel PO (vendor will not deliver the balance)", expanded=False):
+                        _sc_r = st.text_input("Reason", key=f"proc_sc_reason_{req_id}")
+                        if st.button("Short-close request", key=f"proc_sc_btn_{req_id}",
+                                     disabled=(not _proc_ok) or not _sc_r.strip()):
+                            _sc_ok, _sc_msg = short_close_procurement(req_id, _sc_r)
+                            (st.success if _sc_ok else st.error)(_sc_msg)
+                            if _sc_ok:
+                                st.rerun()
 
     # ── NEW REQUEST (manual) ────────────────────────────────────────────────
     with tab_proc_new:
@@ -15108,25 +16120,35 @@ elif module == "Procurement":
         nr_notify_vendor = st.checkbox("📧 Also notify the vendor directly (if linked)",
                                          value=bool(_suggested_vendor), key="nr_notify_vendor")
 
-        if st.button("🚀 Raise Procurement Request", key="nr_submit"):
+        _nr_can = _dept_allows("Procurement", "Stores")
+        if not _nr_can:
+            st.caption("🔒 Only Procurement (or Stores/Admin) can raise a procurement request.")
+        if st.button("🚀 Raise Procurement Request", key="nr_submit", disabled=not _nr_can):
             if not nr_material:
                 st.warning("Select a material.")
+            elif nr_qty <= 0:
+                st.warning("Quantity needed must be greater than zero.")
             else:
                 _nr_vendor = nr_vendor_pick if nr_vendor_pick != "— No vendor —" else ""
-                req_id = _open_procurement_request(
-                    nr_material, nr_factory, "manual", nr_qty, nr_unit, nr_notes.strip(),
-                    vendor=_nr_vendor
-                )
-                if nr_notify:
-                    sent, msg = send_procurement_alert_email(
-                        nr_material, nr_factory, nr_qty, nr_qty, nr_unit, req_id)
-                    (st.success if sent else st.warning)(msg)
-                if nr_notify_vendor and _nr_vendor:
-                    vsent, vmsg = send_vendor_email(
-                        _nr_vendor, nr_material, nr_factory, nr_qty, nr_unit, req_id)
-                    (st.success if vsent else st.warning)(vmsg)
-                st.success(f"✅ Procurement request PR-{req_id:05d} raised for {nr_material} @ {nr_factory}.")
-                st.rerun()
+                req_id = None
+                try:
+                    req_id = _open_procurement_request(
+                        nr_material, nr_factory, "manual", nr_qty, nr_unit, nr_notes.strip(),
+                        vendor=_nr_vendor
+                    )
+                except (PermissionError, ValueError) as _nr_err:
+                    st.error(f"🛑 {_nr_err}")
+                if req_id is not None:
+                    if nr_notify:
+                        sent, msg = send_procurement_alert_email(
+                            nr_material, nr_factory, nr_qty, nr_qty, nr_unit, req_id)
+                        (st.success if sent else st.warning)(msg)
+                    if nr_notify_vendor and _nr_vendor:
+                        vsent, vmsg = send_vendor_email(
+                            _nr_vendor, nr_material, nr_factory, nr_qty, nr_unit, req_id)
+                        (st.success if vsent else st.warning)(vmsg)
+                    st.success(f"✅ Procurement request PR-{req_id:05d} raised for {nr_material} @ {nr_factory}.")
+                    st.rerun()
 
     # ── FORECAST (reorder-point projection) ─────────────────────────────────
     with tab_proc_forecast:
@@ -15281,10 +16303,13 @@ elif module == "Procurement":
                 mm_pack = st.text_input("Pack Size", key="mm_pack", placeholder="e.g. 25 KG BAG")
 
             if mm_vendor and st.button("💾 Save Mapping", key="mm_save"):
-                set_material_vendor(mm_material, mm_vendor, mm_lead, mm_pack)
-                log_audit("UPDATE", "vendor_materials", mm_material, f"vendor={mm_vendor}")
-                st.success(f"✅ {mm_material} → {mm_vendor}")
-                st.rerun()
+                _mm_ok, _mm_msg = set_material_vendor(mm_material, mm_vendor, mm_lead, mm_pack)
+                if _mm_ok:
+                    log_audit("UPDATE", "vendor_materials", mm_material, f"vendor={mm_vendor}")
+                    st.success(f"✅ {_mm_msg}")
+                    st.rerun()
+                else:
+                    st.error(_mm_msg)
 
         with sub_perf:
             st.markdown("#### Vendor Delivery Performance")
@@ -15356,7 +16381,7 @@ elif module == "Procurement":
                         f"and emails the purchase department. Default is "
                         f"{DEFAULT_REORDER_THRESHOLD} units where no custom threshold is set.")
 
-            rl1, rl2, rl3 = st.columns(3)
+            rl1, rl2, rl3, rl4 = st.columns(4)
             with rl1:
                 rl_factory = st.selectbox("Factory", _FAC_CHOICES, key="rl_factory")
             with rl2:
@@ -15365,21 +16390,30 @@ elif module == "Procurement":
                 rl_threshold = st.number_input(
                     "Reorder Threshold", min_value=0.0, value=float(DEFAULT_REORDER_THRESHOLD),
                     step=1.0, key="rl_threshold")
+            with rl4:
+                rl_target = st.number_input(
+                    "Reorder Target (order-up-to)", min_value=0.0, value=0.0, step=1.0, key="rl_target",
+                    help="Auto-orders top stock up to this level (target − available − open PO). "
+                         "0 = use threshold × " + f"{REORDER_TARGET_MULTIPLIER:g}.")
 
             if st.button("💾 Save Threshold", key="rl_save"):
-                try:
-                    cur.execute(
-                        "INSERT INTO reorder_levels VALUES (?,?,?) "
-                        "ON CONFLICT(material,factory) DO UPDATE SET threshold=excluded.threshold",
-                        (rl_material, rl_factory, rl_threshold)
-                    )
-                    conn.commit()
-                    log_audit("UPDATE", "reorder_levels", f"{rl_material}/{rl_factory}",
-                               f"threshold={rl_threshold}")
-                    st.success("Saved.")
-                    st.rerun()
-                except sqlite3.Error as e:
-                    st.error(f"Database error: {e}")
+                if rl_target and rl_target <= rl_threshold:
+                    st.error("Reorder Target must be greater than the threshold (or 0 for the default).")
+                else:
+                    try:
+                        cur.execute(
+                            "INSERT INTO reorder_levels (material, factory, threshold, reorder_target) "
+                            "VALUES (?,?,?,?) ON CONFLICT(material,factory) DO UPDATE SET "
+                            "threshold=excluded.threshold, reorder_target=excluded.reorder_target",
+                            (rl_material, rl_factory, rl_threshold, rl_target)
+                        )
+                        conn.commit()
+                        log_audit("UPDATE", "reorder_levels", f"{rl_material}/{rl_factory}",
+                                   f"threshold={rl_threshold} target={rl_target}")
+                        st.success("Saved.")
+                        st.rerun()
+                    except sqlite3.Error as e:
+                        st.error(f"Database error: {e}")
 
             existing_rl = pd.read_sql_query(
                 "SELECT * FROM reorder_levels ORDER BY factory, material", conn)
@@ -15568,7 +16602,9 @@ elif module == "Quality":
             im_supplier_manual = st.text_input("Or type supplier name", key="im_supplier_manual")
             im_supplier_final = (im_supplier if im_supplier != "— Type below —"
                                   else im_supplier_manual.strip())
-            im_po = st.text_input("PO Number", key="im_po")
+            im_po = st.text_input("PO Number *", key="im_po",
+                                  help="Must match the PO number recorded on an open Procurement request "
+                                       "for this material and factory.")
         with ic2:
             im_material = st.selectbox("Material", MATERIALS, key="im_material", format_func=lab_code_label)
             im_batch_no = st.text_input("Supplier Batch Number", key="im_batch_no")
@@ -15655,6 +16691,32 @@ elif module == "Quality":
 
     # ── STAGE 3: PRODUCTION BATCH ────────────────────────────────────────────
     with tab_prod_batch:
+        with st.expander("⚖️ Formula Deviation Approvals", expanded=False):
+            _dv_sql = ("SELECT signature, product, factory, MAX(raised_by) AS raised_by, MAX(reason) AS reason, "
+                       "GROUP_CONCAT(material || ' ' || printf('%+.1f', variance_pct) || '%', '; ') AS detail "
+                       "FROM production_deviations WHERE status='Pending'"
+                       + (" AND factory=?" if _q_factory_filter else "")
+                       + " GROUP BY signature, product, factory ORDER BY MIN(id)")
+            _dv_df = pd.read_sql_query(_dv_sql, conn, params=(_q_factory_filter,) if _q_factory_filter else ())
+            if _dv_df.empty:
+                st.caption("No formula deviations awaiting approval.")
+            for _, _dv in _dv_df.iterrows():
+                st.markdown(f"**{_dv['product']}** @ {_dv['factory']} — {_dv['detail']}  \n"
+                            f"Raised by {_dv['raised_by']} · Reason: _{_dv['reason']}_")
+                _dv_note = st.text_input("Approver note (required to reject)", key=f"dv_note_{_dv['signature']}")
+                _d1, _d2 = st.columns(2)
+                _dv_can = _dept_allows("QC")
+                if _d1.button("✅ Approve deviation", key=f"dv_ok_{_dv['signature']}", disabled=not _dv_can):
+                    _o, _m = decide_production_deviation(_dv["signature"], True, _dv_note)
+                    (st.success if _o else st.error)(_m)
+                    if _o:
+                        st.rerun()
+                if _d2.button("⛔ Reject", key=f"dv_no_{_dv['signature']}", disabled=not _dv_can):
+                    _o, _m = decide_production_deviation(_dv["signature"], False, _dv_note)
+                    (st.success if _o else st.error)(_m)
+                    if _o:
+                        st.rerun()
+                st.markdown("---")
         sub_create, sub_all = st.tabs(["➕ Create Batch", "📋 All Batches"])
 
         with sub_create:
@@ -16829,7 +17891,28 @@ elif module == "Sales":
                         }),
                 width='stretch', hide_index=True, height=340
             )
-            delete_row_ui(so_df, "sales_orders", "customer", "so")
+            delete_row_ui(so_df, "sales_orders", "customer", "so", delete_fn=delete_sales_order)
+            with st.expander("🚫 Cancel a Sales Order", expanded=False):
+                st.caption("Use this once an order should no longer proceed. Only an untouched 'New' "
+                           "order can be deleted outright; orders already with Production are "
+                           "cancelled (record kept), and dispatched orders need an amendment.")
+                if not _dept_allows("Sales"):
+                    st.info("🔒 Only Sales (or Admin) can cancel a Sales Order.")
+                else:
+                    _cx_df = (so_df[so_df["wo_status"].fillna("New").isin(["New", "Sent to Production"])]
+                              if "wo_status" in so_df.columns else so_df)
+                    if _cx_df.empty:
+                        st.caption("No cancellable orders in this view.")
+                    else:
+                        _cx_opts = {f"ID {r['id']} — {r['customer']} ({r['date']})": int(r["id"])
+                                    for _, r in _cx_df.iterrows()}
+                        _cx_pick = st.selectbox("Order", list(_cx_opts.keys()), key="so_cx_pick")
+                        _cx_reason = st.text_input("Cancellation reason *", key="so_cx_reason")
+                        if st.button("🚫 Cancel this order", key="so_cx_btn", disabled=not _cx_reason.strip()):
+                            _cx_ok, _cx_msg = cancel_sales_order(_cx_opts[_cx_pick], _cx_reason.strip())
+                            (st.success if _cx_ok else st.error)(_cx_msg)
+                            if _cx_ok:
+                                st.rerun()
 
             if HAS_PLOTLY and not so_df.empty:
                 ch1, ch2, ch3 = st.columns(3)
@@ -17153,9 +18236,8 @@ elif module == "Sales":
     # ── ORDER STATUS (simple customer-facing lookup) ────────────────────────
     with tab_order_status:
         st.subheader("🔎 Order Status Lookup")
-        st.caption("Quick 'has my order shipped' answer — matches the order to the most "
-                    "recent production batch of the same product at the same factory, since "
-                    "orders aren't yet linked to a specific batch number directly.")
+        st.caption("Quick 'has my order shipped' answer — follows the order's own Production "
+                    "Instruction to the batches made for it (Order → Instruction → Batch).")
 
         _os_id = st.number_input("Order #", min_value=1, step=1, key="os_order_id")
         if st.button("🔍 Look up", key="os_lookup_btn"):
@@ -17169,16 +18251,13 @@ elif module == "Sales":
                 o = result["order"]
                 st.markdown(f"**Order #{o['id']:05d}** — {o['customer']} — {o['product']} "
                             f"({o['qty']:g} units) — {fmt_inr(o['total'])}")
-                if result["batch_no"]:
-                    st.success(
-                        f"Likely batch: **{result['batch_no']}** — status: "
-                        f"**{result['batch_status']}**" +
-                        (f" — dispatched {result['dispatch_date']}" if result["dispatch_date"] else "")
-                    )
-                    st.caption("Match is based on product + factory, not a guaranteed batch link — "
-                                "confirm against the Dispatch module for anything customer-facing.")
+                if result["batches"]:
+                    for _ob in result["batches"]:
+                        st.success(f"Batch **{_ob['batch_no']}** — status: **{_ob['status']}**")
+                    if result["dispatch_date"]:
+                        st.caption(f"Last dispatch against this order: {result['dispatch_date']}")
                 else:
-                    st.info("No matching production batch found yet for this order's product/factory.")
+                    st.info("No production batch has been raised against this order yet.")
 
     # ── SALES ORDER → PRODUCTION HANDOFF ────────────────────────────────────
     # NEW: "sales person generates a PO, passes it onto the production dept."
@@ -17923,7 +19002,7 @@ elif module == "Reports":
     if rpt_type in ["Full Summary", "Sales Orders"]:
         st.markdown("#### Sales Orders")
         k1, k2 = st.columns(2)
-        k1.metric("Sales Value", fmt_inr(so_rev_r))
+        k1.metric("Order Book (not revenue)", fmt_inr(so_rev_r))
         k2.metric("Orders",      len(r_so))
         if not r_so.empty:
             st.dataframe(paginate_df(r_so.drop(columns=["id"], errors="ignore"), key="rpt_so_pg"),
@@ -17933,7 +19012,9 @@ elif module == "Reports":
         st.markdown("#### Costs")
         k1, k2 = st.columns(2)
         k1.metric("Total Costs", fmt_inr(cost_r))
-        k2.metric("Net P&L",     fmt_inr(rev_r + so_rev_r - cost_r))  # combined revenue
+        k2.metric("Net P&L",     fmt_inr(rev_r - cost_r),
+                  help="Revenue = Dispatch value only (same definition as the P&L page). "
+                       "Sales Orders are the order book, not revenue.")
         if not r_costs.empty:
             st.dataframe(paginate_df(r_costs.drop(columns=["id"], errors="ignore"), key="rpt_cost_pg"),
                          width='stretch', hide_index=True)
@@ -17959,10 +19040,10 @@ elif module == "Reports":
             if not df_.empty:
                 df_.drop(columns=["id"], errors="ignore").to_excel(writer, sheet_name=sheet, index=False)
         summary = pd.DataFrame({
-            "Metric":  ["Dispatch Value", "Sales Orders Value", "Costs", "Net P&L",
+            "Metric":  ["Revenue (Dispatch)", "Order Book (Sales Orders, not revenue)", "Costs", "Net P&L (Dispatch − Costs)",
                          f"Total Production ({unit})", "Avg Efficiency"],
             "Value":   [fmt_inr(rev_r), fmt_inr(so_rev_r), fmt_inr(cost_r),
-                        fmt_inr(rev_r + so_rev_r - cost_r),  # combined revenue
+                        fmt_inr(rev_r - cost_r),
                          f"{from_mt(prod_r):,.2f}",
                          f"{r_prod['efficiency'].mean():.4f}" if not r_prod.empty else "—"],
         })
